@@ -1,0 +1,6 @@
+/bin/
+/dist/
+/.catsync/
+*.test
+*.out
+.DS_Store
