@@ -362,6 +362,54 @@ func TestPermissions(t *testing.T) {
 	assertPerm(filepath.Join(s.Dir(), "locks", entries[0].Name()), 0o600)
 }
 
+func TestSaveTightensExistingDirectoryPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits do not apply on Windows")
+	}
+	dir := filepath.Join(t.TempDir(), "state")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s, err := state.NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := testRun("20251018T120000Z-cccccccccccccccc")
+	if err := s.Save(r); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("state directory mode = %o, want 700", got)
+	}
+}
+
+func TestLoadRejectsSecondJSONDocument(t *testing.T) {
+	s := newStore(t)
+	r := testRun("20251018T120000Z-dddddddddddddddd")
+	if err := s.Save(r); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(s.Dir(), r.ID+".json")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("{}\n"); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Load(r.ID); !errors.Is(err, state.ErrCorrupt) {
+		t.Fatalf("Load with a second JSON document = %v, want ErrCorrupt", err)
+	}
+}
+
 func TestConcurrentSaves(t *testing.T) {
 	s := newStore(t)
 	const n = 8

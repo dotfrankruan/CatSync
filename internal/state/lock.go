@@ -64,7 +64,7 @@ func (s *Store) LockDestination(dest Destination) (*Lock, error) {
 	}
 	key := dest.String()
 	locksDir := filepath.Join(s.dir, locksDirName)
-	if err := os.MkdirAll(locksDir, dirMode); err != nil {
+	if err := ensurePrivateDir(locksDir); err != nil {
 		return nil, fmt.Errorf("state: create locks directory: %w", err)
 	}
 	var rnd [8]byte

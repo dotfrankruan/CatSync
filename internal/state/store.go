@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -71,7 +72,7 @@ func (s *Store) Save(r *Run) error {
 		return fmt.Errorf("state: encode run %s: %w", r.ID, err)
 	}
 	data = append(data, '\n')
-	if err := os.MkdirAll(s.dir, dirMode); err != nil {
+	if err := ensurePrivateDir(s.dir); err != nil {
 		return fmt.Errorf("state: create state directory: %w", err)
 	}
 	// CreateTemp guarantees mode 0600 and a unique hidden name in the same
@@ -159,8 +160,12 @@ func decodeRun(id string, data []byte) (*Run, error) {
 	if err := dec.Decode(&r); err != nil {
 		return nil, fmt.Errorf("%w: %s: %v", ErrCorrupt, id, err)
 	}
-	if dec.More() {
-		return nil, fmt.Errorf("%w: %s: trailing data after the run document", ErrCorrupt, id)
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, fmt.Errorf("%w: %s: trailing data after the run document", ErrCorrupt, id)
+		}
+		return nil, fmt.Errorf("%w: %s: trailing data: %v", ErrCorrupt, id, err)
 	}
 	if r.ID != id {
 		return nil, fmt.Errorf("%w: %s: file holds run %s", ErrCorrupt, id, r.ID)
@@ -169,6 +174,16 @@ func decodeRun(id string, data []byte) (*Run, error) {
 		return nil, fmt.Errorf("%w: %s: %v", ErrCorrupt, id, err)
 	}
 	return &r, nil
+}
+
+// ensurePrivateDir creates path and also tightens a pre-existing directory.
+// MkdirAll honors its mode only when creating a directory, so the Chmod is
+// required when a user points CatSync at an existing, overly broad path.
+func ensurePrivateDir(path string) error {
+	if err := os.MkdirAll(path, dirMode); err != nil {
+		return err
+	}
+	return os.Chmod(path, dirMode)
 }
 
 // LoadAndRecover loads a run and repairs leftover running state from an
