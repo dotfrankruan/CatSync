@@ -1,6 +1,7 @@
 /bin/
 /dist/
 /.catsync/
+/.gocache/
 *.test
 *.out
 .DS_Store
