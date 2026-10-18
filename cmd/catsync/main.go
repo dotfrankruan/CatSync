@@ -1,9 +1,15 @@
+// Command catsync orchestrates multi-backend file synchronization.
 package main
 
-import "fmt"
+import (
+	"os"
 
+	"github.com/frankruan/catsync/internal/cli"
+)
+
+// version is set at build time via -ldflags "-X main.version=...".
 var version = "dev"
 
 func main() {
-	fmt.Printf("catsync %s\n", version)
+	os.Exit(cli.Run(os.Args[1:], os.Stdout, os.Stderr, version))
 }

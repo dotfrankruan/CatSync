@@ -1,0 +1,204 @@
+// Package cli implements the catsync command-line interface: command
+// dispatch, shared option parsing and validation, and the built-in
+// doctor and version commands.
+//
+// Only doctor and version do real work in this slice. The plan, sync,
+// resume, and status commands parse and fully validate their inputs and
+// then fail with a clear "not implemented yet" error (ExitNotImplemented)
+// so scripts never mistake them for successful operations.
+package cli
+
+import (
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"strings"
+
+	"github.com/frankruan/catsync/internal/target"
+)
+
+// Process exit codes returned by Run.
+const (
+	// ExitOK reports success.
+	ExitOK = 0
+	// ExitError reports a runtime failure such as a failed doctor check.
+	ExitError = 1
+	// ExitUsage reports invalid command-line input.
+	ExitUsage = 2
+	// ExitNotImplemented reports a command whose implementation is planned
+	// for a later milestone.
+	ExitNotImplemented = 3
+)
+
+const usageText = `Usage: catsync <command> [options]
+
+Commands:
+  doctor    check external tools (rsync, ssh, fpsync, fpart, mscp)
+  plan      build a transfer plan for SOURCE [user@]host:/absolute/path
+  sync      transfer SOURCE to [user@]host:/absolute/path
+  resume    resume an interrupted run
+  status    show the status of a run
+  version   print the catsync version
+
+Run 'catsync <command> -h' for command-specific options.
+`
+
+// Run executes the catsync command line described by args (excluding the
+// program name) and returns the process exit code. Human-readable output is
+// written to stdout and errors to stderr.
+func Run(args []string, stdout, stderr io.Writer, version string) int {
+	if len(args) == 0 {
+		fmt.Fprint(stderr, usageText)
+		return ExitUsage
+	}
+	name, rest := args[0], args[1:]
+	switch name {
+	case "doctor":
+		return runDoctorCommand(rest, stdout, stderr)
+	case "plan", "sync":
+		return runTransferCommand(name, rest, stdout, stderr)
+	case "resume", "status":
+		return runStateCommand(name, rest, stdout, stderr)
+	case "version", "-version", "--version":
+		fmt.Fprintf(stdout, "catsync %s\n", version)
+		return ExitOK
+	case "help", "-h", "--help":
+		fmt.Fprint(stdout, usageText)
+		return ExitOK
+	default:
+		fmt.Fprintf(stderr, "catsync: unknown command %q\n\n", name)
+		fmt.Fprint(stderr, usageText)
+		return ExitUsage
+	}
+}
+
+// rejectDelete scans raw arguments for any spelling of rsync-style deletion
+// and rejects it explicitly. CatSync never deletes destination files, so a
+// clear error beats the generic "flag not defined" message. Scanning stops
+// at "--", after which tokens are positional operands.
+func rejectDelete(args []string) error {
+	for _, a := range args {
+		if a == "--" {
+			return nil
+		}
+		if a == "-delete" || a == "--delete" ||
+			strings.HasPrefix(a, "-delete=") || strings.HasPrefix(a, "--delete=") {
+			return errors.New("--delete is not supported: catsync never deletes destination files")
+		}
+	}
+	return nil
+}
+
+// newFlagSet builds a FlagSet that prints errors and a header-plus-defaults
+// usage block to stderr.
+func newFlagSet(name, header string, stderr io.Writer) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.Usage = func() {
+		fmt.Fprint(stderr, header)
+		fs.PrintDefaults()
+	}
+	return fs
+}
+
+// parseFlags parses args, translating flag package outcomes into exit codes.
+// The second result reports whether parsing succeeded.
+func parseFlags(fs *flag.FlagSet, args []string) (int, bool) {
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return ExitOK, false
+		}
+		return ExitUsage, false
+	}
+	return ExitOK, true
+}
+
+// runTransferCommand implements plan and sync. Both commands share the full
+// option set and operand validation; only their later execution differs.
+func runTransferCommand(name string, args []string, stdout, stderr io.Writer) int {
+	if err := rejectDelete(args); err != nil {
+		fmt.Fprintf(stderr, "catsync: %s: %v\n", name, err)
+		return ExitUsage
+	}
+	fs := newFlagSet(name, transferUsage(name), stderr)
+	opts := defaultOptions()
+	opts.bindSharedFlags(fs)
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
+	}
+	if err := opts.Validate(); err != nil {
+		fmt.Fprintf(stderr, "catsync: %s: %v\n", name, err)
+		return ExitUsage
+	}
+	operands := fs.Args()
+	if len(operands) != 2 {
+		fmt.Fprintf(stderr, "catsync: %s: want SOURCE and [user@]host:/absolute/path, got %d operands\n", name, len(operands))
+		fs.Usage()
+		return ExitUsage
+	}
+	src, err := target.ValidateSource(operands[0])
+	if err != nil {
+		fmt.Fprintf(stderr, "catsync: %s: %v\n", name, err)
+		return ExitUsage
+	}
+	dst, err := target.ParseDestination(operands[1])
+	if err != nil {
+		fmt.Fprintf(stderr, "catsync: %s: %v\n", name, err)
+		return ExitUsage
+	}
+	_ = stdout
+	fmt.Fprintf(stderr, "catsync: %s: not implemented yet (validated source %s, destination %s)\n", name, src, dst)
+	return ExitNotImplemented
+}
+
+// runStateCommand implements resume and status. Both operate on recorded run
+// state rather than new transfer operands, so they accept a reduced option
+// set and at most one optional run identifier.
+func runStateCommand(name string, args []string, stdout, stderr io.Writer) int {
+	if err := rejectDelete(args); err != nil {
+		fmt.Fprintf(stderr, "catsync: %s: %v\n", name, err)
+		return ExitUsage
+	}
+	fs := newFlagSet(name, stateUsage(name), stderr)
+	opts := defaultOptions()
+	fs.StringVar(&opts.StateDir, "state-dir", opts.StateDir, "directory holding catsync run state")
+	fs.BoolVar(&opts.Verbose, "verbose", false, "increase output detail")
+	fs.BoolVar(&opts.Quiet, "quiet", false, "suppress non-error output")
+	if code, ok := parseFlags(fs, args); !ok {
+		return code
+	}
+	if err := opts.validateOutput(); err != nil {
+		fmt.Fprintf(stderr, "catsync: %s: %v\n", name, err)
+		return ExitUsage
+	}
+	if fs.NArg() > 1 {
+		fmt.Fprintf(stderr, "catsync: %s: want at most one run identifier, got %d operands\n", name, fs.NArg())
+		fs.Usage()
+		return ExitUsage
+	}
+	_ = stdout
+	fmt.Fprintf(stderr, "catsync: %s: not implemented yet\n", name)
+	return ExitNotImplemented
+}
+
+func transferUsage(name string) string {
+	return fmt.Sprintf(`Usage: catsync %s [options] SOURCE [user@]host:/absolute/path
+
+SOURCE must be an existing, readable local directory. The destination must
+name an absolute path on a remote host; bracketed IPv6 literals such as
+user@[2001:db8::1]:/data are accepted. CatSync never deletes destination
+files; --delete is rejected.
+
+Options:
+`, name)
+}
+
+func stateUsage(name string) string {
+	return fmt.Sprintf(`Usage: catsync %s [options] [run-id]
+
+Without a run identifier the latest run in the state directory is used.
+
+Options:
+`, name)
+}
