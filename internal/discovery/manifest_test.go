@@ -16,7 +16,7 @@ func manifestRecord(path, size, mtime string) string {
 
 func TestParseManifestRoundTrip(t *testing.T) {
 	var in strings.Builder
-	in.WriteString(manifestRecord("plain.txt", "10", "1700000000.123456789"))
+	in.WriteString(manifestRecord("plain.txt", "10", "1700000000.1234567890"))
 	in.WriteString(manifestRecord("with space/inner file.bin", "0", "1700000001"))
 	in.WriteString(manifestRecord("uni/日本語.txt", "4294967296", "1.5"))
 	in.WriteString(manifestRecord("line1\nline2", "7", "9999999999.000000001"))
@@ -91,7 +91,7 @@ func TestParseManifestMalformed(t *testing.T) {
 		{"mtime signed", manifestRecord("a", "1", "+5"), "invalid mtime"},
 		{"mtime bare dot", manifestRecord("a", "1", "1."), "fraction"},
 		{"mtime leading dot", manifestRecord("a", "1", ".5"), "invalid mtime"},
-		{"mtime too many digits", manifestRecord("a", "1", "1.1234567890"), "fraction"},
+		{"mtime non-digit fraction", manifestRecord("a", "1", "1.123x"), "fraction"},
 		{"mtime overflow", manifestRecord("a", "1", "99999999999999999999999"), "invalid mtime"},
 		{"path absolute", manifestRecord("/abs", "1", "1"), "path"},
 		{"path escapes root", manifestRecord("../x", "1", "1"), "path"},

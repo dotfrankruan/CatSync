@@ -23,8 +23,9 @@ import (
 // path is slash-separated and relative to the destination root (find's %P),
 // validated with ValidateRelPath so a manifest can never name a file
 // outside the destination tree. size is the decimal byte count. mtime is
-// decimal seconds since the Unix epoch with an optional fractional part of
-// up to 9 digits (nanoseconds), as printed by find's %T@. NUL is the only
+// decimal seconds since the Unix epoch with an optional fractional part,
+// as printed by find's %T@. Precision beyond nanoseconds is accepted and
+// truncated. NUL is the only
 // delimiter, so paths may contain spaces, newlines, quotes, and any other
 // byte except NUL.
 //
@@ -191,8 +192,11 @@ func parseManifestTime(s string) (time.Time, error) {
 	}
 	var nsec int64
 	if hasFrac {
-		if len(fracPart) > 9 || !isDigits(fracPart) {
+		if !isDigits(fracPart) {
 			return time.Time{}, fmt.Errorf("invalid mtime fraction %q", s)
+		}
+		if len(fracPart) > 9 {
+			fracPart = fracPart[:9]
 		}
 		// Right-pad to nanosecond precision: ".5" means 500ms.
 		fracPart += strings.Repeat("0", 9-len(fracPart))
