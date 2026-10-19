@@ -891,3 +891,47 @@ func TestSyncDestinationLockContention(t *testing.T) {
 		t.Errorf("invocations = %d, want 0", got)
 	}
 }
+
+// TestSyncVerifyNoneSkipsRemoteCheck: with --verify none, tasks complete
+// straight after their stage and no verification manifest is collected.
+func TestSyncVerifyNoneSkipsRemoteCheck(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 10)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "exit=0")
+	cfg := h.config()
+	cfg.Backend = state.BackendRsync
+	cfg.Verify = state.VerifyNone
+
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if run.Status != state.StatusCompleted {
+		t.Fatalf("run status = %s (error %q)", run.Status, run.Error)
+	}
+	if run.Tasks[0].Status != state.StatusCompleted {
+		t.Errorf("task = %s, want completed", run.Tasks[0].Status)
+	}
+	if got := len(toolInvocations(h.invocations(), "ssh")); got != 1 {
+		t.Errorf("ssh invocations = %d, want 1 (plan manifest only; no verification call)", got)
+	}
+}
+
+// TestSyncSHA256Refused: the sha256 mode fails fast and honestly instead of
+// silently degrading to a size check.
+func TestSyncSHA256Refused(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 10)
+	h.scriptSSHFreshDest(h.writeManifest("post", ""))
+	cfg := h.config()
+	cfg.Verify = state.VerifySHA256
+	_, err := Sync(context.Background(), cfg)
+	if !errors.Is(err, ErrVerifyNotImplemented) {
+		t.Fatalf("Sync sha256 = %v, want ErrVerifyNotImplemented", err)
+	}
+	if got := len(h.invocations()); got != 0 {
+		t.Errorf("invocations = %d, want 0 (fail fast before any transfer)", got)
+	}
+}
