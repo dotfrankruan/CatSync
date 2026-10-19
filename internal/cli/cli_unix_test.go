@@ -1,0 +1,354 @@
+//go:build unix
+
+package cli
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/frankruan/catsync/internal/testutil/mockexec"
+)
+
+func TestMain(m *testing.M) {
+	if mockexec.HelperActive() {
+		os.Exit(mockexec.RunHelper())
+	}
+	os.Exit(m.Run())
+}
+
+// cliHarness wires the mock executables into the CATSYNC_* environment the
+// CLI reads, with a script directory and invocation log.
+type cliHarness struct {
+	t         *testing.T
+	src       string
+	stateDir  string
+	scriptDir string
+	logPath   string
+}
+
+func newCLIHarness(t *testing.T) *cliHarness {
+	t.Helper()
+	binDir := t.TempDir()
+	progs, err := mockexec.LinkPrograms(binDir, "ssh", "rsync", "fpsync", "fpart", "mscp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &cliHarness{
+		t:         t,
+		src:       t.TempDir(),
+		stateDir:  t.TempDir(),
+		scriptDir: t.TempDir(),
+		logPath:   filepath.Join(t.TempDir(), "invocations.jsonl"),
+	}
+	for tool, path := range progs {
+		t.Setenv("CATSYNC_"+strings.ToUpper(tool), path)
+	}
+	// The CLI passes no Env additions, so children inherit this process'
+	// environment: arm the mock through it.
+	t.Setenv(mockexec.EnvMarker, "1")
+	t.Setenv(mockexec.EnvScriptDir, h.scriptDir)
+	t.Setenv(mockexec.EnvInvocationLog, h.logPath)
+	return h
+}
+
+func (h *cliHarness) writeScript(tool, config string) {
+	h.t.Helper()
+	dir := filepath.Join(h.scriptDir, tool)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		h.t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config"), []byte(config), 0o600); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func (h *cliHarness) writeSrc(rel string, size int) {
+	h.t.Helper()
+	p := filepath.Join(h.src, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		h.t.Fatal(err)
+	}
+	if err := os.WriteFile(p, make([]byte, size), 0o644); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func (h *cliHarness) writeManifest(name, content string) string {
+	h.t.Helper()
+	p := filepath.Join(h.t.TempDir(), name)
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		h.t.Fatal(err)
+	}
+	return p
+}
+
+func (h *cliHarness) record(rel string) string {
+	h.t.Helper()
+	fi, err := os.Stat(filepath.Join(h.src, filepath.FromSlash(rel)))
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return fmt.Sprintf("%s\x00%d\x00%d.%09d\x00", rel, fi.Size(), fi.ModTime().Unix(), int64(fi.ModTime().Nanosecond()))
+}
+
+func (h *cliHarness) invocations(tool string) []mockexec.Invocation {
+	h.t.Helper()
+	invs, err := mockexec.ReadInvocations(h.logPath)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	var out []mockexec.Invocation
+	for _, inv := range invs {
+		if inv.Tool == tool {
+			out = append(out, inv)
+		}
+	}
+	return out
+}
+
+// scriptFreshDestSSH scripts a missing destination (first manifest exits
+// 42), then the post-transfer manifest, and a successful mkdir.
+func (h *cliHarness) scriptFreshDestSSH(postFile string) {
+	h.writeScript("ssh", `match=if [ -d
+nth=1
+exit=42
+---
+match=if [ -d
+stdout_file=`+postFile+`
+---
+match=mkdir -p
+exit=0
+`)
+}
+
+const fpsyncOK = `1792333896 Info: Fpsync started (pid: 74154)
+1792333896 Info: Run ID: 1792333896-74154
+1792333897 Info: Fpsync stopped (with success)
+`
+
+// TestCLISyncEndToEnd drives the whole CLI with mock tools: sync completes
+// and status then reports the persisted run.
+func TestCLISyncEndToEnd(t *testing.T) {
+	h := newCLIHarness(t)
+	h.writeSrc("small.txt", 10)
+	h.writeSrc("big.bin", 2048)
+	post := h.writeManifest("post", h.record("small.txt")+h.record("big.bin"))
+	h.scriptFreshDestSSH(post)
+	h.writeScript("fpsync", "stdout_file="+h.writeManifest("fpsync.out", fpsyncOK+"S\t2048\t./big.bin\n"))
+	h.writeScript("mscp", "touch_flag=-W")
+
+	code, stdout, stderr := run(t, "sync", "--state-dir", h.stateDir,
+		"--large-threshold", "1KiB", h.src, "user@host:/data")
+	if code != ExitOK {
+		t.Fatalf("sync exit = %d, stderr:\n%s", code, stderr)
+	}
+	if !strings.Contains(stdout, "run ") || !strings.Contains(stdout, "completed") {
+		t.Errorf("sync stdout missing the run summary:\n%s", stdout)
+	}
+	if len(h.invocations("fpsync")) != 1 || len(h.invocations("mscp")) != 1 {
+		t.Errorf("invocations: fpsync=%d mscp=%d, want 1 each",
+			len(h.invocations("fpsync")), len(h.invocations("mscp")))
+	}
+
+	code, stdout, stderr = run(t, "status", "--state-dir", h.stateDir)
+	if code != ExitOK {
+		t.Fatalf("status exit = %d, stderr:\n%s", code, stderr)
+	}
+	for _, want := range []string{"completed", "fpsync 1, mscp 1, rsync 0", "user@host:/data"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("status output missing %q:\n%s", want, stdout)
+		}
+	}
+}
+
+// TestCLIPlanPrintsSummary checks the plan command output shape and that
+// plan transfers nothing.
+func TestCLIPlanPrintsSummary(t *testing.T) {
+	h := newCLIHarness(t)
+	h.writeSrc("small.txt", 10)
+	h.writeSrc("big.bin", 2048)
+	pre := h.writeManifest("pre", h.record("small.txt")) // small.txt unchanged? sizes must match
+	h.writeScript("ssh", "match=if [ -d\nstdout_file="+pre+"\n")
+
+	code, stdout, stderr := run(t, "plan", "--state-dir", h.stateDir,
+		"--large-threshold", "1KiB", h.src, "user@host:/data")
+	if code != ExitOK {
+		t.Fatalf("plan exit = %d, stderr:\n%s", code, stderr)
+	}
+	for _, want := range []string{
+		"destination metadata: authoritative",
+		"mscp (large new):     1",
+		"logical source bytes",
+		"no data was transferred",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("plan output missing %q:\n%s", want, stdout)
+		}
+	}
+	if got := len(h.invocations("rsync")) + len(h.invocations("fpsync")) + len(h.invocations("mscp")); got != 0 {
+		t.Errorf("plan invoked %d transfer processes, want 0", got)
+	}
+}
+
+// TestCLIPlanForcedBackendRefusal: a forced-fpsync plan over a large file
+// is unsafe and must fail nonzero.
+func TestCLIPlanForcedBackendRefusal(t *testing.T) {
+	h := newCLIHarness(t)
+	h.writeSrc("big.bin", 2048)
+	pre := h.writeManifest("pre", "")
+	h.writeScript("ssh", "match=if [ -d\nstdout_file="+pre+"\n")
+
+	code, _, stderr := run(t, "plan", "--state-dir", h.stateDir, "--backend", "fpsync",
+		"--large-threshold", "1KiB", h.src, "user@host:/data")
+	if code == ExitOK {
+		t.Fatalf("plan with unsafe forced backend exit = 0, want nonzero")
+	}
+	if !strings.Contains(stderr, "refuses") {
+		t.Errorf("stderr should explain the refusal:\n%s", stderr)
+	}
+}
+
+// TestCLISyncFailureExitCode: a failing transfer exits 1 and records the
+// failed run for status/resume.
+func TestCLISyncFailureExitCode(t *testing.T) {
+	h := newCLIHarness(t)
+	h.writeSrc("small.txt", 10)
+	post := h.writeManifest("post", h.record("small.txt"))
+	h.scriptFreshDestSSH(post)
+	h.writeScript("rsync", "exit=23")
+
+	code, _, stderr := run(t, "sync", "--state-dir", h.stateDir, "--backend", "rsync",
+		h.src, "user@host:/data")
+	if code != ExitError {
+		t.Fatalf("sync exit = %d, want %d", code, ExitError)
+	}
+	if !strings.Contains(stderr, "status 23") {
+		t.Errorf("stderr should carry the rsync exit status:\n%s", stderr)
+	}
+	code, stdout, _ := run(t, "status", "--state-dir", h.stateDir)
+	if code != ExitOK {
+		t.Fatalf("status exit = %d", code)
+	}
+	if !strings.Contains(stdout, "failed") {
+		t.Errorf("status should show the failed run:\n%s", stdout)
+	}
+
+	// Resume retries the failed task; the mock rsync still fails, so
+	// resume exits nonzero and the run stays failed.
+	code, _, _ = run(t, "resume", "--state-dir", h.stateDir)
+	if code != ExitError {
+		t.Errorf("resume with still-failing rsync exit = %d, want %d", code, ExitError)
+	}
+}
+
+// TestCLIIPv6CommandShapes checks that --ipv6 reaches every tool: ssh -6,
+// the rsync transport "ssh -6", and mscp -6.
+func TestCLIIPv6CommandShapes(t *testing.T) {
+	h := newCLIHarness(t)
+	h.writeSrc("big.bin", 2048)
+	post := h.writeManifest("post", h.record("big.bin"))
+	h.scriptFreshDestSSH(post)
+	h.writeScript("mscp", "touch_flag=-W")
+
+	code, _, stderr := run(t, "sync", "--state-dir", h.stateDir, "--ipv6", "--backend", "mscp",
+		"--large-threshold", "1KiB", h.src, "user@[2001:db8::1]:/data")
+	if code != ExitOK {
+		t.Fatalf("sync exit = %d, stderr:\n%s", code, stderr)
+	}
+	for _, inv := range h.invocations("ssh") {
+		if len(inv.Args) < 1 || inv.Args[0] != "-6" {
+			t.Errorf("ssh argv missing -6: %v", inv.Args)
+		}
+	}
+	ms := h.invocations("mscp")
+	if len(ms) != 1 {
+		t.Fatalf("mscp invocations = %d, want 1", len(ms))
+	}
+	found6 := false
+	for _, a := range ms[0].Args {
+		if a == "-6" {
+			found6 = true
+		}
+	}
+	if !found6 {
+		t.Errorf("mscp argv missing -6: %v", ms[0].Args)
+	}
+	if got := ms[0].Args[len(ms[0].Args)-1]; got != "user@[2001:db8::1]:/data/big.bin" {
+		t.Errorf("mscp target = %q, want bracketed IPv6", got)
+	}
+}
+
+// TestCLIResumeAfterInterrupt covers the resume command path end to end: a
+// run interrupted mid-transfer is continued and completed by resume.
+func TestCLIResumeAfterInterrupt(t *testing.T) {
+	h := newCLIHarness(t)
+	h.writeSrc("small.txt", 10)
+	post := h.writeManifest("post", h.record("small.txt"))
+	h.scriptFreshDestSSH(post)
+	h.writeScript("rsync", "nth=1\nsleep_ms=30000\n---\nexit=0\n")
+
+	done := make(chan int, 1)
+	go func() {
+		code, _, _ := run(t, "sync", "--state-dir", h.stateDir, "--backend", "rsync", h.src, "user@host:/data")
+		done <- code
+	}()
+	// Wait until the mock rsync has actually started (its invocation is
+	// recorded before it sleeps), then interrupt: the CLI's signal context
+	// cancels the transfer.
+	deadline := time.Now().Add(10 * time.Second)
+	for len(h.invocations("rsync")) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("mock rsync never started")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	self, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := self.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	code := <-done
+	if code != ExitError {
+		t.Fatalf("interrupted sync exit = %d, want %d", code, ExitError)
+	}
+
+	// The second rsync invocation succeeds; resume completes the run.
+	code, stdout, stderr := run(t, "resume", "--state-dir", h.stateDir)
+	if code != ExitOK {
+		t.Fatalf("resume exit = %d, stderr:\n%s", code, stderr)
+	}
+	if !strings.Contains(stdout, "completed") {
+		t.Errorf("resume stdout missing completion:\n%s", stdout)
+	}
+	if got := len(h.invocations("rsync")); got != 2 {
+		t.Errorf("rsync invocations = %d, want 2", got)
+	}
+}
+
+// TestCLIUsageAndRuntimeExitCodes pins the exit-code contract.
+func TestCLIUsageAndRuntimeExitCodes(t *testing.T) {
+	h := newCLIHarness(t)
+	h.writeSrc("small.txt", 10)
+
+	// Usage: unknown flag.
+	if code, _, _ := run(t, "sync", "--bogus", h.src, "u@h:/d"); code != ExitUsage {
+		t.Errorf("unknown flag exit = %d, want %d", code, ExitUsage)
+	}
+	// Usage: jobs x streams over budget.
+	if code, _, _ := run(t, "sync", "--jobs", "64", "--streams", "64", h.src, "u@h:/d"); code != ExitUsage {
+		t.Errorf("over-budget exit = %d, want %d", code, ExitUsage)
+	}
+	// Runtime: corrupt state file.
+	if err := os.WriteFile(filepath.Join(h.stateDir, "broken.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, _ := run(t, "status", "--state-dir", h.stateDir, "broken"); code != ExitError {
+		t.Errorf("corrupt state exit = %d, want %d", code, ExitError)
+	}
+}
