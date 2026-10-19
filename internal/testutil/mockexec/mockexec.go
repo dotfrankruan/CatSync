@@ -160,9 +160,33 @@ func RunHelper() int {
 // EnvScriptDir is set, environment style otherwise.
 func configuredBehavior(tool string) (behavior, error) {
 	if dir := os.Getenv(EnvScriptDir); dir != "" {
-		return loadScript(filepath.Join(dir, tool, "config"), tool)
+		toolDir := filepath.Join(dir, tool)
+		nth := bumpCounter(toolDir)
+		return loadScript(filepath.Join(toolDir, "config"), tool, nth)
 	}
 	return envBehavior()
+}
+
+// bumpCounter increments and returns the per-tool invocation counter kept
+// in <toolDir>/.count, so script sections can gate on "nth=N". The tool
+// directory is created when missing. Counter updates are not atomic across
+// concurrent invocations of the same tool; script-style tests invoke
+// counter-gated tools (ssh) sequentially.
+func bumpCounter(toolDir string) int {
+	if err := os.MkdirAll(toolDir, 0700); err != nil {
+		fmt.Fprintf(os.Stderr, "mockexec: create tool dir: %v\n", err)
+		return 0
+	}
+	path := filepath.Join(toolDir, ".count")
+	n := 0
+	if data, err := os.ReadFile(path); err == nil {
+		n, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+	}
+	n++
+	if err := os.WriteFile(path, []byte(strconv.Itoa(n)), 0600); err != nil {
+		fmt.Fprintf(os.Stderr, "mockexec: write counter: %v\n", err)
+	}
+	return n
 }
 
 // envBehavior implements the original environment-variable configuration.
@@ -196,18 +220,23 @@ func envBehavior() (behavior, error) {
 //
 //	match=TEXT       section applies only when the NUL-joined argument
 //	                 vector contains TEXT; first matching section wins
+//	nth=N            section applies only to the Nth invocation of this
+//	                 tool (1-based); combines with match
 //	exit=N           decimal exit status (default 0)
 //	stdout_file=P    file copied to stdout
 //	stderr_file=P    file copied to stderr
 //	sleep_ms=N       delay after recording
 //	touch=P          file created (checkpoint simulation)
+//	touch_flag=F     create the file named by flag F's value in argv
+//	                 (e.g. touch_flag=-W creates the mscp checkpoint)
 //	signal=NAME      signal the helper sends itself after output
 //	                 (TERM, KILL, ...; Unix only)
 //
-// A section without a match key always applies, so it works as the default
-// or as the only section. Blank lines and lines starting with '#' are
-// ignored. No matching section is an error, so misconfigurations are loud.
-func loadScript(path, tool string) (behavior, error) {
+// A section without match and nth keys always applies, so it works as the
+// default or as the only section. Blank lines and lines starting with '#'
+// are ignored. No matching section is an error, so misconfigurations are
+// loud.
+func loadScript(path, tool string, nth int) (behavior, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return behavior{}, fmt.Errorf("tool %q: read script config: %w", tool, err)
@@ -227,8 +256,19 @@ func loadScript(path, tool string) (behavior, error) {
 				return behavior{}, fmt.Errorf("tool %q: malformed config line %q", tool, line)
 			}
 			kv[k] = v
-			if k == "match" && !strings.Contains(joined, v) {
-				ok = false
+			switch k {
+			case "match":
+				if !strings.Contains(joined, v) {
+					ok = false
+				}
+			case "nth":
+				want, perr := strconv.Atoi(v)
+				if perr != nil {
+					return behavior{}, fmt.Errorf("tool %q: invalid nth %q", tool, v)
+				}
+				if want != nth {
+					ok = false
+				}
 			}
 		}
 		if ok {
@@ -237,7 +277,7 @@ func loadScript(path, tool string) (behavior, error) {
 		}
 	}
 	if matched == nil {
-		return behavior{}, fmt.Errorf("tool %q: no config section matches argv", tool)
+		return behavior{}, fmt.Errorf("tool %q: no config section matches invocation %d", tool, nth)
 	}
 	kv := *matched
 	var bh behavior
@@ -251,6 +291,16 @@ func loadScript(path, tool string) (behavior, error) {
 	bh.stdoutFile = kv["stdout_file"]
 	bh.stderrFile = kv["stderr_file"]
 	bh.touch = kv["touch"]
+	if flag := kv["touch_flag"]; flag != "" {
+		for i, a := range os.Args[1:] {
+			if a == flag && i+2 <= len(os.Args[1:]) {
+				bh.touch = os.Args[1:][i+1]
+			}
+		}
+		if bh.touch == "" {
+			return bh, fmt.Errorf("tool %q: touch_flag %s not found in argv", tool, flag)
+		}
+	}
 	bh.signal = kv["signal"]
 	if v := kv["sleep_ms"]; v != "" {
 		n, err := strconv.Atoi(v)
