@@ -220,20 +220,83 @@ func isDigits(s string) bool {
 	return true
 }
 
+// ManifestExitNoSuchDir is the remote script's exit status when the
+// destination directory does not exist. Callers treat it as an
+// authoritative empty destination (every source file is new), unlike other
+// failures, which leave the destination state unknown.
+const ManifestExitNoSuchDir = 42
+
 // ManifestCommand builds the single ssh invocation that streams the
-// destination tree manifest on its standard output. The result is an
-// argument array for direct execution (exec.Command), never a shell command
-// line: no local shell is involved and no arguments are concatenated into a
-// local shell string.
-//
-// The remote command runs find on the destination path, printing one
-// NUL-delimited record per regular file (see the format documentation
-// above); find does not follow symlinks by default. The destination path is
-// single-quote escaped for the remote shell, which ssh always involves on
-// the remote side. The remote host needs GNU findutils for -printf; when
-// collection fails, callers must plan with unknown (nil) destination
-// metadata, which routes every file to rsync.
+// destination tree manifest on its standard output, using the "ssh" binary
+// from PATH and default (both-stack) address resolution.
 func ManifestCommand(dest target.Destination) ([]string, error) {
+	return ManifestCommandProg("ssh", dest, false)
+}
+
+// ManifestCommandProg builds the manifest ssh invocation with an explicit
+// ssh program and optional IPv6-only resolution. The result is an argument
+// array for direct execution (exec.Command), never a shell command line: no
+// local shell is involved and no arguments are concatenated into a local
+// shell string.
+//
+// The remote command tests the destination path and, when it is a
+// directory, runs find on it, printing one NUL-delimited record per regular
+// file (see the format documentation above); find does not follow symlinks
+// by default. A missing destination directory exits with
+// ManifestExitNoSuchDir. The destination path is single-quote escaped for
+// the remote shell, which ssh always involves on the remote side. The
+// remote host needs GNU findutils for -printf; when collection fails,
+// callers must plan with unknown (nil) destination metadata, which routes
+// every file to rsync.
+func ManifestCommandProg(prog string, dest target.Destination, ipv6 bool) ([]string, error) {
+	argv, err := sshArgv(prog, dest, ipv6)
+	if err != nil {
+		return nil, err
+	}
+	q := shellQuote(dest.Path)
+	script := "if [ -d " + q + " ]; then find " + q + " -type f -printf '%P\\0%s\\0%T@\\0'; else exit " +
+		strconv.Itoa(ManifestExitNoSuchDir) + "; fi"
+	return append(argv, script), nil
+}
+
+// MkdirCommandProg builds a single ssh invocation that creates the given
+// absolute remote directories (and parents) with mkdir -p. mscp does not
+// create missing remote parent directories, so the executor issues one
+// batched mkdir for all parents of a stage's files. The result is an
+// argument array for direct execution; every directory is single-quote
+// escaped for the remote shell. An empty directory list is an error: no
+// command means no invocation.
+func MkdirCommandProg(prog string, dest target.Destination, ipv6 bool, dirs []string) ([]string, error) {
+	if len(dirs) == 0 {
+		return nil, errors.New("discovery: mkdir command needs at least one directory")
+	}
+	argv, err := sshArgv(prog, dest, ipv6)
+	if err != nil {
+		return nil, err
+	}
+	var b strings.Builder
+	b.WriteString("mkdir -p")
+	for _, d := range dirs {
+		// Absolute paths never begin with '-', so option injection is
+		// impossible once the absolute check passes.
+		if !strings.HasPrefix(d, "/") || strings.ContainsRune(d, 0) {
+			return nil, fmt.Errorf("discovery: mkdir directory %q is not a clean absolute path", d)
+		}
+		b.WriteByte(' ')
+		b.WriteString(shellQuote(d))
+	}
+	return append(argv, b.String()), nil
+}
+
+// sshArgv builds the leading tokens of an ssh invocation: program,
+// optional -6, and the [user@]host target.
+func sshArgv(prog string, dest target.Destination, ipv6 bool) ([]string, error) {
+	if prog == "" {
+		return nil, errors.New("discovery: ssh program is empty")
+	}
+	if strings.ContainsRune(prog, 0) {
+		return nil, errors.New("discovery: ssh program contains a NUL byte")
+	}
 	if dest.Host == "" {
 		return nil, errors.New("discovery: destination host is empty")
 	}
@@ -250,8 +313,11 @@ func ManifestCommand(dest target.Destination) ([]string, error) {
 	if dest.User != "" {
 		who = dest.User + "@" + dest.Host
 	}
-	script := "find " + shellQuote(dest.Path) + " -type f -printf '%P\\0%s\\0%T@\\0'"
-	return []string{"ssh", who, script}, nil
+	argv := []string{prog}
+	if ipv6 {
+		argv = append(argv, "-6")
+	}
+	return append(argv, who), nil
 }
 
 // shellQuote renders s as a single POSIX-shell word: wrapped in single

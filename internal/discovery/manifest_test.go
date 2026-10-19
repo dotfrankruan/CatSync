@@ -222,27 +222,27 @@ func TestManifestCommand(t *testing.T) {
 		{
 			name: "host only",
 			dest: target.Destination{Host: "host", Path: "/data"},
-			want: []string{"ssh", "host", "find '/data' -type f -printf '%P\\0%s\\0%T@\\0'"},
+			want: []string{"ssh", "host", "if [ -d '/data' ]; then find '/data' -type f -printf '%P\\0%s\\0%T@\\0'; else exit 42; fi"},
 		},
 		{
 			name: "user and host",
 			dest: target.Destination{User: "u", Host: "example.com", Path: "/srv/tree"},
-			want: []string{"ssh", "u@example.com", "find '/srv/tree' -type f -printf '%P\\0%s\\0%T@\\0'"},
+			want: []string{"ssh", "u@example.com", "if [ -d '/srv/tree' ]; then find '/srv/tree' -type f -printf '%P\\0%s\\0%T@\\0'; else exit 42; fi"},
 		},
 		{
 			name: "ipv6 literal",
 			dest: target.Destination{User: "u", Host: "2001:db8::1", Path: "/"},
-			want: []string{"ssh", "u@2001:db8::1", "find '/' -type f -printf '%P\\0%s\\0%T@\\0'"},
+			want: []string{"ssh", "u@2001:db8::1", "if [ -d '/' ]; then find '/' -type f -printf '%P\\0%s\\0%T@\\0'; else exit 42; fi"},
 		},
 		{
 			name: "hostile path",
 			dest: target.Destination{Host: "h", Path: "/it's \"quoted\"/$HOME/`id`/;rm -rf"},
-			want: []string{"ssh", "h", `find '/it'\''s "quoted"/$HOME/` + "`id`" + `/;rm -rf' -type f -printf '%P\0%s\0%T@\0'`},
+			want: []string{"ssh", "h", `if [ -d '/it'\''s "quoted"/$HOME/` + "`id`" + `/;rm -rf' ]; then find '/it'\''s "quoted"/$HOME/` + "`id`" + `/;rm -rf' -type f -printf '%P\0%s\0%T@\0'; else exit 42; fi`},
 		},
 		{
 			name: "newline and space path",
 			dest: target.Destination{Host: "h", Path: "/a b/c\nd"},
-			want: []string{"ssh", "h", "find '/a b/c\nd' -type f -printf '%P\\0%s\\0%T@\\0'"},
+			want: []string{"ssh", "h", "if [ -d '/a b/c\nd' ]; then find '/a b/c\nd' -type f -printf '%P\\0%s\\0%T@\\0'; else exit 42; fi"},
 		},
 	}
 	for _, tc := range tests {
@@ -300,5 +300,66 @@ func TestManifestCommandSingleCommand(t *testing.T) {
 	}
 	if !strings.Contains(argv[2], "-printf") || !strings.Contains(argv[2], `\0`) {
 		t.Fatalf("remote script %q does not emit NUL-delimited records", argv[2])
+	}
+}
+
+func TestManifestCommandProgIPv6(t *testing.T) {
+	argv, err := ManifestCommandProg("/opt/ssh", target.Destination{Host: "h", Path: "/d"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"/opt/ssh", "-6", "h", "if [ -d '/d' ]; then find '/d' -type f -printf '%P\\0%s\\0%T@\\0'; else exit 42; fi"}
+	if len(argv) != len(want) {
+		t.Fatalf("argv = %q, want %q", argv, want)
+	}
+	for i := range want {
+		if argv[i] != want[i] {
+			t.Fatalf("argv[%d] = %q, want %q", i, argv[i], want[i])
+		}
+	}
+}
+
+func TestManifestCommandProgRejectsEmptyProgram(t *testing.T) {
+	if _, err := ManifestCommandProg("", target.Destination{Host: "h", Path: "/d"}, false); err == nil {
+		t.Error("empty program accepted, want error")
+	}
+}
+
+func TestMkdirCommandProg(t *testing.T) {
+	argv, err := MkdirCommandProg("ssh", target.Destination{User: "u", Host: "h", Path: "/data"}, false,
+		[]string{"/data/a b", "/data/it's", "/data/uni/日本語"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"ssh", "u@h", `mkdir -p '/data/a b' '/data/it'\''s' '/data/uni/日本語'`}
+	if len(argv) != len(want) {
+		t.Fatalf("argv = %q, want %q", argv, want)
+	}
+	for i := range want {
+		if argv[i] != want[i] {
+			t.Fatalf("argv[%d] = %q, want %q", i, argv[i], want[i])
+		}
+	}
+}
+
+func TestMkdirCommandProgIPv6(t *testing.T) {
+	argv, err := MkdirCommandProg("ssh", target.Destination{Host: "h", Path: "/d"}, true, []string{"/d/x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if argv[0] != "ssh" || argv[1] != "-6" {
+		t.Errorf("argv missing IPv6 flag: %q", argv)
+	}
+}
+
+func TestMkdirCommandProgValidation(t *testing.T) {
+	dest := target.Destination{Host: "h", Path: "/d"}
+	if _, err := MkdirCommandProg("ssh", dest, false, nil); err == nil {
+		t.Error("empty dir list accepted, want error")
+	}
+	for _, bad := range []string{"relative", "-rf", "/bad\x00dir"} {
+		if _, err := MkdirCommandProg("ssh", dest, false, []string{bad}); err == nil {
+			t.Errorf("dir %q accepted, want error", bad)
+		}
 	}
 }
