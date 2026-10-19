@@ -1,11 +1,7 @@
 // Package cli implements the catsync command-line interface: command
-// dispatch, shared option parsing and validation, and the built-in
-// doctor and version commands.
-//
-// Only doctor and version do real work in this slice. The plan, sync,
-// resume, and status commands parse and fully validate their inputs and
-// then fail with a clear "not implemented yet" error (ExitNotImplemented)
-// so scripts never mistake them for successful operations.
+// dispatch, shared option parsing and validation, the built-in doctor and
+// version commands, and the plan, sync, resume, and status transfer
+// commands driven by the executor package.
 package cli
 
 import (
@@ -15,6 +11,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/frankruan/catsync/internal/executor"
 	"github.com/frankruan/catsync/internal/target"
 )
 
@@ -22,13 +19,11 @@ import (
 const (
 	// ExitOK reports success.
 	ExitOK = 0
-	// ExitError reports a runtime failure such as a failed doctor check.
+	// ExitError reports a runtime failure: a failed transfer, an
+	// unreachable destination, a missing run, and so on.
 	ExitError = 1
-	// ExitUsage reports invalid command-line input.
+	// ExitUsage reports invalid command-line input or configuration.
 	ExitUsage = 2
-	// ExitNotImplemented reports a command whose implementation is planned
-	// for a later milestone.
-	ExitNotImplemented = 3
 )
 
 const usageText = `Usage: catsync <command> [options]
@@ -115,7 +110,8 @@ func parseFlags(fs *flag.FlagSet, args []string) (int, bool) {
 }
 
 // runTransferCommand implements plan and sync. Both commands share the full
-// option set and operand validation; only their later execution differs.
+// option set and operand validation; plan stops after the transfer plan
+// while sync executes it.
 func runTransferCommand(name string, args []string, stdout, stderr io.Writer) int {
 	if err := rejectDelete(args); err != nil {
 		fmt.Fprintf(stderr, "catsync: %s: %v\n", name, err)
@@ -147,14 +143,18 @@ func runTransferCommand(name string, args []string, stdout, stderr io.Writer) in
 		fmt.Fprintf(stderr, "catsync: %s: %v\n", name, err)
 		return ExitUsage
 	}
-	_ = stdout
-	fmt.Fprintf(stderr, "catsync: %s: not implemented yet (validated source %s, destination %s)\n", name, src, dst)
-	return ExitNotImplemented
+	cfg := opts.executorConfig(src, dst, stdout, stderr)
+	ctx, stop := signalContext()
+	defer stop()
+	if name == "plan" {
+		return runPlan(ctx, cfg, &opts, stdout, stderr)
+	}
+	return runSync(ctx, cfg, &opts, stdout, stderr)
 }
 
-// runStateCommand implements resume and status. Both operate on recorded run
-// state rather than new transfer operands, so they accept a reduced option
-// set and at most one optional run identifier.
+// runStateCommand implements resume and status. Both operate on recorded
+// run state rather than new transfer operands, so they accept a reduced
+// option set and at most one optional run identifier.
 func runStateCommand(name string, args []string, stdout, stderr io.Writer) int {
 	if err := rejectDelete(args); err != nil {
 		fmt.Fprintf(stderr, "catsync: %s: %v\n", name, err)
@@ -177,9 +177,21 @@ func runStateCommand(name string, args []string, stdout, stderr io.Writer) int {
 		fs.Usage()
 		return ExitUsage
 	}
-	_ = stdout
-	fmt.Fprintf(stderr, "catsync: %s: not implemented yet\n", name)
-	return ExitNotImplemented
+	if name == "resume" {
+		ctx, stop := signalContext()
+		defer stop()
+		return runResume(ctx, &opts, fs.Arg(0), stdout, stderr)
+	}
+	return runStatus(&opts, fs.Arg(0), stdout, stderr)
+}
+
+// exitForError maps an executor error to a process exit code: invalid
+// configuration is a usage error; everything else is a runtime failure.
+func exitForError(err error) int {
+	if errors.Is(err, executor.ErrInvalidConfig) || errors.Is(err, executor.ErrVerifyNotImplemented) {
+		return ExitUsage
+	}
+	return ExitError
 }
 
 func transferUsage(name string) string {
@@ -197,7 +209,8 @@ Options:
 func stateUsage(name string) string {
 	return fmt.Sprintf(`Usage: catsync %s [options] [run-id]
 
-Without a run identifier the latest run in the state directory is used.
+Without a run identifier the latest resumable run in the state directory is
+used.
 
 Options:
 `, name)

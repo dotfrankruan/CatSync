@@ -98,33 +98,45 @@ func TestDeleteAfterDoubleDashIsPositional(t *testing.T) {
 	}
 }
 
-func TestPlanAndSyncNotImplemented(t *testing.T) {
-	src := tempSource(t)
-	for _, name := range []string{"plan", "sync"} {
-		code, _, stderr := run(t, name, src, "user@host:/data")
-		if code != ExitNotImplemented {
-			t.Errorf("%s exit = %d, want %d", name, code, ExitNotImplemented)
-		}
-		if !strings.Contains(stderr, "not implemented yet") {
-			t.Errorf("%s stderr missing not-implemented message:\n%s", name, stderr)
-		}
-		if !strings.Contains(stderr, "user@host:/data") {
-			t.Errorf("%s stderr should echo the validated destination:\n%s", name, stderr)
-		}
+func TestResumeAndStatusWithEmptyStateDir(t *testing.T) {
+	dir := t.TempDir()
+	code, _, stderr := run(t, "resume", "--state-dir", dir)
+	if code != ExitError {
+		t.Errorf("resume exit = %d, want %d", code, ExitError)
+	}
+	if !strings.Contains(stderr, "no runs") {
+		t.Errorf("resume stderr should report the empty state dir:\n%s", stderr)
+	}
+	code, _, stderr = run(t, "status", "--state-dir", dir)
+	if code != ExitError {
+		t.Errorf("status exit = %d, want %d", code, ExitError)
+	}
+	if !strings.Contains(stderr, "no runs") {
+		t.Errorf("status stderr should report the empty state dir:\n%s", stderr)
 	}
 }
 
-func TestResumeAndStatusNotImplemented(t *testing.T) {
-	for _, name := range []string{"resume", "status"} {
-		for _, extra := range [][]string{nil, {"run-123"}} {
-			args := append([]string{name}, extra...)
-			code, _, stderr := run(t, args...)
-			if code != ExitNotImplemented {
-				t.Errorf("Run(%v) exit = %d, want %d", args, code, ExitNotImplemented)
-			}
-			if !strings.Contains(stderr, "not implemented yet") {
-				t.Errorf("Run(%v) stderr missing not-implemented message:\n%s", args, stderr)
-			}
+func TestStatusMissingRun(t *testing.T) {
+	code, _, stderr := run(t, "status", "--state-dir", t.TempDir(), "no-such-run")
+	if code != ExitError {
+		t.Errorf("exit = %d, want %d", code, ExitError)
+	}
+	if !strings.Contains(stderr, "not found") {
+		t.Errorf("stderr should report the missing run:\n%s", stderr)
+	}
+}
+
+// TestSHA256VerificationFailsFast checks that --verify sha256 is refused
+// with a clear usage error before any transfer work happens.
+func TestSHA256VerificationFailsFast(t *testing.T) {
+	src := tempSource(t)
+	for _, name := range []string{"plan", "sync"} {
+		code, _, stderr := run(t, name, "--verify", "sha256", "--state-dir", t.TempDir(), src, "user@host:/data")
+		if code != ExitUsage {
+			t.Errorf("%s --verify sha256 exit = %d, want %d", name, code, ExitUsage)
+		}
+		if !strings.Contains(stderr, "sha256") || !strings.Contains(stderr, "not implemented") {
+			t.Errorf("%s stderr should explain sha256 is not implemented:\n%s", name, stderr)
 		}
 	}
 }
@@ -185,9 +197,12 @@ func TestTransferCommandsValidateDestination(t *testing.T) {
 
 func TestTransferCommandsAcceptIPv6Destination(t *testing.T) {
 	src := tempSource(t)
-	code, _, stderr := run(t, "sync", "--ipv6", src, "user@[2001:db8::1]:/data")
-	if code != ExitNotImplemented {
-		t.Errorf("exit = %d, want %d (stderr %q)", code, ExitNotImplemented, stderr)
+	// No network: the executor fails at the ssh tool check, proving the
+	// bracketed IPv6 destination parsed and validated (no usage error).
+	t.Setenv("CATSYNC_SSH", filepath.Join(t.TempDir(), "no-ssh"))
+	code, _, _ := run(t, "sync", "--ipv6", src, "user@[2001:db8::1]:/data")
+	if code != ExitError {
+		t.Errorf("exit = %d, want %d", code, ExitError)
 	}
 }
 
@@ -217,6 +232,7 @@ func TestSharedOptionValidation(t *testing.T) {
 		{"quiet and verbose", []string{"--quiet", "--verbose"}, "cannot be used together"},
 		{"zero jobs", []string{"--jobs", "0"}, "--jobs"},
 		{"negative streams", []string{"--streams=-1"}, "--streams"},
+		{"budget exceeded", []string{"--jobs", "64", "--streams", "64"}, "budget"},
 		{"bad threshold", []string{"--large-threshold", "ten"}, "invalid value"},
 		{"empty state dir", []string{"--state-dir", ""}, "--state-dir"},
 	}
@@ -236,22 +252,29 @@ func TestSharedOptionValidation(t *testing.T) {
 
 func TestSharedOptionsAccepted(t *testing.T) {
 	src := tempSource(t)
+	// Point ssh at a nonexistent program so the command fails fast at the
+	// tool check without any network access; the point is that the option
+	// set parses and validates (no usage error).
+	t.Setenv("CATSYNC_SSH", filepath.Join(t.TempDir(), "no-ssh"))
 	args := []string{
-		"sync",
-		"--backend", "mscp",
+		"plan",
+		"--backend", "rsync",
 		"--dry-run",
 		"--verbose",
 		"--ipv6",
 		"--state-dir", t.TempDir(),
-		"--verify", "sha256", // accepted now; may fail as unimplemented later
+		"--verify", "size",
 		"--jobs", "8",
 		"--streams", "2",
 		"--large-threshold", "512MiB",
 		src, "host:/data",
 	}
 	code, _, stderr := run(t, args...)
-	if code != ExitNotImplemented {
-		t.Errorf("exit = %d, want %d (stderr %q)", code, ExitNotImplemented, stderr)
+	if code != ExitError {
+		t.Errorf("exit = %d, want %d (runtime tool failure)", code, ExitError)
+	}
+	if !strings.Contains(stderr, "ssh") {
+		t.Errorf("stderr should blame ssh:\n%s", stderr)
 	}
 }
 

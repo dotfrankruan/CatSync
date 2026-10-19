@@ -1,0 +1,243 @@
+package cli
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+
+	"github.com/frankruan/catsync/internal/executor"
+	"github.com/frankruan/catsync/internal/planner"
+	"github.com/frankruan/catsync/internal/state"
+	"github.com/frankruan/catsync/internal/target"
+)
+
+// executorConfig maps the shared options and operands to an executor
+// configuration. Program overrides come from the CATSYNC_* environment
+// (diagnostics and tests); they are never printed. With --quiet the
+// executor's progress output is discarded; errors always reach stderr.
+func (o *Options) executorConfig(src string, dst target.Destination, stdout, stderr io.Writer) executor.Config {
+	execOut := stdout
+	if o.Quiet {
+		execOut = nil
+	}
+	return executor.Config{
+		SourceDir:      src,
+		Dest:           dst,
+		Backend:        state.Backend(o.Backend),
+		DryRun:         o.DryRun,
+		IPv6:           o.IPv6,
+		Verify:         o.Verify,
+		Jobs:           o.Jobs,
+		Streams:        o.Streams,
+		LargeThreshold: uint64(o.LargeThreshold),
+		StateDir:       o.StateDir,
+		Programs:       programsFromEnv(),
+		Stdout:         execOut,
+		Stderr:         stderr,
+	}
+}
+
+// programsFromEnv reads the CATSYNC_<TOOL> program overrides. They exist
+// for diagnostics and tests; values are paths or program names and are
+// never printed.
+func programsFromEnv() executor.Programs {
+	return executor.Programs{
+		SSH:    os.Getenv("CATSYNC_SSH"),
+		Rsync:  os.Getenv("CATSYNC_RSYNC"),
+		FPSync: os.Getenv("CATSYNC_FPSYNC"),
+		FPart:  os.Getenv("CATSYNC_FPART"),
+		MSCP:   os.Getenv("CATSYNC_MSCP"),
+	}
+}
+
+// runPlan executes the plan command: discover, collect the remote manifest
+// (with the conservative fallback), plan, and print a summary. Nothing is
+// transferred and no run state is written.
+func runPlan(ctx context.Context, cfg executor.Config, opts *Options, stdout, stderr io.Writer) int {
+	out, err := executor.Plan(ctx, cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "catsync: plan: %v\n", err)
+		return exitForError(err)
+	}
+	printPlan(stdout, out, opts)
+	return ExitOK
+}
+
+// printPlan renders the plan summary.
+func printPlan(w io.Writer, out *executor.PlanOutcome, opts *Options) {
+	counts := out.Result.Counts()
+	byBackend := map[state.Backend]int{}
+	var unsupported []string
+	for _, d := range out.Result.Decisions {
+		if d.Status == planner.StatusPending {
+			byBackend[d.Backend]++
+		}
+		if d.Status == planner.StatusUnsupported {
+			unsupported = append(unsupported, d.Path)
+		}
+	}
+	fmt.Fprintf(w, "plan: %d source entrie(s)\n", len(out.Result.Decisions))
+	if out.ManifestKnown {
+		fmt.Fprintln(w, "destination metadata: authoritative (remote manifest collected)")
+	} else {
+		fmt.Fprintln(w, "destination metadata: UNKNOWN — conservative fallback, every transferable file routes to rsync")
+	}
+	fmt.Fprintf(w, "to transfer: %d file(s), %d logical source bytes (not a network-traffic estimate)\n",
+		counts[planner.StatusPending], out.LogicalBytes)
+	fmt.Fprintf(w, "  fpsync (small new):   %d\n", byBackend[state.BackendFPSync])
+	fmt.Fprintf(w, "  mscp (large new):     %d\n", byBackend[state.BackendMSCP])
+	fmt.Fprintf(w, "  rsync (conservative): %d\n", byBackend[state.BackendRsync])
+	fmt.Fprintf(w, "skipped (unchanged): %d\n", counts[planner.StatusSkipped])
+	fmt.Fprintf(w, "unsupported (symlink/special/scan error): %d\n", counts[planner.StatusUnsupported])
+	if opts.Verbose {
+		for _, d := range out.Result.Decisions {
+			fmt.Fprintf(w, "  %-11s %-6s %8d  %s — %s\n", d.Status, d.Backend, d.Size, d.Path, d.Reason)
+		}
+	} else if len(unsupported) > 0 {
+		for _, p := range unsupported {
+			fmt.Fprintf(w, "  unsupported: %s\n", p)
+		}
+	}
+	fmt.Fprintln(w, "no data was transferred (plan only)")
+}
+
+// runSync executes the sync command and prints the run summary.
+func runSync(ctx context.Context, cfg executor.Config, opts *Options, stdout, stderr io.Writer) int {
+	run, err := executor.Sync(ctx, cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "catsync: sync: %v\n", err)
+		if run != nil {
+			fmt.Fprintf(stderr, "catsync: sync: run %s is recorded; inspect with 'catsync status %s'\n", run.ID, run.ID)
+		}
+		return exitForError(err)
+	}
+	printRunSummary(stdout, run, opts)
+	return ExitOK
+}
+
+// runResume executes the resume command.
+func runResume(ctx context.Context, opts *Options, id string, stdout, stderr io.Writer) int {
+	execOut := stdout
+	if opts.Quiet {
+		execOut = nil
+	}
+	cfg := executor.Config{
+		StateDir: opts.StateDir,
+		Programs: programsFromEnv(),
+		Stdout:   execOut,
+		Stderr:   stderr,
+	}
+	run, err := executor.Resume(ctx, cfg, id)
+	if err != nil {
+		fmt.Fprintf(stderr, "catsync: resume: %v\n", err)
+		return exitForError(err)
+	}
+	printRunSummary(stdout, run, opts)
+	return ExitOK
+}
+
+// printRunSummary renders the final counts of a finished sync or resume.
+func printRunSummary(w io.Writer, run *state.Run, opts *Options) {
+	var counts map[state.Status]int = map[state.Status]int{}
+	byBackend := map[state.Backend]int{}
+	for _, t := range run.Tasks {
+		counts[t.Status]++
+		byBackend[t.Backend]++
+	}
+	if run.Config.DryRun {
+		fmt.Fprintf(w, "run %s: dry run — no data was transferred\n", run.ID)
+	} else {
+		fmt.Fprintf(w, "run %s: %s\n", run.ID, run.Status)
+	}
+	fmt.Fprintf(w, "  completed %d, pending %d, failed %d, skipped %d (of %d tasks)\n",
+		counts[state.StatusCompleted], counts[state.StatusPending],
+		counts[state.StatusFailed], counts[state.StatusSkipped], len(run.Tasks))
+	if opts.Verbose {
+		for _, t := range run.Tasks {
+			line := fmt.Sprintf("  %-9s %-6s %8d  %s", t.Status, t.Backend, t.Size, t.Path)
+			if t.Error != "" {
+				line += " — " + t.Error
+			}
+			fmt.Fprintln(w, line)
+		}
+	}
+}
+
+// statusView renders a run for the status command without mutating it.
+func printRunStatus(w io.Writer, run *state.Run, verbose bool) {
+	fmt.Fprintf(w, "run %s: %s\n", run.ID, run.Status)
+	fmt.Fprintf(w, "  source:      %s\n", run.Source.Path)
+	fmt.Fprintf(w, "  destination: %s\n", run.Destination.String())
+	fmt.Fprintf(w, "  created:     %s\n", run.CreatedAt.Format("2006-01-02 15:04:05 UTC"))
+	fmt.Fprintf(w, "  updated:     %s\n", run.UpdatedAt.Format("2006-01-02 15:04:05 UTC"))
+	if run.FinishedAt != nil {
+		fmt.Fprintf(w, "  finished:    %s\n", run.FinishedAt.Format("2006-01-02 15:04:05 UTC"))
+	}
+	fmt.Fprintf(w, "  config:      backend=%s verify=%s jobs=%d streams=%d threshold=%d ipv6=%v dry_run=%v\n",
+		run.Config.Backend, run.Config.Verify, run.Config.Jobs, run.Config.Streams,
+		run.Config.LargeThreshold, run.Config.IPv6, run.Config.DryRun)
+	counts := map[state.Status]int{}
+	byBackend := map[state.Backend]int{}
+	checkpoints := 0
+	for _, t := range run.Tasks {
+		counts[t.Status]++
+		byBackend[t.Backend]++
+		if t.Checkpoint != "" {
+			checkpoints++
+		}
+	}
+	fmt.Fprintf(w, "  tasks:       %d total — completed %d, pending %d, failed %d, skipped %d\n",
+		len(run.Tasks), counts[state.StatusCompleted], counts[state.StatusPending],
+		counts[state.StatusFailed], counts[state.StatusSkipped])
+	fmt.Fprintf(w, "  backends:    fpsync %d, mscp %d, rsync %d\n",
+		byBackend[state.BackendFPSync], byBackend[state.BackendMSCP], byBackend[state.BackendRsync])
+	if run.FPSyncRunID != "" {
+		fmt.Fprintf(w, "  fpsync run:  %s (state dir %s)\n", run.FPSyncRunID, run.FPSyncStateDir)
+	}
+	if checkpoints > 0 {
+		fmt.Fprintf(w, "  checkpoints: %d retained (resume artifacts)\n", checkpoints)
+	}
+	if run.Error != "" {
+		fmt.Fprintf(w, "  error:       %s\n", run.Error)
+	}
+	if verbose {
+		for _, t := range run.Tasks {
+			line := fmt.Sprintf("    %-9s %-6s %8d  %s", t.Status, t.Backend, t.Size, t.Path)
+			var extras []string
+			if t.Error != "" {
+				extras = append(extras, t.Error)
+			}
+			if t.Checkpoint != "" {
+				extras = append(extras, "checkpoint "+t.Checkpoint)
+			}
+			if len(extras) > 0 {
+				line += " — " + strings.Join(extras, "; ")
+			}
+			fmt.Fprintln(w, line)
+		}
+	}
+}
+
+// runStatus implements the status command: it reads a run without mutating
+// it and prints the summary.
+func runStatus(opts *Options, id string, stdout, stderr io.Writer) int {
+	store, err := state.NewStore(opts.StateDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "catsync: status: %v\n", err)
+		return ExitUsage
+	}
+	var run *state.Run
+	if id == "" {
+		run, err = store.Latest()
+	} else {
+		run, err = store.Load(id)
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "catsync: status: %v\n", err)
+		return ExitError
+	}
+	printRunStatus(stdout, run, opts.Verbose)
+	return ExitOK
+}

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/frankruan/catsync/internal/bytesize"
+	"github.com/frankruan/catsync/internal/executor"
 )
 
 // Options carries the configuration shared by the transfer commands. Later
@@ -109,6 +110,9 @@ func (o *Options) Validate() error {
 	}
 	if o.Streams < 1 {
 		return fmt.Errorf("--streams must be at least 1, got %d", o.Streams)
+	}
+	if o.Jobs*o.Streams > executor.MaxSSHConnections {
+		return fmt.Errorf("--jobs × --streams = %d exceeds the SSH connection budget of %d; lower one of them", o.Jobs*o.Streams, executor.MaxSSHConnections)
 	}
 	return nil
 }
