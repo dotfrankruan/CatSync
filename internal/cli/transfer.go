@@ -78,7 +78,7 @@ func printPlan(w io.Writer, out *executor.PlanOutcome, opts *Options) {
 			unsupported = append(unsupported, d.Path)
 		}
 	}
-	fmt.Fprintf(w, "plan: %d source entrie(s)\n", len(out.Result.Decisions))
+	fmt.Fprintf(w, "plan: %d source entry(ies)\n", len(out.Result.Decisions))
 	if out.ManifestKnown {
 		fmt.Fprintln(w, "destination metadata: authoritative (remote manifest collected)")
 	} else {

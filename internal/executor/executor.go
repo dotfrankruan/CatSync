@@ -554,11 +554,16 @@ func Resume(ctx context.Context, cfg Config, id string) (*state.Run, error) {
 }
 
 // latestResumable returns the most recently updated run that still has
-// work, recovering interrupted state as it goes.
+// work, recovering interrupted state as it goes. It distinguishes an empty
+// state directory (state.ErrNoRuns) from runs that merely have nothing to
+// resume (ErrNotResumable).
 func (e *Executor) latestResumable() (*state.Run, error) {
 	runs, err := e.store.List()
 	if err != nil {
 		return nil, err
+	}
+	if len(runs) == 0 {
+		return nil, state.ErrNoRuns
 	}
 	var best *state.Run
 	for _, r := range runs {
@@ -575,7 +580,7 @@ func (e *Executor) latestResumable() (*state.Run, error) {
 		}
 	}
 	if best == nil {
-		return nil, state.ErrNoRuns
+		return nil, fmt.Errorf("%w: no run has pending or failed tasks", ErrNotResumable)
 	}
 	return best, nil
 }
