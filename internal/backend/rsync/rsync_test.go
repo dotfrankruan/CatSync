@@ -1,0 +1,245 @@
+package rsync
+
+import (
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/frankruan/catsync/internal/backend"
+	"github.com/frankruan/catsync/internal/target"
+)
+
+func testDest() target.Destination {
+	return target.Destination{User: "alice", Host: "example.com", Path: "/data"}
+}
+
+func validConfig() Config {
+	return Config{
+		SourceDir: "/srv/source",
+		Dest:      testDest(),
+		Paths:     []string{"a/b.txt", "c.txt"},
+	}
+}
+
+func TestCommandGolden(t *testing.T) {
+	cfg := validConfig()
+	argv, stdin, err := cfg.Command()
+	if err != nil {
+		t.Fatalf("Command: %v", err)
+	}
+	want := []string{
+		"rsync",
+		"--archive",
+		"--partial",
+		"--partial-dir=.catsync-rsync-partial",
+		"--relative",
+		"--files-from=-",
+		"--from0",
+		"-e", "ssh",
+		"--",
+		"/srv/source/",
+		"alice@example.com:/data",
+	}
+	if !reflect.DeepEqual(argv, want) {
+		t.Errorf("argv mismatch:\n got %#v\nwant %#v", argv, want)
+	}
+	if got, want := string(stdin), "a/b.txt\x00c.txt\x00"; got != want {
+		t.Errorf("stdin = %q, want %q", got, want)
+	}
+}
+
+func TestCommandDryRunAndIPv6(t *testing.T) {
+	cfg := validConfig()
+	cfg.DryRun = true
+	cfg.SSH = backend.SSH{IPv6: true}
+	cfg.Dest = target.Destination{Host: "2001:db8::1", Path: "/data"}
+	argv, _, err := cfg.Command()
+	if err != nil {
+		t.Fatalf("Command: %v", err)
+	}
+	joined := strings.Join(argv, "\x00")
+	if !strings.Contains(joined, "--dry-run") {
+		t.Error("dry-run missing --dry-run")
+	}
+	if !reflect.DeepEqual(argv[len(argv)-4:], []string{"ssh -6", "--", "/srv/source/", "[2001:db8::1]:/data"}) {
+		t.Errorf("tail = %#v, want IPv6 transport and bracketed destination", argv[len(argv)-4:])
+	}
+	for i, a := range argv {
+		if a == "-e" && argv[i+1] != "ssh -6" {
+			t.Errorf("-e value = %q, want ssh -6", argv[i+1])
+		}
+	}
+}
+
+func TestCommandNeverForbiddenFlags(t *testing.T) {
+	cfg := validConfig()
+	cfg.DryRun = true
+	cfg.SSH = backend.SSH{IPv6: true}
+	argv, stdin, err := cfg.Command()
+	if err != nil {
+		t.Fatalf("Command: %v", err)
+	}
+	for _, a := range argv {
+		for _, bad := range forbiddenFlags {
+			if a == bad {
+				t.Errorf("argv contains forbidden flag %q: %#v", bad, argv)
+			}
+		}
+	}
+	// Deletion strings must not appear even inside the payload.
+	if strings.Contains(string(stdin), "--delete") {
+		t.Errorf("stdin contains deletion flag: %q", stdin)
+	}
+}
+
+func TestCommandPartialDir(t *testing.T) {
+	cfg := validConfig()
+	cfg.PartialDir = ".catsync/partial"
+	argv, _, err := cfg.Command()
+	if err != nil {
+		t.Fatalf("Command: %v", err)
+	}
+	found := false
+	for _, a := range argv {
+		if a == "--partial-dir=.catsync/partial" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("custom partial dir missing: %#v", argv)
+	}
+
+	for _, bad := range []string{"/abs/partial", "../escape", "a/../b"} {
+		cfg := validConfig()
+		cfg.PartialDir = bad
+		if _, _, err := cfg.Command(); err == nil {
+			t.Errorf("partial dir %q accepted, want error", bad)
+		}
+	}
+}
+
+func TestCommandRejectsUnsafePaths(t *testing.T) {
+	bad := []struct {
+		name string
+		path string
+	}{
+		{"absolute", "/etc/passwd"},
+		{"parent escape", "../x"},
+		{"nested parent", "a/../../x"},
+		{"current dir element", "./x"},
+		{"empty element", "a//b"},
+		{"trailing slash", "a/"},
+		{"NUL", "a\x00b"},
+		{"empty", ""},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.Paths = []string{tc.path}
+			if _, _, err := cfg.Command(); err == nil {
+				t.Errorf("path %q accepted, want error", tc.path)
+			}
+		})
+	}
+	t.Run("duplicate", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Paths = []string{"a", "b", "a"}
+		if _, _, err := cfg.Command(); err == nil {
+			t.Error("duplicate path accepted, want error")
+		}
+	})
+}
+
+func TestCommandSpecialPathsTravelAsStdin(t *testing.T) {
+	cfg := validConfig()
+	cfg.Paths = []string{
+		"plain.txt",
+		"dir with space/file.txt",
+		"new\nline.txt",
+		"ünïcødé-文件.txt",
+		"-leading-dash.txt",
+		"quote'and\"double.txt",
+	}
+	argv, stdin, err := cfg.Command()
+	if err != nil {
+		t.Fatalf("Command: %v", err)
+	}
+	// None of the file names may leak into argv: they are stdin data.
+	for _, a := range argv {
+		for _, p := range cfg.Paths {
+			if strings.Contains(a, p) {
+				t.Errorf("path %q leaked into argv element %q", p, a)
+			}
+		}
+	}
+	want := "plain.txt\x00dir with space/file.txt\x00new\nline.txt\x00ünïcødé-文件.txt\x00-leading-dash.txt\x00quote'and\"double.txt\x00"
+	if string(stdin) != want {
+		t.Errorf("stdin = %q, want %q", stdin, want)
+	}
+}
+
+func TestCommandValidation(t *testing.T) {
+	t.Run("relative source", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.SourceDir = "relative/src"
+		if _, _, err := cfg.Command(); err == nil {
+			t.Error("relative source accepted, want error")
+		}
+	})
+	t.Run("empty source", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.SourceDir = ""
+		if _, _, err := cfg.Command(); err == nil {
+			t.Error("empty source accepted, want error")
+		}
+	})
+	t.Run("NUL source", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.SourceDir = "/srv/\x00src"
+		if _, _, err := cfg.Command(); err == nil {
+			t.Error("NUL source accepted, want error")
+		}
+	})
+	t.Run("bad destination", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Dest = target.Destination{Host: "example.com", Path: "relative"}
+		if _, _, err := cfg.Command(); err == nil {
+			t.Error("relative destination path accepted, want error")
+		}
+	})
+	t.Run("dash operand", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Dest = target.Destination{User: "-x", Host: "example.com", Path: "/data"}
+		if _, _, err := cfg.Command(); err == nil {
+			t.Error("dash-leading destination operand accepted, want error")
+		}
+	})
+}
+
+func TestCommandSourceTrailingSlash(t *testing.T) {
+	cfg := validConfig()
+	cfg.SourceDir = "/srv/source/"
+	argv, _, err := cfg.Command()
+	if err != nil {
+		t.Fatalf("Command: %v", err)
+	}
+	if argv[len(argv)-2] != "/srv/source/" {
+		t.Errorf("source operand = %q, want single trailing slash", argv[len(argv)-2])
+	}
+}
+
+func TestCommandProgramOverrideAndEmptyList(t *testing.T) {
+	cfg := validConfig()
+	cfg.Program = "/opt/custom/rsync"
+	cfg.Paths = nil
+	argv, stdin, err := cfg.Command()
+	if err != nil {
+		t.Fatalf("Command: %v", err)
+	}
+	if argv[0] != "/opt/custom/rsync" {
+		t.Errorf("program = %q, want override", argv[0])
+	}
+	if len(stdin) != 0 {
+		t.Errorf("empty path list payload = %q, want empty", stdin)
+	}
+}
