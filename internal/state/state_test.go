@@ -221,3 +221,44 @@ func TestSaveRejectsInvalidRuns(t *testing.T) {
 		}
 	}
 }
+
+// TestUnsupportedStatusIsDistinct pins the unsupported task status: it is a
+// valid, persisted status distinct from skipped, and never counts as
+// resumable work or a completed transfer.
+func TestUnsupportedStatusIsDistinct(t *testing.T) {
+	if !state.StatusUnsupported.Valid() {
+		t.Fatal("unsupported status is not valid")
+	}
+	if state.StatusUnsupported == state.StatusSkipped {
+		t.Fatal("unsupported collides with skipped")
+	}
+	r := testRun("20251019T120000Z-0123456789abcdef")
+	r.Status = state.StatusCompleted
+	r.Tasks = []state.Task{
+		{Path: "link", Size: 0, ModTime: fixedTime, DestSize: -1, Backend: state.BackendRsync, Status: state.StatusUnsupported, Error: "symlinks are unsupported"},
+		{Path: "file", Size: 1, ModTime: fixedTime, DestSize: 1, Backend: state.BackendRsync, Status: state.StatusCompleted},
+	}
+	store, err := state.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(r); err != nil {
+		t.Fatalf("run with unsupported task rejected: %v", err)
+	}
+	loaded, err := store.Load(r.ID)
+	if err != nil {
+		t.Fatalf("load run with unsupported task: %v", err)
+	}
+	if loaded.Tasks[0].Status != state.StatusUnsupported {
+		t.Errorf("persisted task status = %q, want unsupported", loaded.Tasks[0].Status)
+	}
+	if r.Resumable() {
+		t.Error("completed run with unsupported task must not be resumable")
+	}
+	if !r.RecoverInterrupted() == false {
+		t.Error("RecoverInterrupted changed a run with no running tasks")
+	}
+	if got := r.Tasks[0].Status; got != state.StatusUnsupported {
+		t.Errorf("recovery changed unsupported status to %q", got)
+	}
+}

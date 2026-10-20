@@ -75,19 +75,28 @@ func (b Backend) Valid() bool {
 type Status string
 
 // Known statuses. Runs use pending, running, completed, and failed; skipped
-// is meaningful for tasks only.
+// and unsupported are meaningful for tasks only.
 const (
 	StatusPending   Status = "pending"
 	StatusRunning   Status = "running"
 	StatusCompleted Status = "completed"
 	StatusFailed    Status = "failed"
-	StatusSkipped   Status = "skipped"
+	// StatusSkipped marks a task that needs no transfer because the
+	// destination already matched the source metadata.
+	StatusSkipped Status = "skipped"
+	// StatusUnsupported marks a source entry the MVP cannot transfer: a
+	// symlink, a special file (device, FIFO, socket), or an entry whose
+	// scan failed. It is distinct from skipped (nothing to do) and failed
+	// (the transfer was attempted and failed): the entry is explicitly
+	// reported, never written to the destination, and never counted as
+	// completed.
+	StatusUnsupported Status = "unsupported"
 )
 
 // Valid reports whether s is a known status.
 func (s Status) Valid() bool {
 	switch s {
-	case StatusPending, StatusRunning, StatusCompleted, StatusFailed, StatusSkipped:
+	case StatusPending, StatusRunning, StatusCompleted, StatusFailed, StatusSkipped, StatusUnsupported:
 		return true
 	}
 	return false

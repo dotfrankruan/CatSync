@@ -152,7 +152,21 @@ Auto mode assigns every regular file exactly one owner:
 | new file below the threshold | fpsync (rsync if fpsync/fpart missing, or threshold < 2 bytes) |
 | new file at or above the threshold | mscp (rsync if mscp missing) |
 | existing, modified, or state unknown | rsync |
-| symlink or special file | unsupported — reported, never followed |
+| symlink, special file, or scan error | unsupported — recorded distinctly, never followed |
+
+### Unsupported entries
+
+Symlinks, special files (devices, FIFOs, sockets), and entries whose scan
+failed are recorded with the task status **unsupported**, which is distinct
+from `skipped` (nothing to do) and from `failed` (a transfer was attempted
+and failed). They are never followed, never written to the destination, and
+never counted as completed. The run summary and `catsync status` always
+report the unsupported count, without needing `--verbose`, name the paths on
+stderr at the end of `sync`/`resume`, and list every unsupported entry under
+`--verbose`; `catsync plan` shows them before anything runs. `sync` still
+exits 0 when every *transferable* file transferred — unsupported entries are
+a documented MVP limitation, reported loudly rather than silently folded
+into skipped work.
 
 Size and mtime are planning *hints*, not proof of content equality; the
 verification stage is the completion gate. Forced backends must preserve
@@ -288,8 +302,9 @@ catsync sync --backend mscp /srv/isos/ deploy@203.0.113.10:/srv/isos   # only if
   re-stat'd immediately before and after their transfer, and a changed file
   fails its task — but a consistent point-in-time copy of a live tree is
   not promised. Sync quiescent trees or snapshot first.
-- **Symlinks and special files** are reported as unsupported, never
-  transferred or followed.
+- **Symlinks, special files, and scan-error entries** are recorded with the
+  distinct unsupported status, reported by count and path in sync, resume,
+  status, and plan output, and never transferred or followed.
 - **fpsync sees the whole tree**: it cannot take CatSync's per-file list.
   Files at or above the threshold are excluded by the shifted `-s` limit,
   but files it does not own below the threshold may be copied by its

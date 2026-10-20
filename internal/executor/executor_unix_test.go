@@ -848,15 +848,21 @@ func TestSyncSymlinkAndSpecialAreExplicitlyReported(t *testing.T) {
 	if run.Status != state.StatusCompleted {
 		t.Fatalf("run status = %s (error %q)", run.Status, run.Error)
 	}
-	reported := map[string]string{}
+	reported := map[string]state.Task{}
 	for _, task := range run.Tasks {
-		reported[task.Path] = task.Error
+		reported[task.Path] = task
 	}
-	if !strings.Contains(reported["link.txt"], "symlink") {
-		t.Errorf("symlink task error = %q, want an explicit symlink note", reported["link.txt"])
+	if got := reported["link.txt"].Status; got != state.StatusUnsupported {
+		t.Errorf("symlink task status = %q, want unsupported (never skipped/completed)", got)
 	}
-	if !strings.Contains(reported["fifo"], "special") {
-		t.Errorf("fifo task error = %q, want an explicit special-file note", reported["fifo"])
+	if !strings.Contains(reported["link.txt"].Error, "symlink") {
+		t.Errorf("symlink task error = %q, want an explicit symlink note", reported["link.txt"].Error)
+	}
+	if got := reported["fifo"].Status; got != state.StatusUnsupported {
+		t.Errorf("fifo task status = %q, want unsupported", got)
+	}
+	if !strings.Contains(reported["fifo"].Error, "special") {
+		t.Errorf("fifo task error = %q, want an explicit special-file note", reported["fifo"].Error)
 	}
 	// Only the regular file reaches rsync.
 	rs := toolInvocations(h.invocations(), "rsync")

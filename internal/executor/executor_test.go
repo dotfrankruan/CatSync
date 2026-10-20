@@ -70,7 +70,7 @@ func TestValidateFull(t *testing.T) {
 }
 
 // TestBuildRunMapping checks the planner-decision → task mapping, including
-// the unsupported → skipped-with-reason convention.
+// the distinct unsupported status with the planner's reason.
 func TestBuildRunMapping(t *testing.T) {
 	cfg := validTestConfig(t)
 	e, err := newExecutor(cfg)
@@ -95,8 +95,11 @@ func TestBuildRunMapping(t *testing.T) {
 	if run.Tasks[1].Status != state.StatusSkipped || run.Tasks[1].Error != "" {
 		t.Errorf("unchanged task = %+v, want clean skip", run.Tasks[1])
 	}
-	if run.Tasks[2].Status != state.StatusSkipped || !strings.Contains(run.Tasks[2].Error, "unsupported") {
-		t.Errorf("unsupported task = %+v, want skipped with unsupported reason", run.Tasks[2])
+	if run.Tasks[2].Status != state.StatusUnsupported || !strings.Contains(run.Tasks[2].Error, "symlinks") {
+		t.Errorf("unsupported task = %+v, want unsupported with the planner reason", run.Tasks[2])
+	}
+	if run.Tasks[2].Status == state.StatusSkipped {
+		t.Error("unsupported entry collapsed into skipped")
 	}
 	if run.Tasks[0].DestSize != -1 {
 		t.Errorf("DestSize = %d, want -1 (unknown)", run.Tasks[0].DestSize)

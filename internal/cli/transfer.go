@@ -114,6 +114,7 @@ func runSync(ctx context.Context, cfg executor.Config, opts *Options, stdout, st
 		return exitForError(err)
 	}
 	printRunSummary(stdout, run, opts)
+	warnUnsupported(stderr, "sync", run)
 	return ExitOK
 }
 
@@ -135,10 +136,14 @@ func runResume(ctx context.Context, opts *Options, id string, stdout, stderr io.
 		return exitForError(err)
 	}
 	printRunSummary(stdout, run, opts)
+	warnUnsupported(stderr, "resume", run)
 	return ExitOK
 }
 
 // printRunSummary renders the final counts of a finished sync or resume.
+// Unsupported entries are always called out, even without --verbose: they
+// need a transfer the MVP cannot perform and must not look like skipped
+// work.
 func printRunSummary(w io.Writer, run *state.Run, opts *Options) {
 	var counts map[state.Status]int = map[state.Status]int{}
 	byBackend := map[state.Backend]int{}
@@ -151,9 +156,18 @@ func printRunSummary(w io.Writer, run *state.Run, opts *Options) {
 	} else {
 		fmt.Fprintf(w, "run %s: %s\n", run.ID, run.Status)
 	}
-	fmt.Fprintf(w, "  completed %d, pending %d, failed %d, skipped %d (of %d tasks)\n",
+	fmt.Fprintf(w, "  completed %d, pending %d, failed %d, skipped %d, unsupported %d (of %d tasks)\n",
 		counts[state.StatusCompleted], counts[state.StatusPending],
-		counts[state.StatusFailed], counts[state.StatusSkipped], len(run.Tasks))
+		counts[state.StatusFailed], counts[state.StatusSkipped],
+		counts[state.StatusUnsupported], len(run.Tasks))
+	if n := counts[state.StatusUnsupported]; n > 0 {
+		fmt.Fprintf(w, "  unsupported %d — NOT transferred (symlinks, special files, or scan errors)\n", n)
+		if !opts.Verbose {
+			for _, p := range unsupportedPaths(run, 5) {
+				fmt.Fprintf(w, "    %s\n", p)
+			}
+		}
+	}
 	if opts.Verbose {
 		for _, t := range run.Tasks {
 			line := fmt.Sprintf("  %-9s %-6s %8d  %s", t.Status, t.Backend, t.Size, t.Path)
@@ -163,6 +177,45 @@ func printRunSummary(w io.Writer, run *state.Run, opts *Options) {
 			fmt.Fprintln(w, line)
 		}
 	}
+}
+
+// unsupportedPaths returns up to max unsupported task paths, for concise
+// reporting.
+func unsupportedPaths(run *state.Run, max int) []string {
+	var out []string
+	for _, t := range run.Tasks {
+		if t.Status != state.StatusUnsupported {
+			continue
+		}
+		out = append(out, t.Path)
+		if len(out) >= max {
+			break
+		}
+	}
+	return out
+}
+
+// warnUnsupported prints the non-verbose warning for runs that completed but
+// left unsupported source entries untransferred. It never changes the exit
+// status: unsupported entries are a documented MVP limitation, reported
+// loudly rather than folded into skipped or completed work.
+func warnUnsupported(w io.Writer, command string, run *state.Run) {
+	n := 0
+	for _, t := range run.Tasks {
+		if t.Status == state.StatusUnsupported {
+			n++
+		}
+	}
+	if n == 0 {
+		return
+	}
+	paths := unsupportedPaths(run, 5)
+	msg := strings.Join(paths, ", ")
+	if n > len(paths) {
+		msg += fmt.Sprintf(", and %d more", n-len(paths))
+	}
+	fmt.Fprintf(w, "catsync: %s: warning: %d unsupported source entrie(s) were NOT transferred: %s\n", command, n, msg)
+	fmt.Fprintf(w, "catsync: %s: see 'catsync plan' for details; symlinks and special files are not supported by this MVP\n", command)
 }
 
 // statusView renders a run for the status command without mutating it.
@@ -188,9 +241,12 @@ func printRunStatus(w io.Writer, run *state.Run, verbose bool) {
 			checkpoints++
 		}
 	}
-	fmt.Fprintf(w, "  tasks:       %d total — completed %d, pending %d, failed %d, skipped %d\n",
+	fmt.Fprintf(w, "  tasks:       %d total — completed %d, pending %d, failed %d, skipped %d, unsupported %d\n",
 		len(run.Tasks), counts[state.StatusCompleted], counts[state.StatusPending],
-		counts[state.StatusFailed], counts[state.StatusSkipped])
+		counts[state.StatusFailed], counts[state.StatusSkipped], counts[state.StatusUnsupported])
+	if n := counts[state.StatusUnsupported]; n > 0 {
+		fmt.Fprintf(w, "  unsupported: %d (NOT transferred: symlinks, special files, or scan errors)\n", n)
+	}
 	fmt.Fprintf(w, "  backends:    fpsync %d, mscp %d, rsync %d\n",
 		byBackend[state.BackendFPSync], byBackend[state.BackendMSCP], byBackend[state.BackendRsync])
 	if run.FPSyncRunID != "" {

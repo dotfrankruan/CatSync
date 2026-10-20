@@ -16,7 +16,7 @@ Planning produces one owner for every relative path:
 | new file below threshold | fpsync when compatible and threshold >= 2 bytes, otherwise rsync |
 | new file at or above threshold | mscp when compatible, otherwise rsync |
 | existing or uncertain file | rsync |
-| symlink or special file | unsupported in the MVP |
+| symlink, special file, or scan error | unsupported (distinct task status) |
 
 Size and modification time are planning hints, not proof of content equality.
 Verification is a separate completion gate. Backend sets are immutable for a
@@ -108,7 +108,11 @@ Each JSON run records a schema version, run ID, source, destination, original
 working directory, configuration, timestamps, and tasks. A task records its
 relative path, source size/mtime, destination metadata, backend, status,
 attempt count, checkpoint reference, and last error. Valid statuses are
-`pending`, `running`, `completed`, `failed`, and `skipped`.
+`pending`, `running`, `completed`, `failed`, `skipped`, and `unsupported`.
+`unsupported` records entries the MVP cannot transfer (symlinks, special
+files, scan errors); it is never folded into `skipped` and never counted as
+completed. Run summaries and `status` always print the unsupported count and
+name the paths on stderr after `sync`/`resume`.
 
 A task is completed only after subprocess success, unchanged-source checks,
 and requested verification. On startup, `running` becomes `pending` with an

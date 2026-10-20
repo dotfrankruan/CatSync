@@ -7,9 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/frankruan/catsync/internal/state"
 	"github.com/frankruan/catsync/internal/testutil/mockexec"
 )
 
@@ -350,5 +352,94 @@ func TestCLIUsageAndRuntimeExitCodes(t *testing.T) {
 	}
 	if code, _, _ := run(t, "status", "--state-dir", h.stateDir, "broken"); code != ExitError {
 		t.Errorf("corrupt state exit = %d, want %d", code, ExitError)
+	}
+}
+
+// TestCLIReportsUnsupportedEntries covers symlinks, FIFOs, and per-entry
+// scan errors: each is recorded with the distinct unsupported status, the
+// count and paths are reported without --verbose in both sync and status,
+// and nothing is silently folded into skipped work.
+func TestCLIReportsUnsupportedEntries(t *testing.T) {
+	h := newCLIHarness(t)
+	h.writeSrc("regular.txt", 10)
+	if err := os.Symlink("regular.txt", filepath.Join(h.src, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(h.src, "fifo"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	locked := filepath.Join(h.src, "locked")
+	if err := os.Mkdir(locked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(locked, "hidden.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(locked, 0o700) }() // let TempDir cleanup work
+
+	post := h.writeManifest("post", h.record("regular.txt"))
+	h.scriptFreshDestSSH(post)
+	h.writeScript("rsync", "exit=0")
+
+	code, stdout, stderr := run(t, "sync", "--state-dir", h.stateDir, "--backend", "rsync",
+		h.src, "user@host:/data")
+	if code != ExitOK {
+		t.Fatalf("sync exit = %d, stderr:\n%s", code, stderr)
+	}
+	if !strings.Contains(stdout, "unsupported 3") {
+		t.Errorf("sync stdout must report the unsupported count:\n%s", stdout)
+	}
+	for _, want := range []string{"unsupported 3", "NOT transferred"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("sync stdout missing %q:\n%s", want, stdout)
+		}
+	}
+	for _, want := range []string{"warning: 3 unsupported", "link.txt", "fifo", "locked"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("sync stderr warning missing %q:\n%s", want, stderr)
+		}
+	}
+
+	code, stdout, stderr = run(t, "status", "--state-dir", h.stateDir)
+	if code != ExitOK {
+		t.Fatalf("status exit = %d, stderr:\n%s", code, stderr)
+	}
+	for _, want := range []string{"unsupported 3", "NOT transferred"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("status stdout missing %q:\n%s", want, stdout)
+		}
+	}
+
+	// The persisted run distinguishes unsupported from skipped; nothing was
+	// recorded as completed for the symlink, FIFO, or scan-failed directory.
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runRec, err := store.Latest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPath := map[string]state.Task{}
+	for _, task := range runRec.Tasks {
+		byPath[task.Path] = task
+	}
+	for _, p := range []string{"link.txt", "fifo", "locked"} {
+		task, ok := byPath[p]
+		if !ok {
+			t.Fatalf("run has no task for %q", p)
+		}
+		if task.Status != state.StatusUnsupported {
+			t.Errorf("%s status = %q, want unsupported", p, task.Status)
+		}
+		if task.Status == state.StatusSkipped {
+			t.Errorf("%s was folded into skipped", p)
+		}
+	}
+	if got := byPath["regular.txt"].Status; got != state.StatusCompleted {
+		t.Errorf("regular.txt = %q, want completed", got)
 	}
 }

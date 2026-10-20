@@ -444,8 +444,10 @@ func (e *Executor) buildRun(out *PlanOutcome) (*state.Run, error) {
 		case planner.StatusSkipped:
 			t.Status = state.StatusSkipped
 		default: // unsupported
-			t.Status = state.StatusSkipped
-			t.Error = "unsupported: " + d.Reason
+			// Keep unsupported distinct from skipped: the entry needs
+			// transfer but the MVP cannot do it.
+			t.Status = state.StatusUnsupported
+			t.Error = d.Reason
 		}
 		run.Tasks = append(run.Tasks, t)
 	}
@@ -645,16 +647,27 @@ func (e *Executor) finalize(errs []string) error {
 	e.runMu.Unlock()
 
 	if len(errs) == 0 && failed == 0 {
+		unsupported := 0
 		e.runMu.Lock()
 		now := time.Now().UTC()
 		e.run.Status = state.StatusCompleted
 		e.run.FinishedAt = &now
 		e.run.Error = ""
+		for _, t := range e.run.Tasks {
+			if t.Status == state.StatusUnsupported {
+				unsupported++
+			}
+		}
 		e.runMu.Unlock()
 		if err := e.saveRun(); err != nil {
 			return err
 		}
-		e.logf("run %s: completed", e.run.ID)
+		if unsupported > 0 {
+			e.logf("run %s: completed with %d unsupported entrie(s) NOT transferred", e.run.ID, unsupported)
+			e.warnf("run %s: %d source entrie(s) are unsupported (symlinks, special files, or scan errors) and were NOT transferred", e.run.ID, unsupported)
+		} else {
+			e.logf("run %s: completed", e.run.ID)
+		}
 		return nil
 	}
 	summary := fmt.Sprintf("%d task(s) failed", failed)
