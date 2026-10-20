@@ -308,3 +308,72 @@ func TestDefaultStateDirPrefersXDG(t *testing.T) {
 		t.Errorf("defaultStateDir() = %q, want %q", got, want)
 	}
 }
+
+// TestInterspersedFlags verifies options work before, between, and after
+// operands: a configuration error in a trailing flag proves the flag was
+// parsed rather than swallowed as an operand.
+func TestInterspersedFlags(t *testing.T) {
+	src := tempSource(t)
+	dest := "user@host:/data"
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"flag after operands", []string{"plan", src, dest, "--backend", "bogus"}},
+		{"flag before operands", []string{"plan", "--backend", "bogus", src, dest}},
+		{"flag between operands", []string{"plan", src, "--backend", "bogus", dest}},
+		{"equals form after operands", []string{"plan", src, dest, "--backend=bogus"}},
+		{"single dash after operands", []string{"sync", src, dest, "-backend", "bogus"}},
+		{"trailing invalid value", []string{"sync", src, dest, "--jobs", "0"}},
+		{"trailing equals value", []string{"sync", src, dest, "--verify=md5"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, _, stderr := run(t, tc.args...)
+			if code != ExitUsage {
+				t.Fatalf("exit = %d, want %d as the trailing flag must be parsed (stderr %q)", code, ExitUsage, stderr)
+			}
+			if !strings.Contains(stderr, "catsync: plan:") && !strings.Contains(stderr, "catsync: sync:") {
+				t.Errorf("stderr missing the command's configuration error:\n%s", stderr)
+			}
+		})
+	}
+
+	// The operand count is still enforced when flags trail the operands.
+	code, _, stderr := run(t, "sync", src, "--jobs", "2")
+	if code != ExitUsage || !strings.Contains(stderr, "got 1 operands") {
+		t.Errorf("sync with one operand and trailing flag = %d (%q), want a usage error naming 1 operand", code, stderr)
+	}
+
+	// "--" ends option parsing: flag-like tokens after it are operands.
+	code, _, stderr = run(t, "sync", src, dest, "--", "--jobs")
+	if code != ExitUsage || !strings.Contains(stderr, "got 3 operands") {
+		t.Errorf("sync with -- and trailing token = %d (%q), want a usage error naming 3 operands", code, stderr)
+	}
+}
+
+// TestInterspersedStateFlags covers resume/status with the run identifier
+// before or after the options.
+func TestInterspersedStateFlags(t *testing.T) {
+	dir := t.TempDir()
+	cases := [][]string{
+		{"status", "no-such-run", "--state-dir", dir},
+		{"status", "--state-dir", dir, "no-such-run"},
+		{"resume", "no-such-run", "--state-dir", dir},
+	}
+	for _, args := range cases {
+		code, _, stderr := run(t, args...)
+		if code != ExitError {
+			t.Errorf("Run(%v) exit = %d, want %d (stderr %q)", args, code, ExitError, stderr)
+		}
+		if !strings.Contains(stderr, "not found") {
+			t.Errorf("Run(%v) stderr should report the missing run:\n%s", args, stderr)
+		}
+	}
+	// More than one positional operand is still a usage error even with
+	// trailing options.
+	code, _, stderr := run(t, "status", "a", "b", "--state-dir", dir)
+	if code != ExitUsage || !strings.Contains(stderr, "got 2 operands") {
+		t.Errorf("status with two operands = %d (%q), want a usage error", code, stderr)
+	}
+}

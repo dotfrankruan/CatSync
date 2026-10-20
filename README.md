@@ -134,7 +134,10 @@ Prints the version.
 | `--state-dir` | XDG state | run state directory |
 | `--quiet` / `--verbose` | off | output control |
 
-`--delete` is always rejected: CatSync never deletes destination files.
+Options may appear before, between, or after the operands — `catsync sync
+--jobs 8 SRC DEST` and `catsync sync SRC DEST --jobs 8` are equivalent — and
+`--` ends option parsing. `--delete` is always rejected: CatSync never
+deletes destination files.
 
 **SSH connection budget.** A run's estimated worst-case connection count is
 `jobs × streams` (each of up to `jobs` mscp processes holds `streams`

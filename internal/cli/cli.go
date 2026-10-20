@@ -109,6 +109,63 @@ func parseFlags(fs *flag.FlagSet, args []string) (int, bool) {
 	return ExitOK, true
 }
 
+// splitInterspersed separates flag tokens from positional operands, so
+// options may appear before, between, or after operands:
+//
+//	catsync sync --jobs 8 SRC DEST
+//	catsync sync SRC DEST --jobs 8
+//	catsync sync SRC --jobs 8 DEST
+//
+// A token after "--" is always an operand. A flag that takes a value
+// consumes the following token verbatim, even when it starts with a dash
+// (so --jobs -1 reaches the flag parser's range check). Unknown flags are
+// passed through to the flag parser so it produces the standard usage
+// error. The boolean/lookup logic uses only the flag package's public API.
+func splitInterspersed(fs *flag.FlagSet, args []string) (flagTokens, operands []string) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			operands = append(operands, args[i+1:]...)
+			return flagTokens, operands
+		}
+		if len(a) < 2 || a[0] != '-' || a == "-" {
+			operands = append(operands, a)
+			continue
+		}
+		flagTokens = append(flagTokens, a)
+		name := strings.TrimLeft(a, "-")
+		if name == "" || strings.ContainsRune(name, '=') {
+			// "-" or "--name=value": the value is inline or the parser
+			// will report the malformed flag.
+			continue
+		}
+		f := fs.Lookup(name)
+		if f == nil {
+			// Unknown: let the parser report it.
+			continue
+		}
+		if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
+			continue
+		}
+		if i+1 < len(args) {
+			i++
+			flagTokens = append(flagTokens, args[i])
+		}
+	}
+	return flagTokens, operands
+}
+
+// splitArgs is shorthand for splitInterspersed: it parses flag tokens into
+// fs and returns the operands in order. The second result reports whether
+// parsing succeeded (false, with an exit code, for help or errors).
+func splitArgs(fs *flag.FlagSet, args []string) (operands []string, code int, ok bool) {
+	flagTokens, operands := splitInterspersed(fs, args)
+	if code, ok := parseFlags(fs, flagTokens); !ok {
+		return nil, code, false
+	}
+	return operands, ExitOK, true
+}
+
 // runTransferCommand implements plan and sync. Both commands share the full
 // option set and operand validation; plan stops after the transfer plan
 // while sync executes it.
@@ -120,14 +177,14 @@ func runTransferCommand(name string, args []string, stdout, stderr io.Writer) in
 	fs := newFlagSet(name, transferUsage(name), stderr)
 	opts := defaultOptions()
 	opts.bindSharedFlags(fs)
-	if code, ok := parseFlags(fs, args); !ok {
+	operands, code, ok := splitArgs(fs, args)
+	if !ok {
 		return code
 	}
 	if err := opts.Validate(); err != nil {
 		fmt.Fprintf(stderr, "catsync: %s: %v\n", name, err)
 		return ExitUsage
 	}
-	operands := fs.Args()
 	if len(operands) != 2 {
 		fmt.Fprintf(stderr, "catsync: %s: want SOURCE and [user@]host:/absolute/path, got %d operands\n", name, len(operands))
 		fs.Usage()
@@ -165,24 +222,29 @@ func runStateCommand(name string, args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&opts.StateDir, "state-dir", opts.StateDir, "directory holding catsync run state")
 	fs.BoolVar(&opts.Verbose, "verbose", false, "increase output detail")
 	fs.BoolVar(&opts.Quiet, "quiet", false, "suppress non-error output")
-	if code, ok := parseFlags(fs, args); !ok {
+	operands, code, ok := splitArgs(fs, args)
+	if !ok {
 		return code
 	}
 	if err := opts.validateOutput(); err != nil {
 		fmt.Fprintf(stderr, "catsync: %s: %v\n", name, err)
 		return ExitUsage
 	}
-	if fs.NArg() > 1 {
-		fmt.Fprintf(stderr, "catsync: %s: want at most one run identifier, got %d operands\n", name, fs.NArg())
+	if len(operands) > 1 {
+		fmt.Fprintf(stderr, "catsync: %s: want at most one run identifier, got %d operands\n", name, len(operands))
 		fs.Usage()
 		return ExitUsage
+	}
+	id := ""
+	if len(operands) == 1 {
+		id = operands[0]
 	}
 	if name == "resume" {
 		ctx, stop := signalContext()
 		defer stop()
-		return runResume(ctx, &opts, fs.Arg(0), stdout, stderr)
+		return runResume(ctx, &opts, id, stdout, stderr)
 	}
-	return runStatus(&opts, fs.Arg(0), stdout, stderr)
+	return runStatus(&opts, id, stdout, stderr)
 }
 
 // exitForError maps an executor error to a process exit code: invalid
@@ -202,16 +264,22 @@ name an absolute path on a remote host; bracketed IPv6 literals such as
 user@[2001:db8::1]:/data are accepted. CatSync never deletes destination
 files; --delete is rejected.
 
+Options may appear before, between, or after the operands: for example
+"catsync %s --jobs 8 SRC DEST" and "catsync %s SRC DEST --jobs 8" are
+equivalent. Use "--" to end option parsing.
+
 Options:
-`, name)
+`, name, name, name)
 }
 
 func stateUsage(name string) string {
 	return fmt.Sprintf(`Usage: catsync %s [options] [run-id]
 
 Without a run identifier the latest resumable run in the state directory is
-used.
+used. Options may appear before, between, or after the run identifier, for
+example "catsync %s --state-dir DIR RUN_ID" and
+"catsync %s RUN_ID --state-dir DIR" are equivalent.
 
 Options:
-`, name)
+`, name, name, name)
 }

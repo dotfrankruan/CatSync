@@ -443,3 +443,58 @@ func TestCLIReportsUnsupportedEntries(t *testing.T) {
 		t.Errorf("regular.txt = %q, want completed", got)
 	}
 }
+
+// TestCLIInterspersedArgsEndToEnd proves options accepted after, before, or
+// between operands drive real commands end to end.
+func TestCLIInterspersedArgsEndToEnd(t *testing.T) {
+	h := newCLIHarness(t)
+	h.writeSrc("small.txt", 10)
+	h.writeSrc("big.bin", 2048)
+	post := h.writeManifest("post", h.record("small.txt")+h.record("big.bin"))
+	h.scriptFreshDestSSH(post)
+	h.writeScript("fpsync", "stdout_file="+h.writeManifest("fpsync.out", fpsyncOK+"S\t2048\t./big.bin\n"))
+	h.writeScript("mscp", "touch_flag=-W")
+
+	// Every option trails the operands.
+	code, stdout, stderr := run(t, "sync", h.src, "user@host:/data",
+		"--state-dir", h.stateDir, "--large-threshold", "1KiB",
+		"--jobs", "2", "--streams", "2")
+	if code != ExitOK {
+		t.Fatalf("sync with trailing options exit = %d, stderr:\n%s", code, stderr)
+	}
+	if !strings.Contains(stdout, "run ") || !strings.Contains(stdout, "completed") {
+		t.Errorf("sync stdout missing the run summary:\n%s", stdout)
+	}
+
+	// Options interleaved between operands for plan.
+	code, stdout, stderr = run(t, "plan", "--state-dir", h.stateDir, h.src,
+		"--large-threshold", "1KiB", "user@host:/data")
+	if code != ExitOK {
+		t.Fatalf("plan with interleaved options exit = %d, stderr:\n%s", code, stderr)
+	}
+	if !strings.Contains(stdout, "plan:") || !strings.Contains(stdout, "no data was transferred") {
+		t.Errorf("plan stdout unexpected:\n%s", stdout)
+	}
+
+	// Run identifier first, options after (status), and options after the
+	// identifier for resume.
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runRec, err := store.Latest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr = run(t, "status", runRec.ID, "--state-dir", h.stateDir, "--verbose")
+	if code != ExitOK {
+		t.Fatalf("status with trailing options exit = %d, stderr:\n%s", code, stderr)
+	}
+	if !strings.Contains(stdout, runRec.ID) {
+		t.Errorf("status stdout missing the run id:\n%s", stdout)
+	}
+	code, _, stderr = run(t, "resume", runRec.ID, "--state-dir", h.stateDir)
+	if code != ExitError || !strings.Contains(stderr, "not resumable") {
+		t.Errorf("resume of completed run with trailing options = %d (%q), want not-resumable", code, stderr)
+	}
+}
