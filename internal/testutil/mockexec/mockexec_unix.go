@@ -4,6 +4,9 @@ package mockexec
 
 import (
 	"fmt"
+	"os"
+	"os/signal"
+	"path/filepath"
 	"syscall"
 )
 
@@ -30,4 +33,24 @@ func raiseSignal(name string) error {
 		return fmt.Errorf("unknown signal %q", name)
 	}
 	return syscall.Kill(syscall.Getpid(), sig)
+}
+
+// ignoreTerm makes the helper ignore SIGTERM, forcing the process runner's
+// SIGKILL escalation path.
+func ignoreTerm() {
+	signal.Ignore(syscall.SIGTERM)
+}
+
+// installCatchSignal records the first SIGINT/SIGTERM the helper receives
+// to <dir>/signal and exits 42, proving which signal was forwarded.
+func installCatchSignal(dir string) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-ch
+		if dir != "" {
+			_ = os.WriteFile(filepath.Join(dir, "signal"), []byte(sig.String()), 0600)
+		}
+		os.Exit(42)
+	}()
 }

@@ -39,6 +39,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -79,7 +80,38 @@ const (
 	// EnvInvocationLog names a file every invocation appends one JSON
 	// record to (script style).
 	EnvInvocationLog = "MOCKEXEC_INVOCATION_LOG"
+
+	// EnvSpawnChildren makes the helper spawn N grandchild processes (the
+	// test binary in grandchild role) before its own configured sleep, so
+	// cancellation tests can prove the whole process tree dies.
+	EnvSpawnChildren = "MOCKEXEC_SPAWN_CHILDREN"
+	// EnvChildSleepMS is how long each grandchild sleeps (default
+	// 30000). Grandchildren never write invocation records.
+	EnvChildSleepMS = "MOCKEXEC_CHILD_SLEEP_MS"
+	// EnvChildTouch is a file each grandchild writes after its sleep,
+	// simulating a writer that must not survive cancellation (or a
+	// post-cleanup write).
+	EnvChildTouch = "MOCKEXEC_CHILD_TOUCH"
+	// EnvChildPidDir is a directory each grandchild writes its PID to as
+	// child-<index>.pid, so tests can verify it is gone.
+	EnvChildPidDir = "MOCKEXEC_CHILD_PID_DIR"
+	// EnvChildIgnoreTerm makes grandchildren ignore SIGTERM, forcing the
+	// SIGKILL escalation path.
+	EnvChildIgnoreTerm = "MOCKEXEC_CHILD_IGNORE_TERM"
+	// EnvIgnoreTerm makes the helper itself ignore SIGTERM.
+	EnvIgnoreTerm = "MOCKEXEC_IGNORE_TERM"
+	// EnvCatchSignal makes the helper catch SIGINT/SIGTERM, record the
+	// signal name to <record dir>/signal, and exit 42.
+	EnvCatchSignal = "MOCKEXEC_CATCH_SIGNAL"
+	// EnvRole is set for spawned grandchildren; the value "grandchild"
+	// selects the grandchild behavior instead of normal helper behavior.
+	EnvRole = "MOCKEXEC_ROLE"
+	// EnvChildIndex is the grandchild's zero-based index.
+	EnvChildIndex = "MOCKEXEC_CHILD_INDEX"
 )
+
+// RoleGrandchild is the EnvRole value selecting grandchild behavior.
+const RoleGrandchild = "grandchild"
 
 // Record file names within the record directory.
 const (
@@ -101,11 +133,22 @@ type behavior struct {
 	touch      string
 	echoEnv    string
 	signal     string
+
+	spawnChildren   int
+	childSleepMS    int
+	childTouch      string
+	childPidDir     string
+	childIgnoreTerm bool
+	ignoreTerm      bool
+	catchSignal     bool
 }
 
 // RunHelper executes the configured mock behavior and returns the process
 // exit status. It is meant to be passed to os.Exit from TestMain.
 func RunHelper() int {
+	if os.Getenv(EnvRole) == RoleGrandchild {
+		return runGrandchild()
+	}
 	tool := filepath.Base(os.Args[0])
 	if dir := os.Getenv(EnvRecordDir); dir != "" {
 		record(dir)
@@ -117,6 +160,15 @@ func RunHelper() int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mockexec: %v\n", err)
 		return 2
+	}
+	if bh.ignoreTerm {
+		ignoreTerm()
+	}
+	if bh.catchSignal {
+		installCatchSignal(os.Getenv(EnvRecordDir))
+	}
+	if bh.spawnChildren > 0 {
+		spawnChildren(bh)
 	}
 	if bh.touch != "" {
 		if err := os.WriteFile(bh.touch, []byte("mock checkpoint\n"), 0600); err != nil {
@@ -154,6 +206,67 @@ func RunHelper() int {
 		// The signal may be caught or ignored; fall through to exit.
 	}
 	return bh.exit
+}
+
+// runGrandchild implements the grandchild role: it records its PID, then
+// sleeps and optionally writes a file, ignoring SIGTERM when configured.
+func runGrandchild() int {
+	idx := os.Getenv(EnvChildIndex)
+	if dir := os.Getenv(EnvChildPidDir); dir != "" {
+		_ = os.WriteFile(filepath.Join(dir, "child-"+idx+".pid"),
+			[]byte(strconv.Itoa(os.Getpid())), 0600)
+	}
+	if os.Getenv(EnvChildIgnoreTerm) != "" {
+		ignoreTerm()
+	}
+	if ms := os.Getenv(EnvChildSleepMS); ms != "" {
+		if n, err := strconv.Atoi(ms); err == nil {
+			time.Sleep(time.Duration(n) * time.Millisecond)
+		}
+	}
+	if f := os.Getenv(EnvChildTouch); f != "" {
+		_ = os.WriteFile(f, []byte("late write from grandchild\n"), 0600)
+	}
+	return 0
+}
+
+// spawnChildren starts the configured number of grandchild processes. They
+// inherit stdout/stderr on purpose, modelling real tools whose children
+// inherit the parent's pipes, and are never waited for: cleanup is the
+// process runner's job.
+func spawnChildren(bh behavior) {
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mockexec: locate executable for spawn: %v\n", err)
+		return
+	}
+	sleep := bh.childSleepMS
+	if sleep <= 0 {
+		sleep = 30000
+	}
+	for i := 0; i < bh.spawnChildren; i++ {
+		cmd := exec.Command(exe)
+		env := append(os.Environ(),
+			EnvRole+"="+RoleGrandchild,
+			EnvChildIndex+"="+strconv.Itoa(i),
+			EnvChildSleepMS+"="+strconv.Itoa(sleep),
+		)
+		if bh.childPidDir != "" {
+			env = append(env, EnvChildPidDir+"="+bh.childPidDir)
+		}
+		if bh.childTouch != "" {
+			env = append(env, EnvChildTouch+"="+bh.childTouch)
+		}
+		if bh.childIgnoreTerm {
+			env = append(env, EnvChildIgnoreTerm+"=1")
+		}
+		cmd.Env = env
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "mockexec: spawn grandchild %d: %v\n", i, err)
+		}
+	}
 }
 
 // configuredBehavior resolves the invocation's behavior: script style when
@@ -204,6 +317,25 @@ func envBehavior() (behavior, error) {
 	bh.touch = os.Getenv(EnvTouch)
 	bh.echoEnv = os.Getenv(EnvEchoEnv)
 	bh.signal = os.Getenv(EnvSignal)
+	bh.ignoreTerm = os.Getenv(EnvIgnoreTerm) != ""
+	bh.catchSignal = os.Getenv(EnvCatchSignal) != ""
+	bh.childPidDir = os.Getenv(EnvChildPidDir)
+	bh.childTouch = os.Getenv(EnvChildTouch)
+	bh.childIgnoreTerm = os.Getenv(EnvChildIgnoreTerm) != ""
+	if n := os.Getenv(EnvSpawnChildren); n != "" {
+		v, err := strconv.Atoi(n)
+		if err != nil {
+			return bh, fmt.Errorf("invalid %s %q", EnvSpawnChildren, n)
+		}
+		bh.spawnChildren = v
+	}
+	if ms := os.Getenv(EnvChildSleepMS); ms != "" {
+		v, err := strconv.Atoi(ms)
+		if err != nil {
+			return bh, fmt.Errorf("invalid %s %q", EnvChildSleepMS, ms)
+		}
+		bh.childSleepMS = v
+	}
 	if ms := os.Getenv(EnvSleepMS); ms != "" {
 		n, err := strconv.Atoi(ms)
 		if err != nil {
@@ -231,6 +363,13 @@ func envBehavior() (behavior, error) {
 //	                 (e.g. touch_flag=-W creates the mscp checkpoint)
 //	signal=NAME      signal the helper sends itself after output
 //	                 (TERM, KILL, ...; Unix only)
+//	ignore_term=1    the helper ignores SIGTERM (forces SIGKILL escalation)
+//	catch_signal=1   the helper records SIGINT/SIGTERM to <record dir>/signal
+//	spawn_children=N start N grandchild processes before sleeping
+//	child_sleep_ms=N grandchild sleep (default 30000)
+//	child_touch=P    grandchild writes P after its sleep
+//	child_pid_dir=D  grandchild writes child-<n>.pid into D
+//	child_ignore_term=1 grandchildren ignore SIGTERM
 //
 // A section without match and nth keys always applies, so it works as the
 // default or as the only section. Blank lines and lines starting with '#'
@@ -302,6 +441,25 @@ func loadScript(path, tool string, nth int) (behavior, error) {
 		}
 	}
 	bh.signal = kv["signal"]
+	bh.ignoreTerm = kv["ignore_term"] != ""
+	bh.catchSignal = kv["catch_signal"] != ""
+	bh.childPidDir = kv["child_pid_dir"]
+	bh.childTouch = kv["child_touch"]
+	bh.childIgnoreTerm = kv["child_ignore_term"] != ""
+	if v := kv["spawn_children"]; v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return bh, fmt.Errorf("tool %q: invalid spawn_children %q", tool, v)
+		}
+		bh.spawnChildren = n
+	}
+	if v := kv["child_sleep_ms"]; v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return bh, fmt.Errorf("tool %q: invalid child_sleep_ms %q", tool, v)
+		}
+		bh.childSleepMS = n
+	}
 	if v := kv["sleep_ms"]; v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
@@ -517,4 +675,26 @@ func ReadRecord(dir string) (Record, error) {
 		return rec, fmt.Errorf("mockexec: parse pid record %q: %w", pid, err)
 	}
 	return rec, nil
+}
+
+// ReadChildPids loads the PIDs written by spawned grandchildren into dir,
+// in filename order.
+func ReadChildPids(dir string) ([]int, error) {
+	matches, err := filepath.Glob(filepath.Join(dir, "child-*.pid"))
+	if err != nil {
+		return nil, fmt.Errorf("mockexec: glob child pids: %w", err)
+	}
+	var pids []int
+	for _, m := range matches {
+		data, err := os.ReadFile(m)
+		if err != nil {
+			return nil, fmt.Errorf("mockexec: read child pid %s: %w", m, err)
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err != nil {
+			return nil, fmt.Errorf("mockexec: parse child pid %s: %w", m, err)
+		}
+		pids = append(pids, pid)
+	}
+	return pids, nil
 }

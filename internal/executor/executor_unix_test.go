@@ -935,3 +935,100 @@ func TestSyncSHA256Refused(t *testing.T) {
 		t.Errorf("invocations = %d, want 0 (fail fast before any transfer)", got)
 	}
 }
+
+// TestSyncCancellationKillsWriterDescendants proves an interrupted sync
+// leaves no writer behind: the mock rsync spawns grandchildren that would
+// write a marker after a delay; Sync must not return until they are dead,
+// the destination lock must be released, and no late write may appear. This
+// models fpsync spawning several rsync/ssh workers.
+func TestSyncCancellationKillsWriterDescendants(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 10)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
+	h.scriptSSHFreshDest(post)
+	marker := filepath.Join(t.TempDir(), "late-write")
+	childDir := t.TempDir()
+	h.writeScript("rsync", fmt.Sprintf(
+		"spawn_children=2\nchild_sleep_ms=1200\nchild_touch=%s\nchild_pid_dir=%s\nsleep_ms=30000\n",
+		marker, childDir))
+	cfg := h.config()
+	cfg.Backend = state.BackendRsync
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	runDone := make(chan *state.Run, 1)
+	go func() {
+		run, err := Sync(ctx, cfg)
+		runDone <- run
+		done <- err
+	}()
+
+	// Wait until the mock writer and its descendants are running.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		pids, _ := mockexec.ReadChildPids(childDir)
+		if len(toolInvocations(h.invocations(), "rsync")) > 0 && len(pids) >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("mock rsync writer tree did not start")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	err := <-done
+	run := <-runDone
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Sync = %v, want context.Canceled", err)
+	}
+
+	// Every descendant is already gone when Sync returned.
+	pids, perr := mockexec.ReadChildPids(childDir)
+	if perr != nil {
+		t.Fatal(perr)
+	}
+	if len(pids) != 2 {
+		t.Fatalf("recorded %d descendant pids, want 2", len(pids))
+	}
+	for _, pid := range pids {
+		if err := mockexec.ProcessAlive(pid); err == nil {
+			t.Errorf("descendant writer %d survived the cancelled sync", pid)
+		}
+	}
+
+	// No late write may happen after cancellation unwound.
+	time.Sleep(1600 * time.Millisecond)
+	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("descendant wrote %s after cancellation: %v", marker, statErr)
+	}
+
+	// The destination lock is released...
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := store.LockDestination(state.Destination{User: "u", Host: "h", Path: "/data"})
+	if err != nil {
+		t.Fatalf("destination lock still held after cancellation: %v", err)
+	}
+	if err := lock.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+
+	// ...and the interrupted run is persisted, resumable, and its task was
+	// never recorded as completed.
+	if run == nil {
+		t.Fatal("Sync returned no run")
+	}
+	loaded, err := store.Load(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Status != state.StatusFailed {
+		t.Errorf("run status = %s, want failed (interrupted)", loaded.Status)
+	}
+	if len(loaded.Tasks) != 1 || loaded.Tasks[0].Status != state.StatusPending {
+		t.Errorf("task after interruption = %+v, want pending", loaded.Tasks)
+	}
+}

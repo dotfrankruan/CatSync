@@ -1,10 +1,20 @@
 // Package process runs external commands with context cancellation and
 // without any shell.
 //
-// Every execution is a direct exec.CommandContext call with an argument
-// array: no shell is involved locally, so arguments carry any byte except
-// NUL as literal data. When the context is cancelled, the direct child is
-// killed and waited for, so it is never orphaned or left as a zombie.
+// Every execution is a direct exec.Command call with an argument array: no
+// shell is involved locally, so arguments carry any byte except NUL as
+// literal data.
+//
+// On Unix the child is started as the leader of a new process group. When
+// the context is cancelled — typically because catsync received SIGINT or
+// SIGTERM — the same termination signal is forwarded to the whole group,
+// descendants included; after a bounded grace period any survivor is
+// SIGKILLed. Run returns only after the direct child has been waited for
+// and the process group has been verified empty, so fpart, rsync, and ssh
+// descendants cannot outlive Run. stdout/stderr pipes cannot block
+// cancellation forever: exec.Cmd.WaitDelay bounds them by the same grace
+// period.
+//
 // Subprocess failures are returned as *ExitError, which wraps the
 // underlying *exec.ExitError.
 package process
@@ -17,7 +27,20 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"time"
 )
+
+// DefaultGracePeriod is the time granted between the graceful signal sent
+// to a process group and the SIGKILL that force-cleans any survivor. It is
+// also the bound on waiting for output pipes to close after the child
+// exits.
+const DefaultGracePeriod = 5 * time.Second
+
+// ErrDescendantsAlive reports that a process group still had live
+// processes after the grace period and the forcing SIGKILL, so Run could
+// not guarantee the tree is gone.
+var ErrDescendantsAlive = errors.New("process: descendant processes survived cleanup")
 
 // Spec describes one command execution.
 type Spec struct {
@@ -41,13 +64,15 @@ type Spec struct {
 	Stdin io.Reader
 	// Stdout and Stderr receive the output; nil discards it.
 	//
-	// When a writer is not an *os.File, os/exec copies through a pipe and
-	// Wait blocks until every process holding the pipe — including
-	// grandchildren that survived a cancelled direct child — closes it.
-	// Callers that need prompt cancellation of tools with child processes
-	// should pass *os.File writers (for example a temporary file).
+	// Cancellation is bounded even when a grandchild inherits a pipe:
+	// WaitDelay closes the pipes after the grace period, so Run cannot
+	// block forever on them.
 	Stdout io.Writer
 	Stderr io.Writer
+	// GracePeriod overrides DefaultGracePeriod: how long a cancelled
+	// process group gets to exit after the forwarded signal before it is
+	// SIGKILLed. Non-positive values select the default.
+	GracePeriod time.Duration
 }
 
 // String renders the command for diagnostics only: the program name and
@@ -92,6 +117,46 @@ func QuoteArg(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
+// CancelSignal records which signal cancelled a context, so Run can
+// forward the same signal to the child's process group instead of always
+// sending SIGTERM. It is safe for concurrent use; the signal is set by a
+// signal handler goroutine that may run after Run reads it, in which case
+// the SIGTERM default applies.
+type CancelSignal struct {
+	mu  sync.Mutex
+	sig os.Signal
+}
+
+// NewCancelSignal returns an empty signal record.
+func NewCancelSignal() *CancelSignal { return &CancelSignal{} }
+
+// Set records the signal that triggered cancellation.
+func (c *CancelSignal) Set(sig os.Signal) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sig = sig
+}
+
+// Get returns the recorded signal, if any.
+func (c *CancelSignal) Get() (os.Signal, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sig, c.sig != nil
+}
+
+type cancelSignalKey struct{}
+
+// WithCancelSignal attaches a CancelSignal record to ctx.
+func WithCancelSignal(ctx context.Context, c *CancelSignal) context.Context {
+	return context.WithValue(ctx, cancelSignalKey{}, c)
+}
+
+// CancelSignalFromContext returns the CancelSignal attached to ctx.
+func CancelSignalFromContext(ctx context.Context) (*CancelSignal, bool) {
+	c, ok := ctx.Value(cancelSignalKey{}).(*CancelSignal)
+	return c, ok
+}
+
 // ExitError reports a subprocess that started but did not succeed: a
 // non-zero exit status, or termination by a signal (Code is then -1 and
 // Signal reports the signal where the platform exposes it).
@@ -124,12 +189,14 @@ func (e *ExitError) Unwrap() error { return e.Err }
 //
 // The result is classified so callers can distinguish the outcomes:
 //
-//   - nil: the subprocess exited with status 0.
+//   - nil: the subprocess exited with status 0 and no descendants survived.
 //   - *ExitError: the subprocess ran but failed (non-zero exit or signal
 //     not caused by the context). errors.As also reaches *exec.ExitError.
 //   - an error wrapping ctx.Err(): the context was cancelled or its
-//     deadline expired. The direct child has been killed and reaped before
-//     Run returns; it is never left running or as a zombie.
+//     deadline expired. The direct child has been killed and waited for,
+//     and the process group has been cleaned up, before Run returns.
+//   - an error wrapping ErrDescendantsAlive: cleanup could not guarantee
+//     the process tree is gone.
 //   - any other error: the process could not be started at all.
 func Run(ctx context.Context, spec Spec) error {
 	if ctx == nil {
@@ -146,9 +213,12 @@ func Run(ctx context.Context, spec Spec) error {
 			return fmt.Errorf("process: argument %q contains a NUL byte", a)
 		}
 	}
-	// CommandContext kills the direct child when ctx is done; Wait below
-	// reaps it, so the child is terminated and waited for, never orphaned.
-	cmd := exec.CommandContext(ctx, spec.Name, spec.Args...)
+	if err := ctx.Err(); err != nil {
+		// A pre-cancelled context must not start a subprocess at all:
+		// running then killing it would be a race, not a cancellation.
+		return fmt.Errorf("process: %s: %w", spec.Name, err)
+	}
+	cmd := exec.Command(spec.Name, spec.Args...)
 	cmd.Dir = spec.Dir
 	if spec.Env != nil {
 		// Additions on top of the inherited environment; on duplicate
@@ -158,17 +228,24 @@ func Run(ctx context.Context, spec Spec) error {
 	cmd.Stdin = spec.Stdin
 	cmd.Stdout = spec.Stdout
 	cmd.Stderr = spec.Stderr
+	return run(ctx, cmd, spec)
+}
 
-	err := cmd.Run()
-	if err == nil {
+// classifyWait converts a cmd.Wait result into the package's error
+// vocabulary.
+func classifyWait(name string, waitErr error, ctx context.Context) error {
+	if waitErr == nil {
 		return nil
 	}
+	if errors.Is(waitErr, exec.ErrWaitDelay) {
+		return fmt.Errorf("process: %s: output pipes stayed open past the grace period: %w", name, waitErr)
+	}
 	if ctx.Err() != nil {
-		return fmt.Errorf("process: %s terminated: %w", spec.Name, ctx.Err())
+		return fmt.Errorf("process: %s terminated: %w", name, ctx.Err())
 	}
 	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		return &ExitError{Name: spec.Name, Code: exitErr.ExitCode(), Err: exitErr}
+	if errors.As(waitErr, &exitErr) {
+		return &ExitError{Name: name, Code: exitErr.ExitCode(), Err: exitErr}
 	}
-	return fmt.Errorf("process: start %s: %w", spec.Name, err)
+	return fmt.Errorf("process: %s: %w", name, waitErr)
 }

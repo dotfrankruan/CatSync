@@ -14,3 +14,9 @@ func ProcessAlive(pid int) error {
 func raiseSignal(name string) error {
 	return errors.New("mockexec: raiseSignal unsupported on this platform")
 }
+
+// ignoreTerm is a no-op on non-Unix platforms.
+func ignoreTerm() {}
+
+// installCatchSignal is a no-op on non-Unix platforms.
+func installCatchSignal(dir string) {}
