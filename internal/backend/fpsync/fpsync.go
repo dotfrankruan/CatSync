@@ -32,6 +32,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -43,6 +44,32 @@ import (
 	"github.com/frankruan/catsync/internal/process"
 	"github.com/frankruan/catsync/internal/target"
 )
+
+// LimitForThreshold maps CatSync's large-file threshold to fpart's -s
+// partition limit.
+//
+// fpart's -S skip-big mode skips only files strictly larger than the -s
+// limit (experimentally confirmed with fpart 1.7.1), while CatSync treats a
+// file of exactly the threshold size as large. Passing threshold-1 makes
+// the tool boundary exactly "size >= threshold": a file at the boundary is
+// skipped and reported as a pseudo-partition S record instead of being
+// copied by this stage, so it cannot be written by both fpsync and the
+// backend that owns it. Thresholds below 2 cannot be expressed — fpart
+// rejects -s 0 and equal-sized files would slip through — so they are
+// rejected; callers must fall back to rsync.
+func LimitForThreshold(threshold uint64) (uint64, error) {
+	if threshold < 2 {
+		return 0, fmt.Errorf("fpsync: large threshold %d is too small: fpart needs -s >= 1 and the skip boundary must map to at-or-above-threshold", threshold)
+	}
+	limit := threshold - 1
+	if limit > math.MaxInt64 {
+		// File sizes are int64 on the discovery side; no real file can
+		// exceed MaxInt64, so this still excludes every file from the
+		// large-file skip.
+		limit = math.MaxInt64
+	}
+	return limit, nil
+}
 
 // Config describes one fpsync small-file stage.
 type Config struct {
@@ -58,7 +85,10 @@ type Config struct {
 	Jobs int
 	// FilesPerPartition caps files per partition (-f); at least 1.
 	FilesPerPartition int
-	// Threshold is the partition size limit in bytes (-s); at least 1.
+	// Threshold is the partition size limit in bytes passed to fpart as
+	// -s; at least 1. Callers should derive it from the large-file
+	// threshold with LimitForThreshold so fpart's strictly-greater
+	// skip-big boundary matches CatSync's at-or-above-threshold policy.
 	// fpart's -S skip-big only works with a size limit, so zero (meaning
 	// unlimited) is rejected.
 	Threshold uint64

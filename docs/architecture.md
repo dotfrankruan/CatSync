@@ -1,9 +1,10 @@
 # CatSync MVP architecture
 
 CatSync is a local orchestration CLI. It discovers a local source tree, obtains
-remote metadata in batches, creates disjoint transfer sets, and invokes
-`fpsync`, `mscp`, and `rsync` as external programs. The remote host needs only
-SSH/SFTP and rsync; it does not run a CatSync daemon.
+remote metadata in batches, assigns every path exactly one backend in an
+immutable plan, and invokes `fpsync`, `mscp`, and `rsync` as external
+programs. The remote host needs only SSH/SFTP and rsync; it does not run a
+CatSync daemon.
 
 ## Safety model
 
@@ -12,7 +13,7 @@ Planning produces one owner for every relative path:
 | Source/destination state | Auto backend |
 | --- | --- |
 | unchanged size and mtime | skip |
-| new file below threshold | fpsync when compatible, otherwise rsync |
+| new file below threshold | fpsync when compatible and threshold >= 2 bytes, otherwise rsync |
 | new file at or above threshold | mscp when compatible, otherwise rsync |
 | existing or uncertain file | rsync |
 | symlink or special file | unsupported in the MVP |
@@ -20,7 +21,13 @@ Planning produces one owner for every relative path:
 Size and modification time are planning hints, not proof of content equality.
 Verification is a separate completion gate. Backend sets are immutable for a
 run and stages execute sequentially, so two programs never write the same
-destination path concurrently. The MVP never passes a deletion option.
+destination path concurrently. Ownership is exact: each path has one backend.
+fpsync is the exception in *mechanism*, not in concurrent access — it crawls
+the whole tree and cannot take the per-file list, so its internal rsync may
+redundantly copy a file owned by another backend when the destination
+differs; that write is sequential, content-identical, and later verified, and
+the file's owner still drives verification and failure accounting. The MVP
+never passes a deletion option.
 
 The source is rescanned before a task starts and after it exits. A changed
 source is a failed task, not a successful transfer. State is written by
@@ -32,8 +39,10 @@ temporary-file plus rename and a destination lock prevents overlapping runs.
 2. Fetch one NUL-delimited remote manifest over SSH, rather than one SSH call
    per file.
 3. Persist the plan and original source working directory.
-4. Run the fpsync small-file stage, mscp new-large-file tasks, then the rsync
-   conservative/delta stage. Each stage consumes only its own file list.
+4. Run the fpsync small-file stage (bounded by fpart `-s threshold-1` so
+   at-or-above-threshold files are skipped, not copied), mscp
+   new-large-file tasks, then the rsync conservative/delta stage
+   (NUL-delimited `--files-from` list).
 5. Verify successful tasks and atomically save their terminal state.
 
 If remote manifest collection fails, auto mode routes all regular files to
@@ -49,19 +58,27 @@ the default fpart options and requires option/value tokens separated by `|`.
 Therefore the safe small-file command shape is:
 
 ```text
-fpsync -n JOBS -f FILES -s THRESHOLD -O -S -t STATE_DIR SOURCE/ DEST/
+fpsync -n JOBS -f FILES -s (THRESHOLD-1) -O -S -t STATE_DIR SOURCE/ DEST/
 ```
 
-The threshold is passed by fpsync to fpart; `-O -S` enables large-file
-skipping. CatSync must preserve fpsync's standard output because skipped files
-are reported as pseudo-partition `S` and are not part of a normal partition or
-fpsync's success accounting. CatSync does not use fpsync directory mode `-E`
-because it enables rsync deletion.
+The shifted limit is required because fpart skips only files *strictly
+larger* than `-s`, while CatSync classifies a file at or above the threshold
+as large. Passing `threshold-1` makes the tool boundary exactly
+`size >= threshold`; a threshold below 2 bytes cannot be expressed (fpart
+rejects `-s 0`) and disables the fpsync stage in auto mode. `-O -S` enables
+fpart large-file skipping. CatSync must preserve fpsync's standard output
+because skipped files are reported as pseudo-partition `S` and are not part of
+a normal partition or fpsync's success accounting. CatSync does not use fpsync
+directory mode `-E` because it enables rsync deletion.
 
-The behavior was exercised locally with fpsync/fpart 1.7.1: a tree containing
-6-byte and 7-byte files plus a 2048-byte file was synchronized with a 1024-byte
-limit. Only the two small files appeared in the destination and partition; the
-large file appeared as `S\t2048\t./large.bin` on standard output.
+The behavior was exercised locally with fpsync/fpart 1.7.1. A tree containing
+6-byte and 7-byte files plus a 2048-byte file with a 1024-byte limit copies
+only the small files; the large file appears as `S\t2048\t./large.bin` on
+standard output. A dedicated boundary experiment with 1000/1024/2048-byte
+files confirms the strictly-greater rule: with `-s 1024` the 1024-byte file
+is copied and only 2048 is skipped, while with `-s 1023` (the CatSync
+mapping for a 1024-byte threshold) both the 1024- and 2048-byte files are
+reported as `S` records and only the below-threshold file is copied.
 
 ### mscp
 

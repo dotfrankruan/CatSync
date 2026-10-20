@@ -76,7 +76,7 @@ func (o *Options) bindSharedFlags(fs *flag.FlagSet) {
 	fs.StringVar(&o.Verify, "verify", o.Verify, "completion verification: none, size, or sha256")
 	fs.IntVar(&o.Jobs, "jobs", o.Jobs, "maximum parallel transfer jobs")
 	fs.IntVar(&o.Streams, "streams", o.Streams, "maximum parallel streams per job")
-	fs.Var(&o.LargeThreshold, "large-threshold", "size at which a file counts as large (e.g. 512MiB)")
+	fs.Var(&o.LargeThreshold, "large-threshold", "size at or above which a file counts as large (e.g. 512MiB; fpsync needs >= 2 bytes)")
 }
 
 // validateOutput checks the options shared by every command.

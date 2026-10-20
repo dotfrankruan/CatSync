@@ -235,7 +235,9 @@ func TestSyncAutoFreshDest(t *testing.T) {
 		t.Fatalf("fpsync invocations = %d, want 1", len(fps))
 	}
 	joined := strings.Join(fps[0].Args, "\x00")
-	for _, want := range []string{"-n\x002", "-f", "-s\x001024", "-O\x00-S", "/data/"} {
+	// fpart receives threshold-1 so its strictly-greater skip-big
+	// boundary matches the at-or-above-threshold ownership policy.
+	for _, want := range []string{"-n\x002", "-f", "-s\x001023", "-O\x00-S", "/data/"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("fpsync argv missing %q: %v", want, fps[0].Args)
 		}
@@ -1030,5 +1032,102 @@ func TestSyncCancellationKillsWriterDescendants(t *testing.T) {
 	}
 	if len(loaded.Tasks) != 1 || loaded.Tasks[0].Status != state.StatusPending {
 		t.Errorf("task after interruption = %+v, want pending", loaded.Tasks)
+	}
+}
+
+// TestSyncThresholdEqualToFileIsNotCopiedByFPSync covers the boundary that
+// motivated the -s (threshold-1) mapping: a file exactly at the large
+// threshold belongs to mscp, and the fpsync stage's fpart limit must make
+// fpart skip it (reported as an S record) rather than copy it. The run
+// completes only because every skipped file has another planned owner.
+func TestSyncThresholdEqualToFileIsNotCopiedByFPSync(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 10)
+	h.writeSrc("equal.bin", 1024)
+	h.writeSrc("above.bin", 2048)
+	post := h.writeManifest("post", manifestContent(
+		h.newFileRecord("small.txt"),
+		h.newFileRecord("equal.bin"),
+		h.newFileRecord("above.bin"),
+	))
+	h.scriptSSHFreshDest(post)
+	// Real fpart with -s 1023 reports both the equal and the above file.
+	h.writeScript("fpsync", "stdout_file="+h.fpsyncOutputFile("fpsync.out",
+		"S\t1024\t./equal.bin", "S\t2048\t./above.bin"))
+	h.writeScript("mscp", "touch_flag=-W")
+
+	run, err := Sync(context.Background(), h.config())
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if run.Status != state.StatusCompleted {
+		t.Fatalf("run status = %s (%q)", run.Status, run.Error)
+	}
+	byPath := map[string]state.Task{}
+	for _, task := range run.Tasks {
+		byPath[task.Path] = task
+	}
+	if got := byPath["equal.bin"].Backend; got != state.BackendMSCP {
+		t.Errorf("equal-threshold file backend = %s, want mscp", got)
+	}
+	if got := byPath["small.txt"].Backend; got != state.BackendFPSync {
+		t.Errorf("below-threshold file backend = %s, want fpsync", got)
+	}
+	invs := h.invocations()
+	fps := toolInvocations(invs, "fpsync")
+	if len(fps) != 1 {
+		t.Fatalf("fpsync invocations = %d, want 1", len(fps))
+	}
+	joined := strings.Join(fps[0].Args, "\x00")
+	if !strings.Contains(joined, "-s\x001023") {
+		t.Errorf("fpsync argv must use fpart -s 1023 (threshold-1), got %v", fps[0].Args)
+	}
+	if strings.Contains(joined, "-s\x001024") {
+		t.Errorf("fpsync argv still uses the unshifted threshold: %v", fps[0].Args)
+	}
+	// Only the two at-or-above-threshold files go to mscp; the small file
+	// is never handed to rsync or mscp.
+	ms := toolInvocations(invs, "mscp")
+	if len(ms) != 2 {
+		t.Errorf("mscp invocations = %d, want 2 (equal and above)", len(ms))
+	}
+	if rs := toolInvocations(invs, "rsync"); len(rs) != 0 {
+		t.Errorf("rsync invocations = %d, want 0", len(rs))
+	}
+}
+
+// TestSyncTinyThresholdDisablesFPSync covers the correctness-first
+// fallback: a threshold of 1 byte cannot be expressed as an fpart -s limit,
+// so auto mode routes the zero-byte files to rsync and never runs fpsync.
+func TestSyncTinyThresholdDisablesFPSync(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("empty.bin", 0)
+	h.writeSrc("one.bin", 1)
+	post := h.writeManifest("post", manifestContent(
+		h.newFileRecord("empty.bin"),
+		h.newFileRecord("one.bin"),
+	))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "exit=0")
+	h.writeScript("mscp", "touch_flag=-W")
+	cfg := h.config()
+	cfg.LargeThreshold = 1
+
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if run.Status != state.StatusCompleted {
+		t.Fatalf("run status = %s (%q)", run.Status, run.Error)
+	}
+	invs := h.invocations()
+	if len(toolInvocations(invs, "fpsync")) != 0 {
+		t.Error("fpsync ran with a threshold below 2 bytes")
+	}
+	if got := len(toolInvocations(invs, "rsync")); got != 1 {
+		t.Errorf("rsync invocations = %d, want 1 (zero-byte fallback)", got)
+	}
+	if got := len(toolInvocations(invs, "mscp")); got != 1 {
+		t.Errorf("mscp invocations = %d, want 1 (1-byte file is at the threshold)", got)
 	}
 }

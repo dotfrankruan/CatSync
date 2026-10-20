@@ -225,3 +225,41 @@ func TestValidateRunID(t *testing.T) {
 		t.Error("invalid run id accepted")
 	}
 }
+
+// TestLimitForThreshold pins the fpart skip-big boundary mapping: the
+// planner treats a file at or above the threshold as large, while fpart -S
+// skips only files strictly larger than its -s limit, so the limit is
+// threshold-1.
+func TestLimitForThreshold(t *testing.T) {
+	cases := []struct {
+		threshold uint64
+		want      uint64
+		wantErr   bool
+	}{
+		{0, 0, true},
+		{1, 0, true},
+		{2, 1, false},
+		{3, 2, false},
+		{1024, 1023, false},
+		{1 << 20, 1<<20 - 1, false},
+		{1<<63 - 1, 1<<63 - 2, false},
+		{1 << 63, 1<<63 - 1, false},
+		{^uint64(0), 1<<63 - 1, false}, // capped: no int64-sized file can exceed it
+	}
+	for _, tc := range cases {
+		got, err := LimitForThreshold(tc.threshold)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("LimitForThreshold(%d) = %d, want error", tc.threshold, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("LimitForThreshold(%d): %v", tc.threshold, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("LimitForThreshold(%d) = %d, want %d", tc.threshold, got, tc.want)
+		}
+	}
+}

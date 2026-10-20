@@ -4,10 +4,9 @@
 
 CatSync is a local orchestration CLI for moving large directory trees to a
 remote host over SSH. It discovers a local source tree, collects the remote
-destination's metadata in one batched SSH call, splits the work into
-**disjoint** sets — one backend per file, never two writers for the same
-destination path — and drives battle-tested external tools to move the data
-in parallel:
+destination's metadata in one batched SSH call, assigns every file exactly
+one backend in an immutable **disjoint plan**, and drives battle-tested
+external tools to move the data in parallel:
 
 - **fpsync** (fpart + rsync) for the small-file stage,
 - **mscp** for large files confirmed new at the destination (parallel SSH
@@ -130,7 +129,7 @@ Prints the version.
 | `--verify` | `size` | `none` or `size` (`sha256` is not implemented, see below) |
 | `--jobs` | 4 | max concurrent transfer processes |
 | `--streams` | 4 | mscp SSH connections per process |
-| `--large-threshold` | `512MiB` | size at which a file counts as large |
+| `--large-threshold` | `512MiB` | size at or above which a file counts as large (must be ≥ 2 bytes for fpsync) |
 | `--ipv6` | off | restrict ssh, rsync transport, and mscp to IPv6 |
 | `--state-dir` | XDG state | run state directory |
 | `--quiet` / `--verbose` | off | output control |
@@ -150,7 +149,7 @@ Auto mode assigns every regular file exactly one owner:
 | Source / destination state | Backend |
 | --- | --- |
 | unchanged size and mtime (hint only) | skipped — no transfer |
-| new file below the threshold | fpsync (rsync if fpsync/fpart missing) |
+| new file below the threshold | fpsync (rsync if fpsync/fpart missing, or threshold < 2 bytes) |
 | new file at or above the threshold | mscp (rsync if mscp missing) |
 | existing, modified, or state unknown | rsync |
 | symlink or special file | unsupported — reported, never followed |
@@ -159,24 +158,37 @@ Size and mtime are planning *hints*, not proof of content equality; the
 verification stage is the completion gate. Forced backends must preserve
 the safety policy: `--backend mscp` rejects files that exist at the
 destination or whose destination state is unknown, and `--backend fpsync`
-rejects files at or above the threshold.
+rejects files at or above the threshold (and any threshold below 2 bytes).
 
 ### fpsync, fpart, and the two different `-S` flags
 
-CatSync runs `fpsync -v -n JOBS -f 2000 -s THRESHOLD -O -S -t STATEDIR SRC/ DST/`.
+CatSync runs `fpsync -v -n JOBS -f 2000 -s (THRESHOLD-1) -O -S -t STATEDIR SRC/ DST/`.
 The `-S` here is passed *through* `fpsync -O` to **fpart**, enabling
 fpart's skip-files-larger-than-the-partition-limit mode — completely
 unrelated to **fpsync's own** `-S`, which enables sudo and is never used.
 fpsync's `-E` (directory mode) is never used either: it enables rsync's
 `--delete`.
 
-fpsync always crawls the whole source tree. Files at or above the threshold
-are skipped by fpart and printed as pseudo-partition records
-(`S<TAB>size<TAB>./path`). CatSync parses those records and **fails the
-run** if a skipped file has no other planned backend owner — a large file
-is never silently dropped. (Files owned by rsync may additionally be copied
-by fpsync's internal rsync when they differ; stages run sequentially, so
-writers never overlap, and the rsync stage then finds them up to date.)
+The shifted `-s` value matters: fpart skips only files **strictly larger**
+than the limit (verified against fpart 1.7.1: with `-s 1024`, a 1024-byte
+file is copied and only 1025+ bytes are skipped). CatSync treats a file at
+or above the threshold as large, so it passes `threshold-1`, which makes
+fpart's skip boundary exactly `size >= threshold`. A threshold below 2
+bytes cannot be expressed this way (fpart rejects `-s 0`), so auto mode
+falls back to rsync for the below-threshold files and forced fpsync is
+refused — correctness first, never a silent duplicate writer.
+
+fpsync still crawls the whole source tree, so the plan's disjointness is
+about *ownership and accounting*, not about fpsync's internal rsync being
+handed a file list (it cannot be). At-or-above-threshold files are skipped
+by fpart and printed as pseudo-partition records (`S<TAB>size<TAB>./path`);
+CatSync parses those records and **fails the run** if a skipped file has no
+other planned backend owner — a large file is never silently dropped. A
+file owned by rsync (for example a modified small file) can additionally be
+copied by fpsync's internal rsync when it differs: stages run strictly
+sequentially, so two writers never overlap in time, the content source is
+the same snapshot, and the later rsync stage finds the destination up to
+date. Verification and failure accounting stay per-owner.
 
 ### mscp: new large files only
 
@@ -258,8 +270,12 @@ catsync sync --backend mscp /srv/isos/ deploy@203.0.113.10:/srv/isos   # only if
   escaped.
 - SSH host-key checking is never disabled; CatSync passes no
   `StrictHostKeyChecking` overrides. Configure `~/.ssh/config` as usual.
-- No destination path ever has two backend writers: the plan is disjoint
-  and stages execute sequentially.
+- Components never write the same destination path concurrently: the plan
+  assigns one owner per file, and stages (fpsync, mscp, rsync) run strictly
+  sequentially. fpsync is a whole-tree crawler, so its internal rsync can
+  redundantly copy a file owned by another backend when the destination
+  differs; that copy is sequential and content-identical, and ownership
+  still determines verification and failure accounting.
 - There is no deletion: no `--delete`, no fpsync `-E`, no remote cleanup.
 - Credentials and private keys are never read or printed; the
   `CATSYNC_SSH`/`CATSYNC_RSYNC`/`CATSYNC_FPSYNC`/`CATSYNC_FPART`/
@@ -274,9 +290,11 @@ catsync sync --backend mscp /srv/isos/ deploy@203.0.113.10:/srv/isos   # only if
   not promised. Sync quiescent trees or snapshot first.
 - **Symlinks and special files** are reported as unsupported, never
   transferred or followed.
-- **fpsync sees the whole tree**: files it does not own may be copied by
-  its internal rsync when they differ (sequential stages keep this safe),
-  and small files created *during* a run are copied but untracked.
+- **fpsync sees the whole tree**: it cannot take CatSync's per-file list.
+  Files at or above the threshold are excluded by the shifted `-s` limit,
+  but files it does not own below the threshold may be copied by its
+  internal rsync when they differ (sequential stages keep this safe), and
+  small files created *during* a run are copied but untracked.
 - **mscp** transfers new files only; a modified large file always falls to
   rsync. mscp runs where the source lives — no remote-to-remote copies.
 - **fpsync transport options** (e.g. IPv6-only) cannot be forced through

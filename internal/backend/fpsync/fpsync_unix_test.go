@@ -304,3 +304,105 @@ func TestLocalRealFPSyncMixedTree(t *testing.T) {
 		t.Errorf("large file must not be copied, stat err = %v", err)
 	}
 }
+
+// runLocalFPSync executes the exact command the backend builds against a
+// local destination directory (no SSH) with the given fpart -s limit and
+// returns the destination directory, preserved output, and parsed result.
+func runLocalFPSync(t *testing.T, src string, limit uint64) (string, string, *Result) {
+	t.Helper()
+	if _, err := exec.LookPath("fpsync"); err != nil {
+		t.Skip("fpsync not installed; skipping real local fpsync test")
+	}
+	dst := t.TempDir()
+	cfg := validConfig()
+	cfg.Program = "fpsync"
+	cfg.SourceDir = src
+	cfg.StateDir = t.TempDir()
+	cfg.Jobs = 1
+	cfg.FilesPerPartition = 100
+	cfg.Threshold = limit
+
+	argv, err := cfg.Command()
+	if err != nil {
+		t.Fatalf("Command: %v", err)
+	}
+	argv[len(argv)-1] = dst + "/"
+	capture := filepath.Join(t.TempDir(), "fpsync.out")
+	out, err := os.Create(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runErr := process.Run(context.Background(), process.Spec{Name: argv[0], Args: argv[1:], Stdout: out})
+	if cerr := out.Close(); cerr != nil && runErr == nil {
+		runErr = cerr
+	}
+	if runErr != nil {
+		data, _ := os.ReadFile(capture)
+		t.Fatalf("local fpsync (limit %d): %v\noutput:\n%s", limit, runErr, data)
+	}
+	data, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, skipped := ParseOutput(string(data))
+	return dst, string(data), &Result{Skipped: skipped}
+}
+
+// TestLocalRealFPartThresholdBoundary pins the real fpart 1.7.1 skip-big
+// semantics and the CatSync mapping against it: with a raw -s limit, a file
+// whose size equals the limit is copied (fpart skips only strictly larger
+// files), while LimitForThreshold's limit-1 makes the equal file a skipped
+// S record. Only the below-threshold file is copied in the mapped run.
+func TestLocalRealFPartThresholdBoundary(t *testing.T) {
+	for _, tool := range []string{"fpsync", "fpart", "rsync"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not installed; skipping real fpart boundary test", tool)
+		}
+	}
+	const largeThreshold = 1024
+	src := t.TempDir()
+	for name, size := range map[string]int{
+		"below.bin": largeThreshold - 1,
+		"equal.bin": largeThreshold,
+		"above.bin": largeThreshold + 1,
+	} {
+		if err := os.WriteFile(filepath.Join(src, name), bytes.Repeat([]byte("x"), size), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Raw -s limit: fpart copies the file that equals the limit, which is
+	// exactly the ownership hazard the mapped limit avoids.
+	dstRaw, _, rawRes := runLocalFPSync(t, src, largeThreshold)
+	for _, name := range []string{"below.bin", "equal.bin"} {
+		if _, err := os.Stat(filepath.Join(dstRaw, name)); err != nil {
+			t.Errorf("raw limit %d: %s should be copied: %v", largeThreshold, name, err)
+		}
+	}
+	if len(rawRes.Skipped) != 1 || rawRes.Skipped[0].Path != "above.bin" {
+		t.Errorf("raw limit %d: skipped = %#v, want only above.bin", largeThreshold, rawRes.Skipped)
+	}
+
+	// Mapped limit (threshold-1): the equal-size file is skipped, so the
+	// small-file stage cannot write a path that mscp/rsync own.
+	limit, err := LimitForThreshold(largeThreshold)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limit != largeThreshold-1 {
+		t.Fatalf("LimitForThreshold(%d) = %d, want %d", largeThreshold, limit, largeThreshold-1)
+	}
+	dstMapped, _, mappedRes := runLocalFPSync(t, src, limit)
+	if _, err := os.Stat(filepath.Join(dstMapped, "below.bin")); err != nil {
+		t.Errorf("mapped limit %d: below-threshold file should be copied: %v", limit, err)
+	}
+	for _, name := range []string{"equal.bin", "above.bin"} {
+		if _, err := os.Stat(filepath.Join(dstMapped, name)); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("mapped limit %d: %s must not be copied by fpsync: %v", limit, name, err)
+		}
+	}
+	wantSkipped := []Skipped{{Path: "equal.bin", Size: largeThreshold}, {Path: "above.bin", Size: largeThreshold + 1}}
+	if !reflect.DeepEqual(mappedRes.Skipped, wantSkipped) {
+		t.Errorf("mapped limit %d: skipped = %#v, want %#v", limit, mappedRes.Skipped, wantSkipped)
+	}
+}

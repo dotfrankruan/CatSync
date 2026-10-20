@@ -74,12 +74,33 @@ type Tools struct {
 // both must be available.
 func (t Tools) FPSyncCompatible() bool { return t.FPSync && t.FPart }
 
+// FPSyncMinThreshold is the smallest large-file threshold fpsync can
+// reproduce without breaking the planner's ownership boundary.
+//
+// fpart's -S skips only files strictly larger than its -s partition limit,
+// while the planner treats a file at or above the threshold as large.
+// CatSync therefore runs fpsync with -s (threshold - 1), which makes the
+// tool boundary match exactly. That needs a threshold of at least 2 bytes:
+// fpart rejects -s 0, and any other value would let at-or-above-threshold
+// files into the small-file stage, where mscp/rsync also own them.
+const FPSyncMinThreshold = 2
+
+// FPSyncUsable reports whether the fpsync small-file stage can safely
+// carry the below-threshold files: both tools must exist and the threshold
+// must be expressible as fpart's -s limit (see FPSyncMinThreshold).
+func (c *Config) FPSyncUsable() bool {
+	return c.Tools.FPSyncCompatible() && c.Threshold >= FPSyncMinThreshold
+}
+
 // Config is one planning request.
 type Config struct {
 	// Backend is the requested backend: auto or a concrete backend.
 	Backend state.Backend
 	// Threshold is the size in bytes at which a file counts as large; a
-	// file of exactly Threshold bytes is large.
+	// file of exactly Threshold bytes is large. fpsync is only usable
+	// when the threshold is at least FPSyncMinThreshold, because fpart's
+	// skip-big boundary is strictly-greater and must be shifted by one to
+	// match this at-or-above semantics.
 	Threshold uint64
 	// Tools reports external tool availability.
 	Tools Tools
@@ -98,6 +119,9 @@ func (c *Config) validate() error {
 	case state.BackendFPSync:
 		if !c.Tools.FPSyncCompatible() {
 			return errors.New("planner: backend fpsync requested but fpsync and fpart are not both available")
+		}
+		if c.Threshold < FPSyncMinThreshold {
+			return fmt.Errorf("planner: backend fpsync requires a large threshold of at least %d bytes; fpart cannot exclude at-or-above-threshold files with a smaller -s limit", FPSyncMinThreshold)
 		}
 	case state.BackendMSCP:
 		if !c.Tools.MSCP {
@@ -254,24 +278,28 @@ func planFile(d *Decision, e discovery.Entry, dest map[string]discovery.RemoteEn
 		d.Backend = state.BackendMSCP
 		d.Reason = "forced mscp: file confirmed absent at the destination"
 	default: // auto
-		planAuto(d, e, dest, isNew, large, cfg.Tools)
+		planAuto(d, e, dest, isNew, large, cfg)
 	}
 }
 
 // planAuto applies the auto-mode assignment policy to one regular file.
-func planAuto(d *Decision, e discovery.Entry, dest map[string]discovery.RemoteEntry, isNew, large bool, tools Tools) {
+func planAuto(d *Decision, e discovery.Entry, dest map[string]discovery.RemoteEntry, isNew, large bool, cfg *Config) {
 	d.Status = StatusPending
 	switch {
 	case isNew && !large:
-		if tools.FPSyncCompatible() {
+		switch {
+		case cfg.FPSyncUsable():
 			d.Backend = state.BackendFPSync
 			d.Reason = "new file below threshold: fpsync"
-		} else {
+		case !cfg.Tools.FPSyncCompatible():
 			d.Backend = state.BackendRsync
 			d.Reason = "new file below threshold: fpsync/fpart unavailable, rsync fallback"
+		default:
+			d.Backend = state.BackendRsync
+			d.Reason = "new file below threshold: threshold below 2 bytes, fpsync cannot exclude at-or-above-threshold files, rsync fallback"
 		}
 	case isNew && large:
-		if tools.MSCP {
+		if cfg.Tools.MSCP {
 			d.Backend = state.BackendMSCP
 			d.Reason = "new file at or above threshold: mscp"
 		} else {

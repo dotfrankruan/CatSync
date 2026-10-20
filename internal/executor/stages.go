@@ -52,6 +52,19 @@ func (e *Executor) fpsyncStage(ctx context.Context) error {
 		}
 		return errors.New("fpsync or fpart unavailable")
 	}
+	// The fpart partition limit is shifted by one so fpart's skip-big
+	// boundary is exactly "size >= large threshold". Thresholds below 2
+	// cannot express that boundary in fpart; the planner never assigns
+	// fpsync tasks for them, but a resumed run recorded by an older build
+	// (or a corrupted plan) must fail loudly instead of letting fpsync
+	// copy files that another backend owns.
+	partitionLimit, err := fpsync.LimitForThreshold(e.run.Config.LargeThreshold)
+	if err != nil {
+		for _, i := range idxs {
+			e.failTask(&e.run.Tasks[i], fmt.Sprintf("%v; start a new run to replan", err))
+		}
+		return err
+	}
 
 	// Revalidate every small file immediately before the stage.
 	var active []*state.Task
@@ -75,16 +88,18 @@ func (e *Executor) fpsyncStage(ctx context.Context) error {
 		Dest:              e.destTarget(),
 		Jobs:              e.run.Config.Jobs,
 		FilesPerPartition: DefaultFilesPerPartition,
-		Threshold:         e.run.Config.LargeThreshold,
-		StateDir:          stateDir,
-		Env:               e.cfg.Env,
-		Stderr:            e.stderr,
+		// fpart -S skips size > limit, so limit = threshold-1 keeps
+		// at-or-above-threshold files out of this stage's writes.
+		Threshold: partitionLimit,
+		StateDir:  stateDir,
+		Env:       e.cfg.Env,
+		Stderr:    e.stderr,
 	}
 
 	for _, t := range active {
 		e.markRunning(t)
 	}
-	e.logf("stage fpsync: %d file(s) below %d bytes", len(active), e.run.Config.LargeThreshold)
+	e.logf("stage fpsync: %d file(s) below %d bytes (fpart -s %d)", len(active), e.run.Config.LargeThreshold, partitionLimit)
 
 	// Resume only when the recorded run metadata and its on-disk state
 	// directory are both still valid; otherwise start a fresh fpsync run.

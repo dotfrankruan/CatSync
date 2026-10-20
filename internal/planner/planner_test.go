@@ -465,3 +465,63 @@ func TestNegativeSizeUnsupported(t *testing.T) {
 		t.Fatalf("negative size = %+v, want unsupported", d)
 	}
 }
+
+// TestThresholdEdgeCases pins the at-or-above semantics and the fpsync
+// safety rule for thresholds that fpart cannot express: a threshold below 2
+// bytes disables the small-file stage (rsync fallback), and forced fpsync
+// with such a threshold is refused.
+func TestThresholdEdgeCases(t *testing.T) {
+	dest := map[string]discovery.RemoteEntry{}
+
+	t.Run("threshold one routes zero-byte files to rsync", func(t *testing.T) {
+		cfg := Config{Backend: state.BackendAuto, Threshold: 1, Tools: allTools()}
+		d := decide(t, file("empty", 0), dest, cfg)
+		if d.Backend != state.BackendRsync || d.Status != StatusPending {
+			t.Errorf("size 0, threshold 1: %+v, want pending rsync fallback", d)
+		}
+		if !strings.Contains(d.Reason, "threshold below 2") {
+			t.Errorf("reason = %q, want the threshold explanation", d.Reason)
+		}
+		// A 1-byte file is at the threshold: large, so mscp.
+		if d := decide(t, file("one-byte", 1), dest, cfg); d.Backend != state.BackendMSCP {
+			t.Errorf("size 1, threshold 1: backend = %q, want mscp", d.Backend)
+		}
+	})
+
+	t.Run("threshold zero treats everything as large", func(t *testing.T) {
+		cfg := Config{Backend: state.BackendAuto, Threshold: 0, Tools: allTools()}
+		for _, size := range []int64{0, 1, 1 << 40} {
+			if d := decide(t, file("f", size), dest, cfg); d.Backend != state.BackendMSCP {
+				t.Errorf("size %d, threshold 0: backend = %q, want mscp", size, d.Backend)
+			}
+		}
+	})
+
+	t.Run("threshold two boundary", func(t *testing.T) {
+		cfg := Config{Backend: state.BackendAuto, Threshold: 2, Tools: allTools()}
+		if d := decide(t, file("one", 1), dest, cfg); d.Backend != state.BackendFPSync {
+			t.Errorf("size 1, threshold 2: backend = %q, want fpsync", d.Backend)
+		}
+		if d := decide(t, file("two", 2), dest, cfg); d.Backend != state.BackendMSCP {
+			t.Errorf("size 2, threshold 2: backend = %q, want mscp", d.Backend)
+		}
+	})
+
+	t.Run("huge thresholds keep every file small", func(t *testing.T) {
+		for _, threshold := range []uint64{1 << 63, ^uint64(0)} {
+			cfg := Config{Backend: state.BackendAuto, Threshold: threshold, Tools: allTools()}
+			if d := decide(t, file("f", 1<<40), dest, cfg); d.Backend != state.BackendFPSync {
+				t.Errorf("size 1TiB, threshold %d: backend = %q, want fpsync", threshold, d.Backend)
+			}
+		}
+	})
+
+	t.Run("forced fpsync rejects a threshold below two", func(t *testing.T) {
+		for _, threshold := range []uint64{0, 1} {
+			cfg := Config{Backend: state.BackendFPSync, Threshold: threshold, Tools: allTools()}
+			if _, err := Plan([]discovery.Entry{file("f", 10)}, dest, cfg); err == nil {
+				t.Errorf("forced fpsync, threshold %d: plan succeeded, want refusal", threshold)
+			}
+		}
+	})
+}
