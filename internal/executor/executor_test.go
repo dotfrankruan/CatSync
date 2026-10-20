@@ -121,6 +121,9 @@ func TestSourceMutationDetection(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.run = &state.Run{Source: state.Source{Path: cfg.SourceDir}}
+	// These tests exercise mutation detection, not persistence: stub the
+	// save so task transitions do not depend on a complete run document.
+	e.saveFn = func(*state.Run) error { return nil }
 
 	write := func(content string) {
 		t.Helper()
@@ -137,13 +140,13 @@ func TestSourceMutationDetection(t *testing.T) {
 		t.Fatal(err)
 	}
 	task := &state.Task{Path: "f.txt", Size: fi.Size(), ModTime: fi.ModTime(), Backend: state.BackendRsync, Status: state.StatusPending}
-	if !e.recheckBefore(task) {
-		t.Fatal("unchanged source failed pre-check")
+	if ok, err := e.recheckBefore(task); err != nil || !ok {
+		t.Fatalf("unchanged source failed pre-check: ok=%v err=%v", ok, err)
 	}
 	// Mutate the source: the task must fail, never transfer.
 	write("hello, longer now")
-	if e.recheckBefore(task) {
-		t.Fatal("mutated source passed pre-check")
+	if ok, err := e.recheckBefore(task); err != nil || ok {
+		t.Fatalf("mutated source passed pre-check: ok=%v err=%v", ok, err)
 	}
 	if task.Status != state.StatusFailed {
 		t.Errorf("task status = %s, want failed", task.Status)
@@ -151,8 +154,8 @@ func TestSourceMutationDetection(t *testing.T) {
 
 	// A vanished source must also fail.
 	task2 := &state.Task{Path: "gone.txt", Size: 1, ModTime: fi.ModTime(), Backend: state.BackendRsync, Status: state.StatusPending}
-	if e.recheckBefore(task2) {
-		t.Fatal("missing source passed pre-check")
+	if ok, err := e.recheckBefore(task2); err != nil || ok {
+		t.Fatalf("missing source passed pre-check: ok=%v err=%v", ok, err)
 	}
 	if task2.Status != state.StatusFailed {
 		t.Errorf("task2 status = %s, want failed", task2.Status)
@@ -168,20 +171,21 @@ func TestRecheckAfterCatchesMidTransferChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.run = &state.Run{Source: state.Source{Path: cfg.SourceDir}}
+	e.saveFn = func(*state.Run) error { return nil }
 	p := filepath.Join(cfg.SourceDir, "f.txt")
 	if err := os.WriteFile(p, []byte("v1"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	fi, _ := os.Stat(p)
 	task := &state.Task{Path: "f.txt", Size: fi.Size(), ModTime: fi.ModTime(), Backend: state.BackendRsync, Status: state.StatusRunning}
-	if !e.recheckAfter(task) {
-		t.Fatal("unchanged source failed post-check")
+	if ok, err := e.recheckAfter(task); err != nil || !ok {
+		t.Fatalf("unchanged source failed post-check: ok=%v err=%v", ok, err)
 	}
 	if err := os.WriteFile(p, []byte("v2 changed"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if e.recheckAfter(task) {
-		t.Fatal("changed source passed post-check")
+	if ok, err := e.recheckAfter(task); err != nil || ok {
+		t.Fatalf("changed source passed post-check: ok=%v err=%v", ok, err)
 	}
 	if task.Status != state.StatusFailed {
 		t.Errorf("task status = %s, want failed", task.Status)

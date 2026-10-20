@@ -1,6 +1,9 @@
 package state_test
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -260,5 +263,40 @@ func TestUnsupportedStatusIsDistinct(t *testing.T) {
 	}
 	if got := r.Tasks[0].Status; got != state.StatusUnsupported {
 		t.Errorf("recovery changed unsupported status to %q", got)
+	}
+}
+
+// TestSaveFailsInUnwritableLocation exercises a real disk-level persistence
+// failure: the state directory cannot be created, Save returns an error
+// wrapping the filesystem cause, and no partial document appears.
+func TestSaveFailsInUnwritableLocation(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: directory permissions are not enforced")
+	}
+	parent := t.TempDir()
+	if err := os.Chmod(parent, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(parent, 0o700) }()
+	dir := filepath.Join(parent, "state")
+	store, err := state.NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := testRun("20251019T120000Z-0123456789abcdef")
+	err = store.Save(r)
+	if err == nil {
+		t.Fatal("Save into an unwritable location = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "state:") {
+		t.Errorf("error = %v, want a state persistence error", err)
+	}
+	// Nothing partial may remain, and loading reports the missing state
+	// rather than a corrupt or half-written document.
+	if entries, derr := os.ReadDir(parent); derr == nil && len(entries) != 0 {
+		t.Errorf("failed save left entries in the unwritable parent: %v", entries)
+	}
+	if _, lerr := store.Load(r.ID); !errors.Is(lerr, state.ErrNotFound) {
+		t.Errorf("Load after failed save = %v, want ErrNotFound", lerr)
 	}
 }

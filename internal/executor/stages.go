@@ -48,7 +48,9 @@ func (e *Executor) fpsyncStage(ctx context.Context) error {
 	}
 	if !e.detectTools().FPSyncCompatible() {
 		for _, i := range idxs {
-			e.failTask(&e.run.Tasks[i], "fpsync or fpart is no longer available; start a new run to replan")
+			if err := e.failTask(&e.run.Tasks[i], "fpsync or fpart is no longer available; start a new run to replan"); err != nil {
+				return err
+			}
 		}
 		return errors.New("fpsync or fpart unavailable")
 	}
@@ -61,7 +63,9 @@ func (e *Executor) fpsyncStage(ctx context.Context) error {
 	partitionLimit, err := fpsync.LimitForThreshold(e.run.Config.LargeThreshold)
 	if err != nil {
 		for _, i := range idxs {
-			e.failTask(&e.run.Tasks[i], fmt.Sprintf("%v; start a new run to replan", err))
+			if ferr := e.failTask(&e.run.Tasks[i], fmt.Sprintf("%v; start a new run to replan", err)); ferr != nil {
+				return ferr
+			}
 		}
 		return err
 	}
@@ -70,7 +74,11 @@ func (e *Executor) fpsyncStage(ctx context.Context) error {
 	var active []*state.Task
 	for _, i := range idxs {
 		t := &e.run.Tasks[i]
-		if e.recheckBefore(t) {
+		ok, rerr := e.recheckBefore(t)
+		if rerr != nil {
+			return rerr
+		}
+		if ok {
 			active = append(active, t)
 		}
 	}
@@ -96,8 +104,13 @@ func (e *Executor) fpsyncStage(ctx context.Context) error {
 		Stderr:    e.stderr,
 	}
 
+	// Persist every task's running intent before launching. If any save
+	// fails, no subprocess is started; tasks already marked running are
+	// recovered as pending by interruption handling.
 	for _, t := range active {
-		e.markRunning(t)
+		if err := e.markRunning(t); err != nil {
+			return err
+		}
 	}
 	e.logf("stage fpsync: %d file(s) below %d bytes (fpart -s %d)", len(active), e.run.Config.LargeThreshold, partitionLimit)
 
@@ -116,7 +129,9 @@ func (e *Executor) fpsyncStage(ctx context.Context) error {
 		res, err = cfg.Run(ctx)
 	}
 	// Persist the resume artifacts before anything else, success or
-	// failure: an interrupted run needs them.
+	// failure: an interrupted run needs them. A failed save is reported but
+	// does not hide the transfer error below.
+	var artifactErr error
 	if res != nil {
 		e.runMu.Lock()
 		if res.RunID != "" {
@@ -128,16 +143,25 @@ func (e *Executor) fpsyncStage(ctx context.Context) error {
 		}
 		e.runMu.Unlock()
 		if serr := e.saveRun(); serr != nil {
-			e.warnf("save run: %v", serr)
+			artifactErr = serr
+			e.warnf("save fpsync run artifacts: %v", serr)
 		}
 	}
 	if err != nil {
 		if ctx.Err() == nil {
 			for _, t := range active {
-				e.failTask(t, fmt.Sprintf("fpsync failed: %v", err))
+				if ferr := e.failTask(t, fmt.Sprintf("fpsync failed: %v", err)); ferr != nil {
+					return ferr
+				}
 			}
 		}
+		if artifactErr != nil {
+			return fmt.Errorf("%w (also failed to record fpsync run artifacts: %v)", err, artifactErr)
+		}
 		return err
+	}
+	if artifactErr != nil {
+		return artifactErr
 	}
 
 	// On resume fpsync reports no S records again; re-verify the original
@@ -156,10 +180,12 @@ func (e *Executor) fpsyncStage(ctx context.Context) error {
 			// A file that appeared after planning and is too large for
 			// this stage: it has no owner, so it must not pass silently.
 			orphans = append(orphans, s.Path)
-		case ot.Status == state.StatusSkipped:
-			// Unchanged at the destination: needs no owner.
+		case ot.Status == state.StatusSkipped || ot.Status == state.StatusUnsupported:
+			// Unchanged or untransferable: needs no other owner.
 		case ot.Backend == state.BackendFPSync:
-			e.failTask(ot, "file grew to or past the large threshold during the run; start a new run")
+			if ferr := e.failTask(ot, "file grew to or past the large threshold during the run; start a new run"); ferr != nil {
+				return ferr
+			}
 		default:
 			// Owned by mscp or rsync as planned.
 		}
@@ -172,11 +198,17 @@ func (e *Executor) fpsyncStage(ctx context.Context) error {
 		if !still {
 			continue
 		}
-		if !e.recheckAfter(t) {
+		ok, rerr := e.recheckAfter(t)
+		if rerr != nil {
+			return rerr
+		}
+		if !ok {
 			continue
 		}
 		if e.stageVerifyNone() {
-			e.completeTask(t)
+			if cerr := e.completeTask(t); cerr != nil {
+				return cerr
+			}
 		}
 	}
 	if len(orphans) > 0 {
@@ -219,17 +251,28 @@ func quoteAll(paths []string, max int) []string {
 	return out
 }
 
-// completeTask marks a task completed (post-checks already passed) and
-// retires any mscp checkpoint: the completion gate has passed.
-func (e *Executor) completeTask(t *state.Task) {
+// completeTask records a completed task after its post-checks passed, then
+// retires any mscp checkpoint. Ordering is crash-safe:
+//
+//  1. The completed status is persisted while the checkpoint reference is
+//     still present, so a crash cannot lose track of the checkpoint before
+//     completion is durable. If this save fails, the in-memory transition is
+//     rolled back and the error is returned; the checkpoint is untouched.
+//  2. Only then is the checkpoint reference cleared (its own save) and the
+//     file removed (best-effort, harmless if orphaned).
+func (e *Executor) completeTask(t *state.Task) error {
 	e.runMu.Lock()
+	prevStatus, prevErr := t.Status, t.Error
 	t.Status = state.StatusCompleted
 	t.Error = ""
 	e.runMu.Unlock()
-	e.retireCheckpoint(t)
 	if err := e.saveRun(); err != nil {
-		e.warnf("save run: %v", err)
+		e.runMu.Lock()
+		t.Status, t.Error = prevStatus, prevErr
+		e.runMu.Unlock()
+		return err
 	}
+	return e.retireCheckpoint(t)
 }
 
 // mscpStage runs the confirmed-new large-file tasks, one mscp process per
@@ -243,7 +286,9 @@ func (e *Executor) mscpStage(ctx context.Context) error {
 	}
 	if !e.detectTools().MSCP {
 		for _, i := range idxs {
-			e.failTask(&e.run.Tasks[i], "mscp is no longer available; start a new run to replan")
+			if err := e.failTask(&e.run.Tasks[i], "mscp is no longer available; start a new run to replan"); err != nil {
+				return err
+			}
 		}
 		return errors.New("mscp unavailable")
 	}
@@ -264,7 +309,9 @@ func (e *Executor) mscpStage(ctx context.Context) error {
 		sort.Strings(dirs)
 		if err := e.mkdirRemoteParents(ctx, e.destTarget(), e.run.Config.IPv6, dirs); err != nil {
 			for _, i := range idxs {
-				e.failTask(&e.run.Tasks[i], fmt.Sprintf("create remote parent directories: %v", err))
+				if ferr := e.failTask(&e.run.Tasks[i], fmt.Sprintf("create remote parent directories: %v", err)); ferr != nil {
+					return ferr
+				}
 			}
 			return err
 		}
@@ -312,7 +359,11 @@ func (e *Executor) mscpStage(ctx context.Context) error {
 // mscpTask transfers one large file, resuming from its retained checkpoint
 // when one exists.
 func (e *Executor) mscpTask(ctx context.Context, t *state.Task, ckptDir string) error {
-	if !e.recheckBefore(t) {
+	ok, err := e.recheckBefore(t)
+	if err != nil {
+		return err
+	}
+	if !ok {
 		return nil
 	}
 	e.runMu.Lock()
@@ -323,8 +374,7 @@ func (e *Executor) mscpTask(ctx context.Context, t *state.Task, ckptDir string) 
 	checkpoint := t.Checkpoint
 	e.runMu.Unlock()
 	if err := os.MkdirAll(filepath.Dir(checkpoint), 0o700); err != nil {
-		e.failTask(t, fmt.Sprintf("create checkpoint directory: %v", err))
-		return err
+		return e.failTask(t, fmt.Sprintf("create checkpoint directory: %v", err))
 	}
 
 	resume := fileExists(checkpoint)
@@ -343,8 +393,10 @@ func (e *Executor) mscpTask(ctx context.Context, t *state.Task, ckptDir string) 
 		Stderr:      e.stderr,
 	}
 
-	e.markRunning(t)
-	var err error
+	// The running intent must be durable before mscp starts.
+	if err := e.markRunning(t); err != nil {
+		return err
+	}
 	if resume {
 		err = cfg.Resume(ctx)
 	} else {
@@ -352,15 +404,19 @@ func (e *Executor) mscpTask(ctx context.Context, t *state.Task, ckptDir string) 
 	}
 	if err != nil {
 		if ctx.Err() == nil {
-			e.failTask(t, fmt.Sprintf("mscp failed: %v", err))
+			return e.failTask(t, fmt.Sprintf("mscp failed: %v", err))
 		}
 		return err
 	}
-	if !e.recheckAfter(t) {
+	ok, rerr := e.recheckAfter(t)
+	if rerr != nil {
+		return rerr
+	}
+	if !ok {
 		return fmt.Errorf("%s: source changed during transfer", t.Path)
 	}
 	if e.stageVerifyNone() {
-		e.completeTask(t)
+		return e.completeTask(t)
 	}
 	return nil
 }
@@ -388,7 +444,9 @@ func (e *Executor) rsyncStage(ctx context.Context) error {
 	}
 	if !e.detectTools().Rsync {
 		for _, i := range idxs {
-			e.failTask(&e.run.Tasks[i], "rsync is no longer available")
+			if err := e.failTask(&e.run.Tasks[i], "rsync is no longer available"); err != nil {
+				return err
+			}
 		}
 		return errors.New("rsync unavailable")
 	}
@@ -396,7 +454,11 @@ func (e *Executor) rsyncStage(ctx context.Context) error {
 	var active []*state.Task
 	for _, i := range idxs {
 		t := &e.run.Tasks[i]
-		if e.recheckBefore(t) {
+		ok, rerr := e.recheckBefore(t)
+		if rerr != nil {
+			return rerr
+		}
+		if ok {
 			active = append(active, t)
 		}
 	}
@@ -408,7 +470,9 @@ func (e *Executor) rsyncStage(ctx context.Context) error {
 		paths = append(paths, t.Path)
 	}
 	for _, t := range active {
-		e.markRunning(t)
+		if err := e.markRunning(t); err != nil {
+			return err
+		}
 	}
 	e.logf("stage rsync: %d file(s)", len(active))
 	cfg := rsync.Config{
@@ -424,17 +488,25 @@ func (e *Executor) rsyncStage(ctx context.Context) error {
 	if err := cfg.Run(ctx); err != nil {
 		if ctx.Err() == nil {
 			for _, t := range active {
-				e.failTask(t, fmt.Sprintf("rsync failed: %v", err))
+				if ferr := e.failTask(t, fmt.Sprintf("rsync failed: %v", err)); ferr != nil {
+					return ferr
+				}
 			}
 		}
 		return err
 	}
 	for _, t := range active {
-		if !e.recheckAfter(t) {
+		ok, rerr := e.recheckAfter(t)
+		if rerr != nil {
+			return rerr
+		}
+		if !ok {
 			continue
 		}
 		if e.stageVerifyNone() {
-			e.completeTask(t)
+			if cerr := e.completeTask(t); cerr != nil {
+				return cerr
+			}
 		}
 	}
 	return nil
@@ -465,7 +537,9 @@ func (e *Executor) verifyStage(ctx context.Context) error {
 			err = errors.New("destination state unavailable")
 		}
 		for _, t := range candidates {
-			e.failTask(t, fmt.Sprintf("size verification failed: %v", err))
+			if ferr := e.failTask(t, fmt.Sprintf("size verification failed: %v", err)); ferr != nil {
+				return ferr
+			}
 		}
 		return err
 	}
@@ -474,13 +548,19 @@ func (e *Executor) verifyStage(ctx context.Context) error {
 		entry, ok := manifest[t.Path]
 		switch {
 		case !ok:
-			e.failTask(t, "size verification failed: file missing at the destination after transfer")
+			if ferr := e.failTask(t, "size verification failed: file missing at the destination after transfer"); ferr != nil {
+				return ferr
+			}
 			failures = append(failures, t.Path)
 		case entry.Size != t.Size:
-			e.failTask(t, fmt.Sprintf("size verification failed: source %d bytes, destination %d bytes", t.Size, entry.Size))
+			if ferr := e.failTask(t, fmt.Sprintf("size verification failed: source %d bytes, destination %d bytes", t.Size, entry.Size)); ferr != nil {
+				return ferr
+			}
 			failures = append(failures, t.Path)
 		default:
-			e.completeTask(t)
+			if cerr := e.completeTask(t); cerr != nil {
+				return cerr
+			}
 		}
 	}
 	if len(failures) > 0 {

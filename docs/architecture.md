@@ -118,6 +118,16 @@ A task is completed only after subprocess success, unchanged-source checks,
 and requested verification. On startup, `running` becomes `pending` with an
 interruption error so `resume` can revalidate it.
 
+Persistence failures are correctness failures, not warnings. A task's
+`running` state is saved before its subprocess starts, and a failed save
+prevents the launch and propagates to the command. Completion is saved
+before an mscp checkpoint is retired; the checkpoint reference is cleared
+and persisted before the file is removed, so a crash leaves either a
+referenced checkpoint or a harmless orphan file, never a completed task
+whose only copy state vanished. A resume-time recovery pass retires
+references left on durably completed tasks, and a fully successful run
+removes its per-run checkpoint directory.
+
 ## Compatibility and limitations
 
 CatSync checks installed help/version output at runtime. Missing mscp or

@@ -1137,3 +1137,176 @@ func TestSyncTinyThresholdDisablesFPSync(t *testing.T) {
 		t.Errorf("mscp invocations = %d, want 1 (1-byte file is at the threshold)", got)
 	}
 }
+
+// failSavesFrom replaces the executor's save function with one that fails
+// from the given 1-based call onward, simulating a full disk or an
+// unwritable state directory after the plan was persisted.
+func failSavesFrom(e *Executor, call int) {
+	count := 0
+	store := e.store
+	e.saveFn = func(r *state.Run) error {
+		count++
+		if count >= call {
+			return errors.New("injected persistence failure")
+		}
+		return store.Save(r)
+	}
+}
+
+// TestSaveFailureBeforeTransferBlocksLaunch proves a failed markRunning
+// save prevents the subprocess from starting: the transfer would otherwise
+// be invisible and unrecoverable.
+func TestSaveFailureBeforeTransferBlocksLaunch(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 10)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "exit=0")
+	cfg := h.config()
+	cfg.Backend = state.BackendRsync
+
+	run, err := syncWith(context.Background(), cfg, func(e *Executor) { failSavesFrom(e, 2) })
+	if err == nil {
+		t.Fatal("Sync with failing markRunning save = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "injected persistence failure") {
+		t.Errorf("error = %v, want the injected persistence failure", err)
+	}
+	// No transfer process may run when its running state is not durable.
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 0 {
+		t.Errorf("rsync invocations = %d, want 0 (transfer must not start)", got)
+	}
+	if got := len(toolInvocations(h.invocations(), "mscp")) + len(toolInvocations(h.invocations(), "fpsync")); got != 0 {
+		t.Errorf("other transfer invocations = %d, want 0", got)
+	}
+	if run == nil {
+		t.Fatal("Sync returned no run")
+	}
+	// The durable document is the pre-transfer one: running run, pending
+	// task, recoverable by the next load/resume.
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Load(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Tasks[0].Status != state.StatusPending {
+		t.Errorf("durable task status = %q, want pending", loaded.Tasks[0].Status)
+	}
+	if loaded.Status != state.StatusRunning {
+		t.Errorf("durable run status = %q, want running (recoverable)", loaded.Status)
+	}
+}
+
+// mscpOnlyHarness prepares a fresh-destination run with one large mscp file.
+func mscpOnlyHarness(t *testing.T) (*harness, Config) {
+	t.Helper()
+	h := newHarness(t)
+	h.writeSrc("big.bin", 2048)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("big.bin")))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("mscp", "touch_flag=-W")
+	cfg := h.config()
+	cfg.Verify = state.VerifyNone
+	return h, cfg
+}
+
+// TestCompletedPersistedBeforeCheckpointRemoval proves ordering: when the
+// completion save fails, the checkpoint is NOT removed and the durable task
+// state stays running (not completed-without-checkpoint).
+func TestCompletedPersistedBeforeCheckpointRemoval(t *testing.T) {
+	h, cfg := mscpOnlyHarness(t)
+	// Save #1 is the initial run, #2 markRunning, #3 the completion save.
+	run, err := syncWith(context.Background(), cfg, func(e *Executor) { failSavesFrom(e, 3) })
+	if err == nil {
+		t.Fatal("Sync with failing completion save = nil, want error")
+	}
+	if got := len(toolInvocations(h.invocations(), "mscp")); got != 1 {
+		t.Fatalf("mscp invocations = %d, want 1", got)
+	}
+	if len(run.Tasks) != 1 || run.Tasks[0].Checkpoint == "" {
+		t.Fatalf("task checkpoint reference missing: %+v", run.Tasks)
+	}
+	cp := run.Tasks[0].Checkpoint
+	if _, statErr := os.Stat(cp); statErr != nil {
+		t.Fatalf("checkpoint was removed before completion was durable: %v", statErr)
+	}
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Load(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.Tasks[0].Status; got != state.StatusRunning {
+		t.Errorf("durable task status = %q, want running (completion not persisted)", got)
+	}
+	if loaded.Tasks[0].Checkpoint != cp {
+		t.Errorf("durable checkpoint ref = %q, want %q", loaded.Tasks[0].Checkpoint, cp)
+	}
+}
+
+// TestCheckpointReferenceClearFailureRetainsCheckpoint covers the crash-safe
+// window between "completed persisted" and "checkpoint reference cleared":
+// a failed reference save must leave both the reference and the file, which
+// is harmless because the task is already durably completed.
+func TestCheckpointReferenceClearFailureRetainsCheckpoint(t *testing.T) {
+	h, cfg := mscpOnlyHarness(t)
+	// #1 initial, #2 markRunning, #3 completed, #4 clear reference.
+	run, err := syncWith(context.Background(), cfg, func(e *Executor) { failSavesFrom(e, 4) })
+	if err == nil {
+		t.Fatal("Sync with failing checkpoint-reference save = nil, want error")
+	}
+	if len(run.Tasks) != 1 || run.Tasks[0].Checkpoint == "" {
+		t.Fatalf("checkpoint reference missing: %+v", run.Tasks)
+	}
+	cp := run.Tasks[0].Checkpoint
+	if _, statErr := os.Stat(cp); statErr != nil {
+		t.Fatalf("checkpoint must be retained when its reference save failed: %v", statErr)
+	}
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Load(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.Tasks[0].Status; got != state.StatusCompleted {
+		t.Errorf("durable task status = %q, want completed", got)
+	}
+	if loaded.Tasks[0].Checkpoint != cp {
+		t.Errorf("durable checkpoint ref = %q, want %q retained", loaded.Tasks[0].Checkpoint, cp)
+	}
+
+	// Resume's recovery pass retires the leftover reference and file
+	// without touching the completed status.
+	e2, err := newExecutor(Config{StateDir: h.stateDir, Programs: h.config().Programs, Env: mockexec.EnvScript(h.scriptDir, h.logPath)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, _, err := e2.store.LoadAndRecover(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e2.run = recovered
+	if err := e2.retireCompletedCheckpoints(); err != nil {
+		t.Fatalf("retireCompletedCheckpoints: %v", err)
+	}
+	after, err := store.Load(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Tasks[0].Status != state.StatusCompleted {
+		t.Errorf("recovery changed completed status to %q", after.Tasks[0].Status)
+	}
+	if after.Tasks[0].Checkpoint != "" {
+		t.Errorf("recovery left checkpoint reference %q", after.Tasks[0].Checkpoint)
+	}
+	if _, statErr := os.Stat(cp); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("recovery left checkpoint file behind: %v", statErr)
+	}
+}

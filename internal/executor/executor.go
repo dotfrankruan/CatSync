@@ -182,6 +182,12 @@ type Executor struct {
 	// and saves so concurrent mscp workers never corrupt the document.
 	run   *state.Run
 	runMu sync.Mutex
+
+	// saveFn persists the run; it defaults to the store and is replaced in
+	// tests to inject persistence failures. A failed save is always
+	// propagated to the caller and never silently swallowed when it could
+	// affect correctness or resumability.
+	saveFn func(*state.Run) error
 }
 
 func newExecutor(cfg Config) (*Executor, error) {
@@ -196,6 +202,7 @@ func newExecutor(cfg Config) (*Executor, error) {
 		stdout: cfg.Stdout,
 		stderr: cfg.Stderr,
 	}
+	e.saveFn = store.Save
 	if e.stdout == nil {
 		e.stdout = io.Discard
 	}
@@ -245,11 +252,16 @@ func (e *Executor) lockDestination(dest state.Destination) (*state.Lock, error) 
 	return lock, nil
 }
 
-// saveRun persists the run under the run mutex.
+// saveRun persists the run under the run mutex. Callers must treat an
+// error as fatal for the current operation: a transfer whose intent or
+// outcome could not be recorded must not start or be reported as finished.
 func (e *Executor) saveRun() error {
 	e.runMu.Lock()
 	defer e.runMu.Unlock()
-	return e.store.Save(e.run)
+	if err := e.saveFn(e.run); err != nil {
+		return fmt.Errorf("executor: save run %s: %w", e.run.ID, err)
+	}
+	return nil
 }
 
 // collectManifest runs one batched SSH manifest collection. The boolean
@@ -456,12 +468,21 @@ func (e *Executor) buildRun(out *PlanOutcome) (*state.Run, error) {
 
 // Sync plans and executes a fresh run.
 func Sync(ctx context.Context, cfg Config) (*state.Run, error) {
+	return syncWith(ctx, cfg, nil)
+}
+
+// syncWith implements Sync and lets tests prepare the executor (for example
+// to inject persistence failures) before any state is written.
+func syncWith(ctx context.Context, cfg Config, prepare func(*Executor)) (*state.Run, error) {
 	if err := cfg.validateFull(); err != nil {
 		return nil, err
 	}
 	e, err := newExecutor(cfg)
 	if err != nil {
 		return nil, err
+	}
+	if prepare != nil {
+		prepare(e)
 	}
 	lock, err := e.lockDestination(state.Destination{User: cfg.Dest.User, Host: cfg.Dest.Host, Path: cfg.Dest.Path})
 	if err != nil {
@@ -500,12 +521,20 @@ func Sync(ctx context.Context, cfg Config) (*state.Run, error) {
 // Resume continues a persisted run (the given ID, or the latest resumable
 // run when id is empty) with the run's recorded immutable configuration.
 func Resume(ctx context.Context, cfg Config, id string) (*state.Run, error) {
+	return resumeWith(ctx, cfg, id, nil)
+}
+
+// resumeWith implements Resume with a test preparation hook.
+func resumeWith(ctx context.Context, cfg Config, id string, prepare func(*Executor)) (*state.Run, error) {
 	if err := cfg.validateResume(); err != nil {
 		return nil, err
 	}
 	e, err := newExecutor(cfg)
 	if err != nil {
 		return nil, err
+	}
+	if prepare != nil {
+		prepare(e)
 	}
 	var run *state.Run
 	if id == "" {
@@ -543,6 +572,13 @@ func Resume(ctx context.Context, cfg Config, id string) (*state.Run, error) {
 		return run, err
 	}
 	defer func() { _ = lock.Unlock() }()
+
+	// A crash between persisting completion and checkpoint cleanup leaves a
+	// completed task referencing a file. Retire those now; this cannot lose
+	// progress because completed is already durable.
+	if err := e.retireCompletedCheckpoints(); err != nil {
+		return run, err
+	}
 
 	run.Status = state.StatusRunning
 	run.Error = ""
@@ -603,8 +639,11 @@ func (e *Executor) execute(ctx context.Context) error {
 	for _, st := range stages {
 		if err := st.fn(ctx); err != nil {
 			if ctx.Err() != nil {
-				e.interrupt()
-				return fmt.Errorf("executor: %s stage: %w", st.name, ctx.Err())
+				ctxErr := fmt.Errorf("executor: %s stage: %w", st.name, ctx.Err())
+				if ierr := e.interrupt(); ierr != nil {
+					return fmt.Errorf("%w; %v", ctxErr, ierr)
+				}
+				return ctxErr
 			}
 			errs = append(errs, fmt.Sprintf("%s stage: %v", st.name, err))
 			e.warnf("%s", errs[len(errs)-1])
@@ -612,8 +651,11 @@ func (e *Executor) execute(ctx context.Context) error {
 	}
 	if err := e.verifyStage(ctx); err != nil {
 		if ctx.Err() != nil {
-			e.interrupt()
-			return fmt.Errorf("executor: verification: %w", ctx.Err())
+			ctxErr := fmt.Errorf("executor: verification: %w", ctx.Err())
+			if ierr := e.interrupt(); ierr != nil {
+				return fmt.Errorf("%w; %v", ctxErr, ierr)
+			}
+			return ctxErr
 		}
 		errs = append(errs, fmt.Sprintf("verification: %v", err))
 		e.warnf("%s", errs[len(errs)-1])
@@ -622,16 +664,20 @@ func (e *Executor) execute(ctx context.Context) error {
 }
 
 // interrupt converts the run to its resumable interrupted form and saves.
-func (e *Executor) interrupt() {
+// A save failure here is returned: an interrupted run whose recovery state
+// was not recorded may look running on disk, which the next load repairs,
+// but the caller must still see the persistence failure.
+func (e *Executor) interrupt() error {
 	e.runMu.Lock()
 	changed := e.run.RecoverInterrupted()
 	e.runMu.Unlock()
 	if changed {
 		if err := e.saveRun(); err != nil {
-			e.warnf("save interrupted run: %v", err)
+			return fmt.Errorf("executor: record interruption of run %s: %w", e.run.ID, err)
 		}
 	}
 	e.warnf("interrupted; run %s is safe to resume", e.run.ID)
+	return nil
 }
 
 // finalize sets the terminal run status from the accumulated stage errors
@@ -662,6 +708,9 @@ func (e *Executor) finalize(errs []string) error {
 		if err := e.saveRun(); err != nil {
 			return err
 		}
+		// The completion gate passed and is persisted; only now are any
+		// remaining checkpoint artifacts for this run retired.
+		e.removeRunCheckpointDir()
 		if unsupported > 0 {
 			e.logf("run %s: completed with %d unsupported entrie(s) NOT transferred", e.run.ID, unsupported)
 			e.warnf("run %s: %d source entrie(s) are unsupported (symlinks, special files, or scan errors) and were NOT transferred", e.run.ID, unsupported)
@@ -702,45 +751,62 @@ func (e *Executor) statSource(rel string) (os.FileInfo, error) {
 }
 
 // recheckBefore validates a task's source metadata against the plan
-// immediately before transfer. On any mismatch the task is failed, never
-// transferred.
-func (e *Executor) recheckBefore(t *state.Task) bool {
+// immediately before transfer. On a mismatch the task is failed and the
+// transfer must not run. A persistence error is returned so the stage stops
+// instead of starting work whose intent is not on disk.
+func (e *Executor) recheckBefore(t *state.Task) (bool, error) {
 	fi, err := e.statSource(t.Path)
 	if err != nil {
-		e.failTask(t, fmt.Sprintf("source revalidation failed: %v", err))
-		return false
+		if ferr := e.failTask(t, fmt.Sprintf("source revalidation failed: %v", err)); ferr != nil {
+			return false, ferr
+		}
+		return false, nil
 	}
 	if fi.Size() != t.Size || !fi.ModTime().Equal(t.ModTime) {
-		e.failTask(t, "source changed since planning; start a new run")
-		return false
+		if ferr := e.failTask(t, "source changed since planning; start a new run"); ferr != nil {
+			return false, ferr
+		}
+		return false, nil
 	}
-	return true
+	return true, nil
 }
 
 // recheckAfter validates that the source stayed unchanged across the
 // transfer. A changed source is a failed task, not a successful transfer.
-func (e *Executor) recheckAfter(t *state.Task) bool {
+func (e *Executor) recheckAfter(t *state.Task) (bool, error) {
 	fi, err := e.statSource(t.Path)
 	if err != nil {
-		e.failTask(t, fmt.Sprintf("source post-check failed: %v", err))
-		return false
+		if ferr := e.failTask(t, fmt.Sprintf("source post-check failed: %v", err)); ferr != nil {
+			return false, ferr
+		}
+		return false, nil
 	}
 	if fi.Size() != t.Size || !fi.ModTime().Equal(t.ModTime) {
-		e.failTask(t, "source changed during transfer; not marked completed")
-		return false
+		if ferr := e.failTask(t, "source changed during transfer; not marked completed"); ferr != nil {
+			return false, ferr
+		}
+		return false, nil
 	}
-	return true
+	return true, nil
 }
 
-// failTask marks a task failed and persists the run.
-func (e *Executor) failTask(t *state.Task, msg string) {
+// failTask marks a task failed and persists the run, returning any
+// persistence error.
+func (e *Executor) failTask(t *state.Task, msg string) error {
 	e.runMu.Lock()
+	prevStatus, prevErr := t.Status, t.Error
 	t.Status = state.StatusFailed
 	t.Error = msg
 	e.runMu.Unlock()
 	if err := e.saveRun(); err != nil {
-		e.warnf("save run: %v", err)
+		// Keep memory consistent with the disk document so later logic and
+		// finalization do not build on an unrecorded transition.
+		e.runMu.Lock()
+		t.Status, t.Error = prevStatus, prevErr
+		e.runMu.Unlock()
+		return err
 	}
+	return nil
 }
 
 // pendingTasks returns the indexes of tasks that are pending or failed
@@ -771,30 +837,110 @@ func (e *Executor) taskByPath(path string) *state.Task {
 }
 
 // markRunning marks a task running, increments its attempt count, and
-// persists the run before the subprocess launches.
-func (e *Executor) markRunning(t *state.Task) {
+// persists the run. It MUST succeed before the subprocess launches: a
+// transfer whose running state could not be recorded would be invisible and
+// unrecoverable after a crash. On failure the in-memory transition is
+// rolled back and the error propagated to the stage, which must not start
+// the subprocess.
+func (e *Executor) markRunning(t *state.Task) error {
 	e.runMu.Lock()
+	prevStatus, prevAttempts, prevErr := t.Status, t.Attempts, t.Error
 	t.Status = state.StatusRunning
 	t.Attempts++
 	t.Error = ""
 	e.runMu.Unlock()
 	if err := e.saveRun(); err != nil {
-		e.warnf("save run: %v", err)
+		e.runMu.Lock()
+		t.Status, t.Attempts, t.Error = prevStatus, prevAttempts, prevErr
+		e.runMu.Unlock()
+		return err
 	}
+	return nil
 }
 
-// retireCheckpoint removes a completed task's mscp checkpoint — the
-// verification gate has passed, so the checkpoint is no longer needed.
-// Removal failure is a warning, not a task failure: the file is harmless.
-func (e *Executor) retireCheckpoint(t *state.Task) {
+// retireCheckpoint clears a completed task's checkpoint reference and then
+// removes the file, in crash-safe order:
+//
+//  1. The completed status was already persisted by completeTask, whose
+//     save failure keeps the checkpoint intact.
+//  2. The cleared reference is persisted before the file is removed. A
+//     crash between the two steps leaves only a harmless orphan file; a
+//     crash before the reference save leaves a completed task whose
+//     checkpoint is still referenced, which resume's cleanup pass retires.
+//  3. File removal is best-effort: an orphan checkpoint is harmless, while
+//     a missing one for an unfinished task would force a full restart.
+func (e *Executor) retireCheckpoint(t *state.Task) error {
 	e.runMu.Lock()
 	cp := t.Checkpoint
+	if cp == "" {
+		e.runMu.Unlock()
+		return nil
+	}
 	t.Checkpoint = ""
 	e.runMu.Unlock()
-	if cp == "" {
-		return
+	if err := e.saveRun(); err != nil {
+		e.runMu.Lock()
+		t.Checkpoint = cp
+		e.runMu.Unlock()
+		return fmt.Errorf("executor: clear checkpoint reference for %q: %w", t.Path, err)
 	}
 	if err := os.Remove(cp); err != nil && !errors.Is(err, os.ErrNotExist) {
 		e.warnf("remove checkpoint %s: %v", cp, err)
+	}
+	return nil
+}
+
+// retireCompletedCheckpoints is the resume-time recovery pass for completed
+// tasks that still reference a checkpoint (a crash between completion and
+// reference cleanup). The completed status is already durable, so clearing
+// the reference and removing the file cannot lose transfer progress.
+func (e *Executor) retireCompletedCheckpoints() error {
+	var refs []*state.Task
+	e.runMu.Lock()
+	for i := range e.run.Tasks {
+		t := &e.run.Tasks[i]
+		if t.Status == state.StatusCompleted && t.Checkpoint != "" {
+			refs = append(refs, t)
+		}
+	}
+	e.runMu.Unlock()
+	if len(refs) == 0 {
+		return nil
+	}
+	// Persist all cleared references first, then remove the files.
+	e.runMu.Lock()
+	paths := make([]string, len(refs))
+	for i, t := range refs {
+		paths[i] = t.Checkpoint
+		t.Checkpoint = ""
+	}
+	e.runMu.Unlock()
+	if err := e.saveRun(); err != nil {
+		e.runMu.Lock()
+		for i, t := range refs {
+			t.Checkpoint = paths[i]
+		}
+		e.runMu.Unlock()
+		return fmt.Errorf("executor: clear completed checkpoint references: %w", err)
+	}
+	for _, cp := range paths {
+		if err := os.Remove(cp); err != nil && !errors.Is(err, os.ErrNotExist) {
+			e.warnf("remove leftover checkpoint %s: %v", cp, err)
+		}
+	}
+	return nil
+}
+
+// removeRunCheckpointDir removes the run's own checkpoint directory after a
+// fully successful run, clearing any harmless leftovers from an earlier
+// crash. It acts only on CatSync's per-run state directory.
+func (e *Executor) removeRunCheckpointDir() {
+	abs, err := filepath.Abs(e.cfg.StateDir)
+	if err != nil {
+		return
+	}
+	dir := filepath.Join(abs, "checkpoints", e.run.ID)
+	if err := os.RemoveAll(dir); err != nil {
+		e.warnf("remove checkpoint directory %s: %v", dir, err)
 	}
 }

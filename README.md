@@ -36,7 +36,11 @@ catsync (local orchestrator)
 
 A run is a versioned JSON document in the state directory (default
 `$XDG_STATE_HOME/catsync` or `~/.local/state/catsync`), written
-temp-file-plus-rename with fsync. A destination-scoped lock file prevents
+temp-file-plus-rename with fsync. State writes are part of correctness: a
+task is marked running on disk *before* its subprocess starts (a failed save
+aborts the launch), completion is persisted before an mscp checkpoint is
+retired, and checkpoint references are cleared before their files are
+removed, so interrupted cleanup leaves only a harmless orphan. A destination-scoped lock file prevents
 two runs from writing the same remote tree at once. Interrupted runs are
 recovered explicitly: `running` tasks return to `pending` and `resume`
 revalidates and continues them.
