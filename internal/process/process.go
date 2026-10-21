@@ -231,17 +231,54 @@ func Run(ctx context.Context, spec Spec) error {
 	return run(ctx, cmd, spec)
 }
 
-// classifyWait converts a cmd.Wait result into the package's error
-// vocabulary.
-func classifyWait(name string, waitErr error, ctx context.Context) error {
+// classifyRunResult converts the outcomes of one execution into the
+// package's error vocabulary.
+//
+// ctxErr is non-nil only when the cancellation watcher actually observed
+// the context's cancellation and tore the process group down; the caller
+// must not pass a late ctx.Err() observed after the direct child already
+// finished, or a normally completed command could be reclassified as
+// interrupted. A watcher-observed cancellation is always reported as an
+// error wrapping ctxErr, even when the child handled the forwarded signal
+// and exited 0: the command did not finish on its own, and callers use the
+// distinction to keep the run resumable instead of marking it complete.
+// cleanupErr reports that the process group could not be proven empty;
+// when both apply, errors.Join keeps errors.Is working for each.
+func classifyRunResult(name string, waitErr, ctxErr, cleanupErr error) error {
+	var errs []error
+	if ctxErr != nil {
+		errs = append(errs, fmt.Errorf("process: %s terminated: %w", name, ctxErr))
+	}
+	if cleanupErr != nil {
+		errs = append(errs, cleanupErr)
+	}
 	if waitErr == nil {
-		return nil
+		if len(errs) == 0 {
+			return nil
+		}
+		return errors.Join(errs...)
 	}
 	if errors.Is(waitErr, exec.ErrWaitDelay) {
-		return fmt.Errorf("process: %s: output pipes stayed open past the grace period: %w", name, waitErr)
+		// Keep the diagnostic WaitDelay cause even when the same run was
+		// also cancelled (a survivor held a pipe past the grace period).
+		errs = append(errs, fmt.Errorf("process: %s: output pipes stayed open past the grace period: %w", name, waitErr))
+		return errors.Join(errs...)
 	}
-	if ctx.Err() != nil {
-		return fmt.Errorf("process: %s terminated: %w", name, ctx.Err())
+	if ctxErr != nil {
+		// Cancellation caused the termination: the context error carries
+		// the meaning, so the signal-induced wait error is not repeated.
+		return errors.Join(errs...)
+	}
+	if len(errs) > 0 {
+		// A cleanup failure with a non-cancelled non-zero exit: keep both
+		// causes so errors.As still reaches *ExitError when applicable.
+		var exitErr *exec.ExitError
+		if errors.As(waitErr, &exitErr) {
+			errs = append(errs, &ExitError{Name: name, Code: exitErr.ExitCode(), Err: exitErr})
+			return errors.Join(errs...)
+		}
+		errs = append(errs, fmt.Errorf("process: %s: %w", name, waitErr))
+		return errors.Join(errs...)
 	}
 	var exitErr *exec.ExitError
 	if errors.As(waitErr, &exitErr) {

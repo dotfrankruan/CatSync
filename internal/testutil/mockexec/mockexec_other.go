@@ -20,3 +20,6 @@ func ignoreTerm() {}
 
 // installCatchSignal is a no-op on non-Unix platforms.
 func installCatchSignal(dir string) {}
+
+// installZeroExitSignal is a no-op on non-Unix platforms.
+func installZeroExitSignal(name, dir string) error { return nil }

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 )
 
@@ -17,8 +16,8 @@ func ProcessAlive(pid int) error {
 	return syscall.Kill(pid, 0)
 }
 
-// raiseSignal sends the named signal to the current process.
-func raiseSignal(name string) error {
+// signalByName maps a mock signal name to its Unix signal.
+func signalByName(name string) (syscall.Signal, bool) {
 	signals := map[string]syscall.Signal{
 		"TERM": syscall.SIGTERM,
 		"KILL": syscall.SIGKILL,
@@ -29,10 +28,36 @@ func raiseSignal(name string) error {
 		"USR2": syscall.SIGUSR2,
 	}
 	sig, ok := signals[name]
+	return sig, ok
+}
+
+// raiseSignal sends the named signal to the current process.
+func raiseSignal(name string) error {
+	sig, ok := signalByName(name)
 	if !ok {
 		return fmt.Errorf("unknown signal %q", name)
 	}
 	return syscall.Kill(syscall.Getpid(), sig)
+}
+
+// installZeroExitSignal catches name (TERM or INT), records it to path
+// when set, and exits 0: a tool that treats a forwarded cancellation
+// signal as a graceful shutdown.
+func installZeroExitSignal(name, path string) error {
+	sig, ok := signalByName(name)
+	if !ok {
+		return fmt.Errorf("unknown zero-exit signal %q", name)
+	}
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, sig)
+	go func() {
+		s := <-ch
+		if path != "" {
+			_ = os.WriteFile(path, []byte(s.String()), 0600)
+		}
+		os.Exit(0)
+	}()
+	return nil
 }
 
 // ignoreTerm makes the helper ignore SIGTERM, forcing the process runner's
@@ -42,14 +67,14 @@ func ignoreTerm() {
 }
 
 // installCatchSignal records the first SIGINT/SIGTERM the helper receives
-// to <dir>/signal and exits 42, proving which signal was forwarded.
-func installCatchSignal(dir string) {
+// to the signal path and exits 42, proving which signal was forwarded.
+func installCatchSignal(path string) {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		sig := <-ch
-		if dir != "" {
-			_ = os.WriteFile(filepath.Join(dir, "signal"), []byte(sig.String()), 0600)
+		if path != "" {
+			_ = os.WriteFile(path, []byte(sig.String()), 0600)
 		}
 		os.Exit(42)
 	}()

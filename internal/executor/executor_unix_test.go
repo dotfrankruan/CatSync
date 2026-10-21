@@ -1348,3 +1348,124 @@ func TestFPartOverrideOnlyAffectsProbe(t *testing.T) {
 		}
 	}
 }
+
+// TestSyncCancellationWithZeroExitBackendRemainsResumable is the
+// state-layer regression for graceful cancellation: the mock backend
+// handles the forwarded SIGTERM and exits 0. Sync must still report the
+// cancellation, the run must never become completed, the task must be
+// resumable (pending with the interruption note), the lock must be free,
+// and no descendant writer may survive or write late.
+func TestSyncCancellationWithZeroExitBackendRemainsResumable(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 10)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
+	h.scriptSSHFreshDest(post)
+	ready := filepath.Join(t.TempDir(), "ready")
+	marker := filepath.Join(t.TempDir(), "late-write")
+	childDir := t.TempDir()
+	sigFile := filepath.Join(t.TempDir(), "signal")
+	h.writeScript("rsync", fmt.Sprintf(
+		"zero_exit_signal=TERM\nready_file=%s\nsignal_file=%s\nspawn_children=1\nchild_sleep_ms=1500\nchild_touch=%s\nchild_pid_dir=%s\nsleep_ms=30000\n",
+		ready, sigFile, marker, childDir))
+
+	cfg := h.config()
+	cfg.Backend = state.BackendRsync
+	cfg.Verify = state.VerifyNone
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	runCh := make(chan *state.Run, 1)
+	go func() {
+		run, err := Sync(ctx, cfg)
+		runCh <- run
+		done <- err
+	}()
+
+	// Wait until the mock backend is live (the ready marker is written
+	// after the signal handler and grandchild are set up), then cancel.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("mock rsync did not become ready")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+
+	err := <-done
+	run := <-runCh
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Sync = %v, want an error wrapping context.Canceled", err)
+	}
+	// The graceful zero-exit path really ran: the backend caught TERM.
+	sig, serr := os.ReadFile(sigFile)
+	if serr != nil {
+		t.Fatalf("mock backend did not handle the forwarded signal: %v", serr)
+	}
+	if got := strings.TrimSpace(string(sig)); got != "terminated" {
+		t.Errorf("forwarded signal = %q, want terminated", got)
+	}
+	if run == nil {
+		t.Fatal("Sync returned no run")
+	}
+	if run.Status == state.StatusCompleted {
+		t.Fatal("cancelled run was recorded as completed")
+	}
+	if run.Status != state.StatusFailed {
+		t.Errorf("run status = %s, want failed (interrupted)", run.Status)
+	}
+	if len(run.Tasks) != 1 || run.Tasks[0].Status != state.StatusPending {
+		t.Fatalf("task after cancellation = %+v, want pending", run.Tasks)
+	}
+	if !strings.Contains(run.Tasks[0].Error, "interrupted") {
+		t.Errorf("task error = %q, want the interruption note", run.Tasks[0].Error)
+	}
+	if run.Tasks[0].Attempts != 1 {
+		t.Errorf("attempts = %d, want 1 (started once)", run.Tasks[0].Attempts)
+	}
+
+	// The durable state agrees and is resumable.
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Load(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Status != state.StatusFailed || loaded.Tasks[0].Status != state.StatusPending {
+		t.Errorf("durable state = %s/%s, want failed/pending", loaded.Status, loaded.Tasks[0].Status)
+	}
+	if !loaded.Resumable() {
+		t.Error("cancelled run is not resumable")
+	}
+	// The destination lock was released.
+	lock, err := store.LockDestination(state.Destination{User: "u", Host: "h", Path: "/data"})
+	if err != nil {
+		t.Fatalf("destination lock still held after cancellation: %v", err)
+	}
+	if err := lock.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+	// Descendants are gone before Sync returned, and no late write appears.
+	pids, perr := mockexec.ReadChildPids(childDir)
+	if perr != nil {
+		t.Fatal(perr)
+	}
+	if len(pids) != 1 {
+		t.Fatalf("recorded %d descendant pids, want 1", len(pids))
+	}
+	for _, pid := range pids {
+		if err := mockexec.ProcessAlive(pid); err == nil {
+			t.Errorf("descendant writer %d survived the cancelled sync", pid)
+		}
+	}
+	time.Sleep(1600 * time.Millisecond)
+	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("descendant wrote %s after cancellation: %v", marker, statErr)
+	}
+}

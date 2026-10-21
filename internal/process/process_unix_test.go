@@ -509,3 +509,211 @@ func TestRunGracePeriodForcesKillAndUnblocksPipes(t *testing.T) {
 		waitGone(t, pid, 5*time.Second)
 	}
 }
+
+// waitForFile polls until path exists, failing the test on timeout.
+func waitForFile(t *testing.T, path string, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s did not appear within %s", path, within)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestRunCancelledChildExitsZeroStillReturnsContextError is the regression
+// test for graceful-shutdown classification: a child that catches the
+// forwarded SIGTERM and exits 0 during cancellation did not finish on its
+// own, so Run must report the cancellation, not success.
+func TestRunCancelledChildExitsZeroStillReturnsContextError(t *testing.T) {
+	dir := t.TempDir()
+	childDir := t.TempDir()
+	ready := filepath.Join(t.TempDir(), "ready")
+	spec := mockSpec(t, dir, map[string]string{
+		mockexec.EnvSleepMS:        "30000",
+		mockexec.EnvZeroExitSignal: "TERM",
+		mockexec.EnvReadyFile:      ready,
+		mockexec.EnvSpawnChildren:  "1",
+		mockexec.EnvChildPidDir:    childDir,
+		mockexec.EnvChildSleepMS:   "30000",
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		// The helper writes the ready marker only after its signal handler
+		// is installed and its grandchild has reported in.
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			if _, err := os.Stat(ready); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		cancel()
+	}()
+
+	err := Run(ctx, spec)
+	if err == nil {
+		t.Fatal("Run = nil for a cancelled zero-exit child, want context.Canceled")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want it to wrap context.Canceled", err)
+	}
+	// The helper exited 0 after handling TERM, and the whole tree is gone.
+	sig, sigErr := os.ReadFile(filepath.Join(dir, "signal"))
+	if sigErr != nil {
+		t.Fatalf("helper did not record the forwarded signal: %v", sigErr)
+	}
+	if got := strings.TrimSpace(string(sig)); got != "terminated" {
+		t.Errorf("forwarded signal = %q, want terminated (SIGTERM)", got)
+	}
+	rec, rerr := mockexec.ReadRecord(dir)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	waitGone(t, rec.PID, 5*time.Second)
+	for _, pid := range childPids(t, childDir, 1) {
+		waitGone(t, pid, 5*time.Second)
+	}
+}
+
+// TestRunCancelledChildExitsZeroOnSIGINT is the SIGINT variant of the
+// graceful-shutdown regression: the recorded cancel signal is forwarded,
+// the child exits 0 after handling it, and Run still reports the
+// cancellation.
+func TestRunCancelledChildExitsZeroOnSIGINT(t *testing.T) {
+	dir := t.TempDir()
+	ready := filepath.Join(t.TempDir(), "ready")
+	spec := mockSpec(t, dir, map[string]string{
+		mockexec.EnvSleepMS:        "30000",
+		mockexec.EnvZeroExitSignal: "INT",
+		mockexec.EnvReadyFile:      ready,
+	})
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	slot := NewCancelSignal()
+	ctx := WithCancelSignal(base, slot)
+	go func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			if _, err := os.Stat(ready); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		slot.Set(syscall.SIGINT)
+		cancel()
+	}()
+
+	err := Run(ctx, spec)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want it to wrap context.Canceled", err)
+	}
+	sig, sigErr := os.ReadFile(filepath.Join(dir, "signal"))
+	if sigErr != nil {
+		t.Fatalf("helper did not record the forwarded signal: %v", sigErr)
+	}
+	if got := strings.TrimSpace(string(sig)); got != "interrupt" {
+		t.Errorf("forwarded signal = %q, want interrupt (SIGINT)", got)
+	}
+}
+
+// TestRunDeadlineChildExitsZero checks a child that handles SIGTERM and
+// exits 0 when the context deadline expires: the error must wrap
+// context.DeadlineExceeded, not classify as success.
+func TestRunDeadlineChildExitsZero(t *testing.T) {
+	dir := t.TempDir()
+	ready := filepath.Join(t.TempDir(), "ready")
+	spec := mockSpec(t, dir, map[string]string{
+		mockexec.EnvSleepMS:        "30000",
+		mockexec.EnvZeroExitSignal: "TERM",
+		mockexec.EnvReadyFile:      ready,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	err := Run(ctx, spec)
+	if err == nil {
+		t.Fatal("Run = nil for a deadline-expired zero-exit child, want DeadlineExceeded")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want it to wrap context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Errorf("deadline path took %s", elapsed)
+	}
+	// The helper reached its handler (ready file) and recorded the signal,
+	// proving the zero-exit graceful path was exercised.
+	waitForFile(t, ready, time.Second)
+	if _, sigErr := os.ReadFile(filepath.Join(dir, "signal")); sigErr != nil {
+		t.Errorf("helper did not handle the forwarded signal: %v", sigErr)
+	}
+}
+
+// TestRunContextCancelAfterCompletionReturnsNil is the reverse-race
+// protection: once Run has returned because the child finished normally, a
+// later cancellation must not change the successful result.
+func TestRunContextCancelAfterCompletionReturnsNil(t *testing.T) {
+	dir := t.TempDir()
+	spec := mockSpec(t, dir, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type result struct{ err error }
+	done := make(chan result, 1)
+	go func() { done <- result{err: Run(ctx, spec)} }()
+	r := <-done
+	if r.err != nil {
+		t.Fatalf("Run = %v, want nil for a normally completed child", r.err)
+	}
+	// Cancel only after Run returned: no watcher observed it.
+	cancel()
+	// The returned value is already fixed; this documents the contract.
+	if r.err != nil {
+		t.Fatalf("late cancellation changed the result to %v", r.err)
+	}
+}
+
+// TestClassifyRunResultKeepsBothCauses covers the classification seams
+// directly: a watcher-observed cancellation wins over a zero wait result,
+// and cleanup/WaitDelay diagnostics remain inspectable alongside it.
+func TestClassifyRunResultKeepsBothCauses(t *testing.T) {
+	// Graceful zero-exit cancellation.
+	if err := classifyRunResult("tool", nil, context.Canceled, nil); !errors.Is(err, context.Canceled) {
+		t.Errorf("zero-exit cancellation = %v, want context.Canceled", err)
+	}
+	// Deadline variant.
+	if err := classifyRunResult("tool", nil, context.DeadlineExceeded, nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("zero-exit deadline = %v, want DeadlineExceeded", err)
+	}
+	// Cancellation plus cleanup failure: both must be errors.Is-reachable.
+	cleanup := fmt.Errorf("process: group survived: %w", ErrDescendantsAlive)
+	err := classifyRunResult("tool", nil, context.Canceled, cleanup)
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, ErrDescendantsAlive) {
+		t.Errorf("joined cancellation+cleanup = %v, want both causes", err)
+	}
+	// Cancellation plus WaitDelay: keep the diagnostic cause.
+	err = classifyRunResult("tool", exec.ErrWaitDelay, context.DeadlineExceeded, nil)
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, exec.ErrWaitDelay) {
+		t.Errorf("joined deadline+WaitDelay = %v, want both causes", err)
+	}
+	// No observed cancellation: a zero wait result is success.
+	if err := classifyRunResult("tool", nil, nil, nil); err != nil {
+		t.Errorf("plain success = %v, want nil", err)
+	}
+	// No observed cancellation with a non-zero exit: ExitError, never ctx.
+	err = classifyRunResult("tool", &exec.ExitError{}, nil, nil)
+	var exitErr *ExitError
+	if !errors.As(err, &exitErr) {
+		t.Errorf("non-zero exit = %v, want *ExitError", err)
+	}
+}

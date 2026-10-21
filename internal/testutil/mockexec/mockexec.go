@@ -103,6 +103,16 @@ const (
 	// EnvCatchSignal makes the helper catch SIGINT/SIGTERM, record the
 	// signal name to <record dir>/signal, and exit 42.
 	EnvCatchSignal = "MOCKEXEC_CATCH_SIGNAL"
+	// EnvZeroExitSignal makes the helper catch TERM or INT, record the
+	// signal name to <record dir>/signal (when set), and exit 0: a tool
+	// that treats a forwarded signal as a graceful shutdown.
+	EnvZeroExitSignal = "MOCKEXEC_ZERO_EXIT_SIGNAL"
+	// EnvReadyFile is written after signal handlers and grandchildren are
+	// set up, giving tests a deterministic "invocation is live" marker.
+	EnvReadyFile = "MOCKEXEC_READY_FILE"
+	// EnvSignalFile, when set, receives the name of a caught cancellation
+	// signal; otherwise <record dir>/signal is used in environment style.
+	EnvSignalFile = "MOCKEXEC_SIGNAL_FILE"
 	// EnvRole is set for spawned grandchildren; the value "grandchild"
 	// selects the grandchild behavior instead of normal helper behavior.
 	EnvRole = "MOCKEXEC_ROLE"
@@ -141,6 +151,9 @@ type behavior struct {
 	childIgnoreTerm bool
 	ignoreTerm      bool
 	catchSignal     bool
+	zeroExitSignal  string
+	readyFile       string
+	signalFile      string
 }
 
 // RunHelper executes the configured mock behavior and returns the process
@@ -164,11 +177,27 @@ func RunHelper() int {
 	if bh.ignoreTerm {
 		ignoreTerm()
 	}
+	sp := bh.signalFile
+	if sp == "" {
+		sp = signalPath()
+	}
 	if bh.catchSignal {
-		installCatchSignal(os.Getenv(EnvRecordDir))
+		installCatchSignal(sp)
+	}
+	if bh.zeroExitSignal != "" {
+		if err := installZeroExitSignal(bh.zeroExitSignal, sp); err != nil {
+			fmt.Fprintf(os.Stderr, "mockexec: %v\n", err)
+			return 2
+		}
 	}
 	if bh.spawnChildren > 0 {
 		spawnChildren(bh)
+	}
+	if bh.readyFile != "" {
+		if err := os.WriteFile(bh.readyFile, []byte("ready\n"), 0600); err != nil {
+			fmt.Fprintf(os.Stderr, "mockexec: write ready file: %v\n", err)
+			return 2
+		}
 	}
 	if bh.touch != "" {
 		if err := os.WriteFile(bh.touch, []byte("mock checkpoint\n"), 0600); err != nil {
@@ -206,6 +235,18 @@ func RunHelper() int {
 		// The signal may be caught or ignored; fall through to exit.
 	}
 	return bh.exit
+}
+
+// signalPath returns where a caught signal should be recorded: the
+// explicit MOCKEXEC_SIGNAL_FILE, else <record dir>/signal, else empty.
+func signalPath() string {
+	if p := os.Getenv(EnvSignalFile); p != "" {
+		return p
+	}
+	if dir := os.Getenv(EnvRecordDir); dir != "" {
+		return filepath.Join(dir, "signal")
+	}
+	return ""
 }
 
 // runGrandchild implements the grandchild role: it records its PID, then
@@ -267,6 +308,22 @@ func spawnChildren(bh behavior) {
 			fmt.Fprintf(os.Stderr, "mockexec: spawn grandchild %d: %v\n", i, err)
 		}
 	}
+	// Wait for the children to report in, so a caller's ready marker (and
+	// the test that waits for it) implies the whole tree is live.
+	if bh.childPidDir != "" {
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			matches, _ := filepath.Glob(filepath.Join(bh.childPidDir, "child-*.pid"))
+			if len(matches) >= bh.spawnChildren {
+				return
+			}
+			if time.Now().After(deadline) {
+				fmt.Fprintf(os.Stderr, "mockexec: %d of %d grandchildren reported in\n", len(matches), bh.spawnChildren)
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
 }
 
 // configuredBehavior resolves the invocation's behavior: script style when
@@ -319,6 +376,8 @@ func envBehavior() (behavior, error) {
 	bh.signal = os.Getenv(EnvSignal)
 	bh.ignoreTerm = os.Getenv(EnvIgnoreTerm) != ""
 	bh.catchSignal = os.Getenv(EnvCatchSignal) != ""
+	bh.zeroExitSignal = os.Getenv(EnvZeroExitSignal)
+	bh.readyFile = os.Getenv(EnvReadyFile)
 	bh.childPidDir = os.Getenv(EnvChildPidDir)
 	bh.childTouch = os.Getenv(EnvChildTouch)
 	bh.childIgnoreTerm = os.Getenv(EnvChildIgnoreTerm) != ""
@@ -365,6 +424,9 @@ func envBehavior() (behavior, error) {
 //	                 (TERM, KILL, ...; Unix only)
 //	ignore_term=1    the helper ignores SIGTERM (forces SIGKILL escalation)
 //	catch_signal=1   the helper records SIGINT/SIGTERM to <record dir>/signal
+//	zero_exit_signal=TERM|INT  catch the signal, record it, exit 0
+//	signal_file=P    where a caught signal name is recorded
+//	ready_file=P     written once handlers and grandchildren are set up
 //	spawn_children=N start N grandchild processes before sleeping
 //	child_sleep_ms=N grandchild sleep (default 30000)
 //	child_touch=P    grandchild writes P after its sleep
@@ -443,6 +505,9 @@ func loadScript(path, tool string, nth int) (behavior, error) {
 	bh.signal = kv["signal"]
 	bh.ignoreTerm = kv["ignore_term"] != ""
 	bh.catchSignal = kv["catch_signal"] != ""
+	bh.zeroExitSignal = kv["zero_exit_signal"]
+	bh.readyFile = kv["ready_file"]
+	bh.signalFile = kv["signal_file"]
 	bh.childPidDir = kv["child_pid_dir"]
 	bh.childTouch = kv["child_touch"]
 	bh.childIgnoreTerm = kv["child_ignore_term"] != ""

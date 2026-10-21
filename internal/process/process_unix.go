@@ -31,11 +31,17 @@ func run(ctx context.Context, cmd *exec.Cmd, spec Spec) error {
 	pgid := cmd.Process.Pid
 
 	exited := make(chan struct{})
+	// cancelObserved is closed only when the watcher takes the ctx.Done()
+	// branch and actually performs the teardown. A late cancellation after
+	// the child exited normally leaves it closed, so the completed command
+	// is not reclassified as interrupted.
+	cancelObserved := make(chan struct{})
 	watcherDone := make(chan struct{})
 	go func() {
 		defer close(watcherDone)
 		select {
 		case <-ctx.Done():
+			close(cancelObserved)
 		case <-exited:
 			return
 		}
@@ -50,10 +56,19 @@ func run(ctx context.Context, cmd *exec.Cmd, spec Spec) error {
 	// signalled.
 	<-watcherDone
 
-	if err := reapGroup(pgid, grace); err != nil {
-		return err
+	reapErr := reapGroup(pgid, grace)
+
+	// Only a watcher-observed cancellation is treated as a cancellation.
+	// ctx.Err() is read here because the watcher observed Done, so it is
+	// non-nil; reading it through ctx keeps the returned error wrapping
+	// the caller's context cause (Canceled or DeadlineExceeded).
+	var ctxErr error
+	select {
+	case <-cancelObserved:
+		ctxErr = ctx.Err()
+	default:
 	}
-	return classifyWait(spec.Name, waitErr, ctx)
+	return classifyRunResult(spec.Name, waitErr, ctxErr, reapErr)
 }
 
 // gracefulSignal picks the signal forwarded to the child group: the one
