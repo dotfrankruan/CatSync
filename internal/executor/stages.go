@@ -387,7 +387,7 @@ func (e *Executor) mscpTask(ctx context.Context, t *state.Task, ckptDir string) 
 		Inflight:    mscpInflight,
 		MinChunk:    mscpMinChunk,
 		Checkpoint:  checkpoint,
-		SSH:         sshOpts(e.run.Config.IPv6),
+		SSH:         e.sshOpts(e.run.Config.IPv6),
 		Env:         e.cfg.Env,
 		Stdout:      e.stdout,
 		Stderr:      e.stderr,
@@ -479,7 +479,7 @@ func (e *Executor) rsyncStage(ctx context.Context) error {
 		Program:   e.progs.rsync(),
 		SourceDir: e.run.Source.Path,
 		Dest:      e.destTarget(),
-		SSH:       sshOpts(e.run.Config.IPv6),
+		SSH:       e.sshOpts(e.run.Config.IPv6),
 		Paths:     paths,
 		Env:       e.cfg.Env,
 		Stdout:    e.stdout,
@@ -575,7 +575,11 @@ func targetRemoteJoin(base, rel string) string {
 	return strings.TrimSuffix(base, "/") + "/" + rel
 }
 
-// sshOpts renders the backend SSH options for a run.
-func sshOpts(ipv6 bool) backend.SSH {
-	return backend.SSH{IPv6: ipv6}
+// sshOpts renders the backend SSH options for a run. The configured ssh
+// program override (CATSYNC_SSH) reaches rsync's -e transport as well as
+// the manifest/mkdir invocations, so diagnostics and tests control the
+// whole ssh path CatSync itself starts. fpsync's internal rsync/ssh and
+// mscp's libssh always use their own resolution and are not affected.
+func (e *Executor) sshOpts(ipv6 bool) backend.SSH {
+	return backend.SSH{IPv6: ipv6, Program: e.progs.sshProgram()}
 }

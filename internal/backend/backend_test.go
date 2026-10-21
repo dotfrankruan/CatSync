@@ -84,3 +84,39 @@ func TestDestinationOperandNeverDashLeading(t *testing.T) {
 		t.Errorf("dash-leading operand error = %v, want explicit rejection", err)
 	}
 }
+
+// TestRsyncTransportProgram pins the ssh program override in rsync's -e
+// value: the executor passes CATSYNC_SSH here so the override reaches the
+// transport instead of being silently ignored.
+func TestRsyncTransportProgram(t *testing.T) {
+	cases := []struct {
+		ssh  SSH
+		want string
+	}{
+		{SSH{}, "ssh"},
+		{SSH{IPv6: true}, "ssh -6"},
+		{SSH{Program: "/opt/mock/ssh"}, "/opt/mock/ssh"},
+		{SSH{Program: "/opt/mock/ssh", IPv6: true}, "/opt/mock/ssh -6"},
+		{SSH{Program: "ssh-custom"}, "ssh-custom"},
+	}
+	for _, tc := range cases {
+		if got := tc.ssh.RsyncTransport(); got != tc.want {
+			t.Errorf("RsyncTransport(%+v) = %q, want %q", tc.ssh, got, tc.want)
+		}
+	}
+}
+
+// TestValidateTransport rejects overrides rsync's -e value cannot represent
+// (rsync splits it on whitespace without quoting).
+func TestValidateTransport(t *testing.T) {
+	for _, ok := range []string{"", "ssh", "/opt/homebrew/bin/ssh", "ssh-custom"} {
+		if err := (SSH{Program: ok}).ValidateTransport(); err != nil {
+			t.Errorf("ValidateTransport(%q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"/opt/a b/ssh", "ssh\t-x", "ssh\nx", "-ssh", "a\x00b"} {
+		if err := (SSH{Program: bad}).ValidateTransport(); err == nil {
+			t.Errorf("ValidateTransport(%q) = nil, want error", bad)
+		}
+	}
+}

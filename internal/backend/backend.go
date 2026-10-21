@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/frankruan/catsync/internal/target"
 )
@@ -31,17 +32,52 @@ type SSH struct {
 	// IPv6 restricts connections to IPv6 (rsync transport "ssh -6",
 	// mscp -6).
 	IPv6 bool
+	// Program overrides the ssh executable used as rsync's remote shell
+	// (-e). Empty means the default "ssh". The value becomes the first
+	// token of rsync's -e value and is therefore restricted by
+	// ValidateTransport to a single whitespace-free token.
+	Program string
 }
 
-// RsyncTransport renders the rsync -e (remote shell) value: "ssh" or, when
-// IPv6 is requested, "ssh -6". The value is a fixed token sequence chosen by
-// CatSync — never user data — so rsync's whitespace splitting of the
-// transport command cannot be influenced by operands.
+// RsyncTransport renders the rsync -e (remote shell) value: the transport
+// program ("ssh" by default) plus " -6" when IPv6 is requested. The value
+// is a fixed token sequence chosen by CatSync, never file or destination
+// data; Program is vetted by ValidateTransport so rsync's whitespace
+// splitting of the transport command cannot be influenced by operands.
 func (s SSH) RsyncTransport() string {
-	if s.IPv6 {
-		return "ssh -6"
+	prog := s.Program
+	if prog == "" {
+		prog = "ssh"
 	}
-	return "ssh"
+	if s.IPv6 {
+		return prog + " -6"
+	}
+	return prog
+}
+
+// ValidateTransport checks that the ssh program override can be represented
+// in rsync's -e value, which rsync splits on whitespace without quote
+// interpretation. A value containing whitespace or control characters
+// would be silently mis-split into a different command, and a leading dash
+// could be mistaken for an option, so both are refused as configuration
+// errors instead.
+func (s SSH) ValidateTransport() error {
+	prog := s.Program
+	if prog == "" {
+		return nil
+	}
+	if strings.ContainsRune(prog, 0) {
+		return errors.New("backend: ssh program contains a NUL byte")
+	}
+	if strings.HasPrefix(prog, "-") {
+		return fmt.Errorf("backend: ssh program %q must not begin with '-'", prog)
+	}
+	if strings.ContainsFunc(prog, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	}) {
+		return fmt.Errorf("backend: ssh program %q contains whitespace or control characters, which rsync's -e value cannot represent", prog)
+	}
+	return nil
 }
 
 // MSCPArgs returns the mscp argument tokens carrying the SSH options.

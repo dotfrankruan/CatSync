@@ -1310,3 +1310,41 @@ func TestCheckpointReferenceClearFailureRetainsCheckpoint(t *testing.T) {
 		t.Errorf("recovery left checkpoint file behind: %v", statErr)
 	}
 }
+
+// TestFPartOverrideOnlyAffectsProbe pins the documented CATSYNC_FPART
+// scope: the override affects CatSync's availability probe only, because
+// fpsync locates fpart through PATH itself. Pointing it at a missing file
+// makes fpsync unavailable (rsync fallback); CatSync never passes an fpart
+// path to fpsync, so a value that exists does not change which fpart
+// actually runs.
+func TestFPartOverrideOnlyAffectsProbe(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 10)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "exit=0")
+	cfg := h.config()
+	cfg.Programs.FPart = filepath.Join(t.TempDir(), "no-fpart")
+
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if run.Status != state.StatusCompleted {
+		t.Fatalf("run status = %s (%q)", run.Status, run.Error)
+	}
+	if got := len(toolInvocations(h.invocations(), "fpsync")); got != 0 {
+		t.Errorf("fpsync invocations = %d, want 0 (probe found no fpart)", got)
+	}
+	rs := toolInvocations(h.invocations(), "rsync")
+	if len(rs) != 1 {
+		t.Fatalf("rsync invocations = %d, want 1", len(rs))
+	}
+	// CatSync never emits an fpart program argument: fpsync owns that
+	// lookup, so the override cannot be forwarded.
+	for _, a := range rs[0].Args {
+		if strings.Contains(a, "no-fpart") {
+			t.Errorf("fpart override leaked into a backend argv element: %q", a)
+		}
+	}
+}

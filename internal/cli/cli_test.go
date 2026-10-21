@@ -377,3 +377,17 @@ func TestInterspersedStateFlags(t *testing.T) {
 		t.Errorf("status with two operands = %d (%q), want a usage error", code, stderr)
 	}
 }
+
+// TestInvalidSSHOverrideIsUsageError checks an ssh override rsync's -e
+// cannot represent is refused as configuration, before any remote work.
+func TestInvalidSSHOverrideIsUsageError(t *testing.T) {
+	src := tempSource(t)
+	t.Setenv("CATSYNC_SSH", "/opt/with space/ssh")
+	code, _, stderr := run(t, "sync", "--state-dir", t.TempDir(), src, "user@host:/data")
+	if code != ExitUsage {
+		t.Fatalf("exit = %d, want %d (stderr %q)", code, ExitUsage, stderr)
+	}
+	if !strings.Contains(stderr, "whitespace") {
+		t.Errorf("stderr should explain the whitespace restriction:\n%s", stderr)
+	}
+}

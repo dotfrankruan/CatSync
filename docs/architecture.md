@@ -130,6 +130,14 @@ removes its per-run checkpoint directory.
 
 ## Compatibility and limitations
 
+Program overrides (diagnostics and tests): `CATSYNC_SSH`, `CATSYNC_RSYNC`,
+`CATSYNC_FPSYNC`, and `CATSYNC_MSCP` replace executables CatSync itself
+spawns; `CATSYNC_SSH` also becomes rsync's `-e` transport and must be a
+whitespace-free token. `CATSYNC_FPART` feeds only the availability probe,
+because fpsync resolves fpart through `PATH`; descendants spawned by the
+external tools inherit their own resolution and are outside CatSync's
+control.
+
 CatSync checks installed help/version output at runtime. Missing mscp or
 fpsync causes auto mode to fall back to rsync; a missing rsync is fatal. The
 MVP excludes symlinks and special files, does not delete remote files, and does

@@ -243,3 +243,26 @@ func TestCommandProgramOverrideAndEmptyList(t *testing.T) {
 		t.Errorf("empty path list payload = %q, want empty", stdin)
 	}
 }
+
+// TestCommandSSHProgramOverride checks the transport override is emitted
+// verbatim as a single -e token, matching the documented CATSYNC_SSH scope.
+func TestCommandSSHProgramOverride(t *testing.T) {
+	cfg := validConfig()
+	cfg.SSH = backend.SSH{Program: "/opt/mock/ssh"}
+	argv, _, err := cfg.Command()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for i, a := range argv {
+		if a == "-e" {
+			if i+1 >= len(argv) || argv[i+1] != "/opt/mock/ssh" {
+				t.Errorf("-e value = %q, want /opt/mock/ssh", argv[i+1])
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("argv missing -e: %v", argv)
+	}
+}

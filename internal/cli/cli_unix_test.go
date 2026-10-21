@@ -30,6 +30,7 @@ type cliHarness struct {
 	stateDir  string
 	scriptDir string
 	logPath   string
+	progs     map[string]string
 }
 
 func newCLIHarness(t *testing.T) *cliHarness {
@@ -45,6 +46,7 @@ func newCLIHarness(t *testing.T) *cliHarness {
 		stateDir:  t.TempDir(),
 		scriptDir: t.TempDir(),
 		logPath:   filepath.Join(t.TempDir(), "invocations.jsonl"),
+		progs:     progs,
 	}
 	for tool, path := range progs {
 		t.Setenv("CATSYNC_"+strings.ToUpper(tool), path)
@@ -496,5 +498,46 @@ func TestCLIInterspersedArgsEndToEnd(t *testing.T) {
 	code, _, stderr = run(t, "resume", runRec.ID, "--state-dir", h.stateDir)
 	if code != ExitError || !strings.Contains(stderr, "not resumable") {
 		t.Errorf("resume of completed run with trailing options = %d (%q), want not-resumable", code, stderr)
+	}
+}
+
+// TestCLISSHOverrideReachesRsyncTransport pins the documented CATSYNC_SSH
+// scope: the override is used for the manifest/mkdir ssh calls and also
+// reaches rsync's -e transport, so diagnostics and tests control the whole
+// ssh path CatSync itself starts.
+func TestCLISSHOverrideReachesRsyncTransport(t *testing.T) {
+	h := newCLIHarness(t)
+	h.writeSrc("small.txt", 10)
+	post := h.writeManifest("post", h.record("small.txt"))
+	h.scriptFreshDestSSH(post)
+	h.writeScript("rsync", "exit=0")
+
+	code, _, stderr := run(t, "sync", "--state-dir", h.stateDir, "--backend", "rsync",
+		h.src, "user@host:/data")
+	if code != ExitOK {
+		t.Fatalf("sync exit = %d, stderr:\n%s", code, stderr)
+	}
+	rs := h.invocations("rsync")
+	if len(rs) != 1 {
+		t.Fatalf("rsync invocations = %d, want 1", len(rs))
+	}
+	wantTransport := h.progs["ssh"]
+	found := false
+	for i, a := range rs[0].Args {
+		if a == "-e" {
+			found = true
+			if i+1 >= len(rs[0].Args) || rs[0].Args[i+1] != wantTransport {
+				t.Errorf("rsync -e transport = %q, want the CATSYNC_SSH override %q", rs[0].Args[i+1], wantTransport)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("rsync argv has no -e transport: %v", rs[0].Args)
+	}
+	// The manifest and mkdir ssh calls were made through the same override
+	// (the mock records the tool basename, which is "ssh" for the override
+	// path as well).
+	if got := len(h.invocations("ssh")); got < 1 {
+		t.Errorf("ssh manifest invocations = %d, want at least 1", got)
 	}
 }

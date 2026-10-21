@@ -298,10 +298,26 @@ catsync sync --backend mscp /srv/isos/ deploy@203.0.113.10:/srv/isos   # only if
   differs; that copy is sequential and content-identical, and ownership
   still determines verification and failure accounting.
 - There is no deletion: no `--delete`, no fpsync `-E`, no remote cleanup.
-- Credentials and private keys are never read or printed; the
-  `CATSYNC_SSH`/`CATSYNC_RSYNC`/`CATSYNC_FPSYNC`/`CATSYNC_FPART`/
-  `CATSYNC_MSCP` environment variables only override program *paths* for
-  diagnostics and tests, and environment values never appear in logs.
+- Credentials and private keys are never read or printed; no environment
+  value is ever printed. See the override scope table below.
+
+### Program overrides (diagnostics and tests)
+
+The `CATSYNC_*` environment variables override paths of programs CatSync
+executes itself. They never change tool behavior, and their values are never
+printed.
+
+| Variable | Effective scope |
+| --- | --- |
+| `CATSYNC_SSH` | The ssh invocations for the remote manifest and batched mkdir, **and** rsync's `-e` transport. Must be one token without whitespace or control characters (rsync splits `-e` on whitespace); `--ipv6` appends `-6`. Invalid values are a usage error. |
+| `CATSYNC_RSYNC` | CatSync's own rsync stage process. |
+| `CATSYNC_FPSYNC` | The fpsync process CatSync starts. |
+| `CATSYNC_FPART` | Only CatSync's availability probe. fpsync always locates `fpart` through `PATH` itself, so this cannot change which fpart runs; pointing it at a missing path only makes CatSync treat fpsync as unavailable (rsync fallback). |
+| `CATSYNC_MSCP` | The mscp process CatSync starts. |
+
+Processes started *inside* those tools — fpsync's own rsync/fpart/ssh
+invocations and mscp's libssh connections — resolve programs and SSH
+configuration themselves and are not affected by these variables.
 
 ## Known limitations
 

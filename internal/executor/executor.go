@@ -82,7 +82,12 @@ type Programs struct {
 	MSCP   string
 }
 
-func (p Programs) ssh() string    { return orDefault(p.SSH, "ssh") }
+func (p Programs) ssh() string { return orDefault(p.SSH, "ssh") }
+
+// sshProgram returns the ssh override exactly as configured: empty means
+// the transport and probe default to "ssh".
+func (p Programs) sshProgram() string { return p.SSH }
+
 func (p Programs) rsync() string  { return orDefault(p.Rsync, "rsync") }
 func (p Programs) fpsync() string { return orDefault(p.FPSync, "fpsync") }
 func (p Programs) fpart() string  { return orDefault(p.FPart, "fpart") }
@@ -158,6 +163,23 @@ func (c *Config) validateFull() error {
 	}
 	if err := backend.ValidateDestination(c.Dest); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+	}
+	// The ssh override reaches rsync's -e transport, which rsync splits on
+	// whitespace; refuse overrides it cannot represent instead of silently
+	// running a different command.
+	if err := (backend.SSH{Program: c.Programs.SSH}).ValidateTransport(); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+	}
+	for _, p := range []struct{ name, value string }{
+		{"CATSYNC_SSH", c.Programs.SSH},
+		{"CATSYNC_RSYNC", c.Programs.Rsync},
+		{"CATSYNC_FPSYNC", c.Programs.FPSync},
+		{"CATSYNC_FPART", c.Programs.FPart},
+		{"CATSYNC_MSCP", c.Programs.MSCP},
+	} {
+		if strings.ContainsRune(p.value, 0) {
+			return fmt.Errorf("%w: %s contains a NUL byte", ErrInvalidConfig, p.name)
+		}
 	}
 	return nil
 }

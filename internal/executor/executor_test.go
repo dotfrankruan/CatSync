@@ -269,3 +269,23 @@ func TestResumeRejectsCompletedRun(t *testing.T) {
 		t.Fatalf("Resume missing run = %v, want ErrNotFound", err)
 	}
 }
+
+// TestValidateRejectsUnexpressibleSSHOverride checks the configuration gate:
+// an ssh override rsync's -e cannot represent fails as a configuration
+// error instead of silently running a different transport command.
+func TestValidateRejectsUnexpressibleSSHOverride(t *testing.T) {
+	cfg := validTestConfig(t)
+	cfg.Programs.SSH = "/opt/a b/ssh"
+	err := cfg.validateFull()
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("validateFull = %v, want ErrInvalidConfig", err)
+	}
+	cfg.Programs.SSH = "/opt/mock/ssh"
+	if err := cfg.validateFull(); err != nil {
+		t.Fatalf("valid ssh override rejected: %v", err)
+	}
+	cfg.Programs.MSCP = "/tmp/a\x00b"
+	if err := cfg.validateFull(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("NUL program override = %v, want ErrInvalidConfig", err)
+	}
+}
