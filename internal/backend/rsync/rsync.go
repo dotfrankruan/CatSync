@@ -93,6 +93,12 @@ func (c *Config) Command() (argv []string, stdin []byte, err error) {
 	if err := backend.ValidateDestination(c.Dest); err != nil {
 		return nil, nil, err
 	}
+	// Defense in depth: the transport override must be representable in
+	// rsync's whitespace-split -e value even when this backend is used
+	// without the executor's configuration validation.
+	if err := c.SSH.ValidateTransport(); err != nil {
+		return nil, nil, err
+	}
 	partialDir := c.PartialDir
 	if partialDir == "" {
 		partialDir = DefaultPartialDir

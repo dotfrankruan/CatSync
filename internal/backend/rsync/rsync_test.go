@@ -266,3 +266,47 @@ func TestCommandSSHProgramOverride(t *testing.T) {
 		t.Errorf("argv missing -e: %v", argv)
 	}
 }
+
+// TestCommandRejectsUnexpressibleSSHProgram covers the backend's
+// defense-in-depth transport validation: rsync splits -e on whitespace, so
+// overrides it cannot represent must fail here too, not only in the
+// executor.
+func TestCommandRejectsUnexpressibleSSHProgram(t *testing.T) {
+	for _, bad := range []string{
+		"/opt/with space/ssh",
+		"ssh\t-x",
+		"ssh\nx",
+		"-ssh",
+		"a\x00b",
+	} {
+		cfg := validConfig()
+		cfg.SSH = backend.SSH{Program: bad}
+		if _, _, err := cfg.Command(); err == nil {
+			t.Errorf("SSH.Program %q accepted, want transport validation error", bad)
+		}
+	}
+}
+
+// TestCommandCustomSSHProgramRendering checks valid custom paths and the
+// IPv6 rendering pass through to -e unchanged.
+func TestCommandCustomSSHProgramRendering(t *testing.T) {
+	cfg := validConfig()
+	cfg.SSH = backend.SSH{Program: "/opt/custom/ssh", IPv6: true}
+	argv, _, err := cfg.Command()
+	if err != nil {
+		t.Fatalf("Command: %v", err)
+	}
+	want := "/opt/custom/ssh -6"
+	found := false
+	for i, a := range argv {
+		if a == "-e" {
+			found = true
+			if i+1 >= len(argv) || argv[i+1] != want {
+				t.Errorf("-e value = %q, want %q", argv[i+1], want)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("argv missing -e: %v", argv)
+	}
+}

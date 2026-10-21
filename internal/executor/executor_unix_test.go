@@ -1469,3 +1469,64 @@ func TestSyncCancellationWithZeroExitBackendRemainsResumable(t *testing.T) {
 		t.Errorf("descendant wrote %s after cancellation: %v", marker, statErr)
 	}
 }
+
+// TestResumeRejectsUnexpressibleSSHOverrideBeforeExecution is the regression
+// for the resume validation gap: a resumable run with the current
+// invocation's invalid CATSYNC_SSH must fail as a configuration error before
+// any backend or ssh invocation, without touching the persisted state or
+// attempt counts.
+func TestResumeRejectsUnexpressibleSSHOverrideBeforeExecution(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 10)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "exit=23")
+
+	cfg := h.config()
+	cfg.Backend = state.BackendRsync
+	cfg.Verify = state.VerifyNone
+	run, err := Sync(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("setup sync with failing rsync = nil, want a failed run")
+	}
+	if run.Status != state.StatusFailed || !run.Resumable() {
+		t.Fatalf("setup run = %s resumable=%v, want failed/resumable", run.Status, run.Resumable())
+	}
+	attemptsBefore := run.Tasks[0].Attempts
+	invocationsBefore := len(h.invocations())
+
+	badCfg := Config{
+		StateDir: h.stateDir,
+		Programs: Programs{SSH: "/opt/with space/ssh"},
+		Env:      mockexec.EnvScript(h.scriptDir, h.logPath),
+	}
+	_, rerr := Resume(context.Background(), badCfg, run.ID)
+	if !errors.Is(rerr, ErrInvalidConfig) {
+		t.Fatalf("Resume with unexpressible ssh override = %v, want ErrInvalidConfig", rerr)
+	}
+	if !strings.Contains(rerr.Error(), "whitespace") {
+		t.Errorf("error = %v, want the whitespace explanation", rerr)
+	}
+	// No ssh/rsync/fpsync/mscp invocation may have happened.
+	if got := len(h.invocations()); got != invocationsBefore {
+		t.Errorf("invocations = %d after rejected resume, want %d", got, invocationsBefore)
+	}
+	// The persisted run and its attempt count are untouched.
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Load(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Status != state.StatusFailed {
+		t.Errorf("persisted run status = %q, want failed", loaded.Status)
+	}
+	if len(loaded.Tasks) != 1 || loaded.Tasks[0].Attempts != attemptsBefore {
+		t.Errorf("persisted attempts = %+v, want %d", loaded.Tasks, attemptsBefore)
+	}
+	if loaded.Tasks[0].Status != state.StatusFailed {
+		t.Errorf("persisted task status = %q, want failed", loaded.Tasks[0].Status)
+	}
+}

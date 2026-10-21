@@ -541,3 +541,66 @@ func TestCLISSHOverrideReachesRsyncTransport(t *testing.T) {
 		t.Errorf("ssh manifest invocations = %d, want at least 1", got)
 	}
 }
+
+// allInvocations returns every mock invocation recorded so far.
+func (h *cliHarness) allInvocations() []mockexec.Invocation {
+	h.t.Helper()
+	invs, err := mockexec.ReadInvocations(h.logPath)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return invs
+}
+
+// TestResumeInvalidSSHOverrideIsUsageError covers the CLI layer: an invalid
+// CATSYNC_SSH on resume exits 2 with the transport explanation, before any
+// backend invocation, leaving the run untouched.
+func TestResumeInvalidSSHOverrideIsUsageError(t *testing.T) {
+	h := newCLIHarness(t)
+	h.writeSrc("small.txt", 10)
+	post := h.writeManifest("post", h.record("small.txt"))
+	h.scriptFreshDestSSH(post)
+	h.writeScript("rsync", "exit=23")
+
+	// Create a genuinely resumable run: the transfer fails.
+	code, _, stderr := run(t, "sync", "--state-dir", h.stateDir, "--backend", "rsync",
+		"--verify", "none", h.src, "user@host:/data")
+	if code != ExitError {
+		t.Fatalf("setup sync exit = %d, stderr:\n%s", code, stderr)
+	}
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runRec, err := store.Latest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !runRec.Resumable() {
+		t.Fatalf("setup run %s is not resumable", runRec.ID)
+	}
+	attemptsBefore := runRec.Tasks[0].Attempts
+	invocationsBefore := len(h.allInvocations())
+
+	t.Setenv("CATSYNC_SSH", "/opt/with space/ssh")
+	code, _, stderr = run(t, "resume", "--state-dir", h.stateDir)
+	if code != ExitUsage {
+		t.Fatalf("resume with invalid CATSYNC_SSH exit = %d, want %d (stderr:\n%s)", code, ExitUsage, stderr)
+	}
+	if !strings.Contains(stderr, "whitespace") || !strings.Contains(stderr, "-e") {
+		t.Errorf("stderr should name the transport reason:\n%s", stderr)
+	}
+	if got := len(h.allInvocations()); got != invocationsBefore {
+		t.Errorf("backend invocations = %d after rejected resume, want %d", got, invocationsBefore)
+	}
+	after, err := store.Load(runRec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != state.StatusFailed || after.Tasks[0].Status != state.StatusFailed {
+		t.Errorf("persisted state changed: run %s task %s", after.Status, after.Tasks[0].Status)
+	}
+	if after.Tasks[0].Attempts != attemptsBefore {
+		t.Errorf("attempts changed to %d, want %d", after.Tasks[0].Attempts, attemptsBefore)
+	}
+}

@@ -570,8 +570,10 @@ func resumeWith(ctx context.Context, cfg Config, id string, prepare func(*Execut
 	if !run.Resumable() {
 		return run, fmt.Errorf("%w: %s (status %s, no pending or failed tasks)", ErrNotResumable, run.ID, run.Status)
 	}
-	// The recorded configuration is authoritative; it must still pass
-	// today's safety invariants.
+	// The recorded configuration is authoritative for the transfer
+	// strategy, but the current invocation's program overrides are what
+	// Resume will actually execute, so they must pass the same validation
+	// a fresh sync applies (notably the rsync -e transport check).
 	rc := Config{
 		SourceDir:      run.Source.Path,
 		Dest:           target.Destination{User: run.Destination.User, Host: run.Destination.Host, Path: run.Destination.Path},
@@ -581,6 +583,8 @@ func resumeWith(ctx context.Context, cfg Config, id string, prepare func(*Execut
 		Streams:        run.Config.Streams,
 		LargeThreshold: run.Config.LargeThreshold,
 		StateDir:       cfg.StateDir,
+		Programs:       cfg.Programs,
+		Env:            cfg.Env,
 	}
 	if err := rc.validateFull(); err != nil {
 		return run, fmt.Errorf("executor: run %s configuration no longer valid: %w", run.ID, err)
