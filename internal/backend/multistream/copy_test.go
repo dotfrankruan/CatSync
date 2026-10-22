@@ -348,22 +348,21 @@ func TestCopyCallbackAfterFullWrite(t *testing.T) {
 	}
 }
 
-// TestCopyCallbackFailureStopsCopy: the first completed chunk's callback
-// fails; no new chunk is claimed, in-flight workers exit, and nothing
-// happens after Copy returns.
+// TestCopyCallbackFailureStopsCopy: a completed chunk's callback fails;
+// no new chunk is claimed after the failure, in-flight workers exit after
+// their current window, and nothing happens after Copy returns.
 //
-// Deterministic synchronization: chunk 0's write blocks on a test gate, and
-// when the gate opens it fails its write instead of completing — so no
-// worker ever becomes free to claim another chunk after the failure, which
-// removes the cancel-propagation window entirely.
+// Deterministic synchronization without sleeps: chunk 1's write waits on a
+// gate that the failing callback itself closes, so the sibling chunk is
+// guaranteed in-flight when the failure lands; the dispatcher has no free
+// worker to receive another chunk before cancellation takes effect.
 func TestCopyCallbackFailureStopsCopy(t *testing.T) {
 	size := uint64(256)
 	chunks := mustPlan(t, size, 64) // 4 chunks
 	src := &testReader{data: patternBytes(size)}
 	dst := newWriter(size)
 
-	gate0 := make(chan struct{})
-	failedCh := make(chan struct{})
+	gate1 := make(chan struct{})
 	var cbMu sync.Mutex
 	callbacks := map[int]int{}
 	var startMu sync.Mutex
@@ -373,36 +372,31 @@ func TestCopyCallbackFailureStopsCopy(t *testing.T) {
 		startMu.Lock()
 		started[c.Index] = true
 		startMu.Unlock()
-		if c.Index == 0 {
-			<-gate0
-			return 0, errors.New("chunk 0 torn down by test")
+		if c.Index == 1 {
+			<-gate1
 		}
 		return len(p), nil
 	}
-	done := make(chan error, 1)
-	go func() {
-		done <- Copy(context.Background(), src, dst, size, chunks, CopyOptions{
-			Workers: 2,
-			OnComplete: func(c Chunk) error {
-				cbMu.Lock()
-				callbacks[c.Index]++
-				cbMu.Unlock()
-				if c.Index == 1 {
-					close(failedCh)
-					return errors.New("injected callback failure")
-				}
-				return nil
-			},
-		})
-	}()
-	<-failedCh // the callback failure is recorded before we proceed
-	close(gate0)
-	err := <-done
+	// One worker copies chunk 0 (its callback fails); the other is inside
+	// chunk 1's write, released by the failing callback.
+	err := Copy(context.Background(), src, dst, size, chunks, CopyOptions{
+		Workers: 2,
+		OnComplete: func(c Chunk) error {
+			cbMu.Lock()
+			callbacks[c.Index]++
+			cbMu.Unlock()
+			if c.Index == 0 {
+				close(gate1) // let the in-flight sibling finish its window
+				return errors.New("injected callback failure")
+			}
+			return nil
+		},
+	})
 	if err == nil {
 		t.Fatal("Copy = nil, want the callback failure")
 	}
-	if !strings.Contains(err.Error(), "chunk 1") || !strings.Contains(err.Error(), "completion callback") {
-		t.Errorf("error = %v, want chunk 1 callback failure with range", err)
+	if !strings.Contains(err.Error(), "chunk 0") || !strings.Contains(err.Error(), "completion callback") {
+		t.Errorf("error = %v, want chunk 0 callback failure with range", err)
 	}
 	startMu.Lock()
 	for idx := range started {
@@ -413,10 +407,10 @@ func TestCopyCallbackFailureStopsCopy(t *testing.T) {
 	startMu.Unlock()
 	cbMu.Lock()
 	defer cbMu.Unlock()
-	if callbacks[1] != 1 {
-		t.Errorf("chunk 1 callbacks = %d, want exactly 1 (the failing call)", callbacks[1])
+	if callbacks[0] != 1 {
+		t.Errorf("chunk 0 callbacks = %d, want exactly 1 (the failing call)", callbacks[0])
 	}
-	for _, idx := range []int{0, 2, 3} {
+	for _, idx := range []int{1, 2, 3} {
 		if callbacks[idx] != 0 {
 			t.Errorf("chunk %d got %d callbacks after cancellation", idx, callbacks[idx])
 		}

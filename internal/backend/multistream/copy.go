@@ -175,13 +175,23 @@ func Copy(ctx context.Context, src io.ReaderAt, dst io.WriterAt, size uint64, ch
 					}
 					if opts.OnComplete != nil {
 						cbMu.Lock()
-						cbErr := opts.OnComplete(j.chunk)
-						cbMu.Unlock()
-						if cbErr != nil {
-							recordFailure(fmt.Errorf("multistream: chunk %d (%d+%d): completion callback: %w",
-								j.chunk.Index, j.chunk.Offset, j.chunk.Length, cbErr))
+						// Check again with the callback lock held: if a
+						// sibling failed while we waited for the lock, this
+						// chunk must not be reported complete.
+						if workCtx.Err() != nil {
+							cbMu.Unlock()
 							return
 						}
+						cbErr := opts.OnComplete(j.chunk)
+						if cbErr != nil {
+							// Cancel while still holding cbMu, so no other
+							// chunk's callback can start after this failure.
+							recordFailure(fmt.Errorf("multistream: chunk %d (%d+%d): completion callback: %w",
+								j.chunk.Index, j.chunk.Offset, j.chunk.Length, cbErr))
+							cbMu.Unlock()
+							return
+						}
+						cbMu.Unlock()
 					}
 				case <-workCtx.Done():
 					return
