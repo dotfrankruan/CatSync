@@ -60,6 +60,13 @@ type Config struct {
 	// Paths is the disjoint set of slash-separated paths relative to
 	// SourceDir. An empty set is valid: Run then does nothing.
 	Paths []string
+	// NoImpliedDirs adds --no-implied-dirs: the implied parent
+	// directories are neither created nor updated with source attributes,
+	// so concurrent rsync batches that share destination parents cannot
+	// race on directory metadata. Callers that set this must ensure the
+	// parent directories already exist (CatSync creates them with one
+	// batched remote mkdir before launching batches).
+	NoImpliedDirs bool
 	// Env lists environment additions applied on top of the inherited
 	// environment (see process.Spec.Env); nil inherits it unchanged.
 	Env []string
@@ -128,6 +135,9 @@ func (c *Config) Command() (argv []string, stdin []byte, err error) {
 		"--relative",
 		"--files-from=-",
 		"--from0",
+	}
+	if c.NoImpliedDirs {
+		args = append(args, "--no-implied-dirs")
 	}
 	if c.DryRun {
 		args = append(args, "--dry-run")

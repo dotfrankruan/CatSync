@@ -310,3 +310,44 @@ func TestCommandCustomSSHProgramRendering(t *testing.T) {
 		t.Errorf("argv missing -e: %v", argv)
 	}
 }
+
+// TestCommandNoImpliedDirs covers the option used by the native
+// parallel-rsync stage: it appears exactly once and never drags in the
+// forbidden options.
+func TestCommandNoImpliedDirs(t *testing.T) {
+	cfg := validConfig()
+	cfg.NoImpliedDirs = true
+	argv, stdin, err := cfg.Command()
+	if err != nil {
+		t.Fatalf("Command: %v", err)
+	}
+	count := 0
+	for _, a := range argv {
+		if a == "--no-implied-dirs" {
+			count++
+		}
+		for _, bad := range forbiddenFlags {
+			if a == bad {
+				t.Errorf("argv contains forbidden flag %q: %#v", bad, argv)
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("--no-implied-dirs appears %d times, want 1: %v", count, argv)
+	}
+	if got := string(stdin); got != "a/b.txt\x00c.txt\x00" {
+		t.Errorf("stdin = %q, want the NUL-delimited file list", got)
+	}
+
+	// The conservative stage keeps the default behavior.
+	plain := validConfig()
+	argv, _, err = plain.Command()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range argv {
+		if a == "--no-implied-dirs" {
+			t.Fatal("default command unexpectedly contains --no-implied-dirs")
+		}
+	}
+}

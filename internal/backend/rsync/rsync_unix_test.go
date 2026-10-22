@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -247,5 +249,339 @@ func TestLocalRealRsyncTransfer(t *testing.T) {
 	}
 	if want := "content of plain.txt -- updated, longer"; string(got) != want {
 		t.Errorf("after delta update destination = %q, want %q", got, want)
+	}
+}
+
+// runLocalRsync executes cfg against a local destination directory: the
+// argv is built exactly as the backend builds it and only the remote
+// destination operand is swapped for the local path. It returns the argv
+// and stdin payload for assertions.
+func runLocalRsync(t *testing.T, cfg Config, dst string) ([]string, []byte) {
+	t.Helper()
+	argv, stdin, err := cfg.Command()
+	if err != nil {
+		t.Fatalf("Command: %v", err)
+	}
+	argv[len(argv)-1] = dst + "/"
+	var stdout, stderr bytes.Buffer
+	if err := process.Run(context.Background(), process.Spec{
+		Name:   argv[0],
+		Args:   argv[1:],
+		Stdin:  bytes.NewReader(stdin),
+		Stdout: &stdout,
+		Stderr: &stderr,
+	}); err != nil {
+		t.Fatalf("local rsync: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+	return argv, stdin
+}
+
+// mkdirDestParents pre-creates the destination parent directories for rel
+// paths, the way CatSync's batched remote mkdir does before launching
+// parallel batches.
+func mkdirDestParents(t *testing.T, dst string, rels []string) {
+	t.Helper()
+	for _, rel := range rels {
+		if slash := strings.LastIndexByte(rel, '/'); slash >= 0 {
+			p := filepath.Join(dst, filepath.FromSlash(rel[:slash]))
+			if err := os.MkdirAll(p, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+// TestLocalRealRsyncNoImpliedDirsNested proves the parallel-rsync stage's
+// command shape with a real rsync and a local destination: pre-created
+// parent directories plus --relative --no-implied-dirs copy nested files
+// correctly (including empty files and names with spaces, Unicode, newlines,
+// quotes, and leading dashes), preserve file mtimes, never touch shared
+// parent directory metadata, and keep the deletion/whole-file/inplace flags
+// out of argv.
+func TestLocalRealRsyncNoImpliedDirsNested(t *testing.T) {
+	prog, err := exec.LookPath("rsync")
+	if err != nil {
+		t.Skip("rsync not installed; skipping real local transfer test")
+	}
+	src := t.TempDir()
+	dst := t.TempDir()
+	paths := []string{
+		"root.txt",
+		"dir with space/nested/file one.txt",
+		"ünïcødé/文件.txt",
+		"new\nline/file.txt",
+		"quotes/quote'and\"double.txt",
+		"-leading-dash/-file.txt",
+		"empty/zero.bin",
+	}
+	for _, rel := range paths {
+		content := []byte("content of " + rel)
+		if rel == "empty/zero.bin" {
+			content = nil
+		}
+		writeSourceFile(t, src, rel, content)
+	}
+	// Source directory attributes differ from the destination's so an
+	// implied-dir update would be visible.
+	srcDirTime := time.Date(2021, 5, 5, 5, 5, 5, 0, time.UTC)
+	for _, rel := range paths {
+		if slash := strings.LastIndexByte(rel, '/'); slash >= 0 {
+			if err := os.Chtimes(filepath.Join(src, filepath.FromSlash(rel[:slash])), srcDirTime, srcDirTime); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	mkdirDestParents(t, dst, paths)
+	// Give every pre-created destination parent a distinct mtime so an
+	// implied-directory attribute update would be unmistakable.
+	destDirTime := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	parents := map[string]bool{}
+	for _, rel := range paths {
+		if slash := strings.LastIndexByte(rel, '/'); slash >= 0 {
+			parents[filepath.Join(dst, filepath.FromSlash(rel[:slash]))] = true
+		}
+	}
+	for p := range parents {
+		if err := os.Chtimes(p, destDirTime, destDirTime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg := validConfig()
+	cfg.Program = prog
+	cfg.SourceDir = src
+	cfg.Paths = paths
+	cfg.NoImpliedDirs = true
+	argv, stdin := runLocalRsync(t, cfg, dst)
+
+	if want := strings.Join(paths, "\x00") + "\x00"; string(stdin) != want {
+		t.Errorf("stdin = %q, want the NUL-delimited path list", stdin)
+	}
+	foundFlag := false
+	for _, a := range argv {
+		if a == "--no-implied-dirs" {
+			foundFlag = true
+		}
+		for _, bad := range forbiddenFlags {
+			if a == bad {
+				t.Errorf("argv contains forbidden flag %q: %#v", bad, argv)
+			}
+		}
+	}
+	if !foundFlag {
+		t.Error("argv missing --no-implied-dirs")
+	}
+	for _, rel := range paths {
+		dp := filepath.Join(dst, filepath.FromSlash(rel))
+		got, rerr := os.ReadFile(dp)
+		if rerr != nil {
+			t.Errorf("read destination %q: %v", rel, rerr)
+			continue
+		}
+		want := "content of " + rel
+		if rel == "empty/zero.bin" {
+			want = ""
+		}
+		if string(got) != want {
+			t.Errorf("destination %q = %q, want %q", rel, got, want)
+		}
+		si, serr := os.Stat(filepath.Join(src, filepath.FromSlash(rel)))
+		di, derr := os.Stat(dp)
+		if serr == nil && derr == nil && !si.ModTime().Equal(di.ModTime()) {
+			t.Errorf("destination %q mtime = %v, want archive-preserved %v", rel, di.ModTime(), si.ModTime())
+		}
+	}
+	// The decisive property: source directory attributes are NOT applied to
+	// the implied destination directories. (Their mtime may still change
+	// because files are created inside them; only the source-attribute
+	// update is the concurrency hazard.)
+	for p := range parents {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("stat parent %s: %v", p, err)
+		}
+		if fi.ModTime().Equal(srcDirTime) {
+			t.Errorf("parent %s mtime = source directory time %v: implied-dir attributes were applied", p, srcDirTime)
+		}
+	}
+	// Control: without --no-implied-dirs the same transfer DOES copy the
+	// source directory mtime onto the destination parent, which is exactly
+	// the shared-parent race the flag avoids for parallel batches.
+	controlDst := t.TempDir()
+	mkdirDestParents(t, controlDst, paths)
+	for _, rel := range paths {
+		if slash := strings.LastIndexByte(rel, '/'); slash >= 0 {
+			p := filepath.Join(controlDst, filepath.FromSlash(rel[:slash]))
+			if err := os.Chtimes(p, destDirTime, destDirTime); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	control := validConfig()
+	control.Program = prog
+	control.SourceDir = src
+	control.Paths = paths
+	runLocalRsync(t, control, controlDst)
+	checkedControl := false
+	for _, rel := range paths {
+		slash := strings.LastIndexByte(rel, '/')
+		if slash < 0 {
+			continue
+		}
+		p := filepath.Join(controlDst, filepath.FromSlash(rel[:slash]))
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("stat control parent %s: %v", p, err)
+		}
+		if fi.ModTime().Equal(srcDirTime) {
+			checkedControl = true
+		}
+	}
+	if !checkedControl {
+		t.Error("control run without --no-implied-dirs did not apply source directory times; test assumption broken")
+	}
+	// Successful runs leave no partial directories behind.
+	if _, err := os.Stat(filepath.Join(dst, DefaultPartialDir)); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("partial dir remains after successful transfer: %v", err)
+	}
+}
+
+// TestLocalRealRsyncConcurrentBatchesSharedParents runs two batches
+// concurrently against the same local destination, sharing nested parent
+// directories: with pre-created parents and --no-implied-dirs both must
+// succeed without corrupting each other or rewriting parent metadata.
+func TestLocalRealRsyncConcurrentBatchesSharedParents(t *testing.T) {
+	prog, err := exec.LookPath("rsync")
+	if err != nil {
+		t.Skip("rsync not installed; skipping real local concurrent transfer test")
+	}
+	src := t.TempDir()
+	dst := t.TempDir()
+	paths := []string{
+		"shared/deep/one.txt",
+		"shared/deep/two.txt",
+		"shared/deep/ünïcødé three.txt",
+		"shared/other/four.txt",
+	}
+	for _, rel := range paths {
+		writeSourceFile(t, src, rel, []byte("payload "+rel))
+	}
+	mkdirDestParents(t, dst, paths)
+	destDirTime := time.Date(2020, 2, 2, 2, 2, 2, 0, time.UTC)
+	srcDirTime := time.Date(2021, 6, 6, 6, 6, 6, 0, time.UTC)
+	for _, dir := range []string{"shared", "shared/deep", "shared/other"} {
+		if err := os.Chtimes(filepath.Join(dst, filepath.FromSlash(dir)), destDirTime, destDirTime); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(filepath.Join(src, filepath.FromSlash(dir)), srcDirTime, srcDirTime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Two disjoint batches sharing the "shared/deep" parent.
+	batches := [][]string{
+		{"shared/deep/one.txt", "shared/deep/ünïcødé three.txt"},
+		{"shared/deep/two.txt", "shared/other/four.txt"},
+	}
+	errs := make(chan error, len(batches))
+	var wg sync.WaitGroup
+	for _, batch := range batches {
+		wg.Add(1)
+		go func(batch []string) {
+			defer wg.Done()
+			cfg := validConfig()
+			cfg.Program = prog
+			cfg.SourceDir = src
+			cfg.Paths = batch
+			cfg.NoImpliedDirs = true
+			argv, stdin, err := cfg.Command()
+			if err != nil {
+				errs <- err
+				return
+			}
+			argv[len(argv)-1] = dst + "/"
+			var stdout, stderr bytes.Buffer
+			errs <- process.Run(context.Background(), process.Spec{
+				Name:   argv[0],
+				Args:   argv[1:],
+				Stdin:  bytes.NewReader(stdin),
+				Stdout: &stdout,
+				Stderr: &stderr,
+			})
+		}(batch)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent local rsync: %v", err)
+		}
+	}
+	for _, rel := range paths {
+		got, rerr := os.ReadFile(filepath.Join(dst, filepath.FromSlash(rel)))
+		if rerr != nil {
+			t.Errorf("read destination %q: %v", rel, rerr)
+			continue
+		}
+		if want := "payload " + rel; string(got) != want {
+			t.Errorf("destination %q = %q, want %q", rel, got, want)
+		}
+	}
+	for _, dir := range []string{"shared", "shared/deep", "shared/other"} {
+		fi, err := os.Stat(filepath.Join(dst, filepath.FromSlash(dir)))
+		if err != nil {
+			t.Fatalf("stat %s: %v", dir, err)
+		}
+		if fi.ModTime().Equal(srcDirTime) {
+			t.Errorf("shared parent %s mtime = source directory time %v: implied-dir attribute race", dir, srcDirTime)
+		}
+	}
+}
+
+// TestLocalRealRsyncSharedRelativePartialDirIsPerFile proves the shared
+// relative --partial-dir cannot mix batches: a stale partial file for one
+// path does not disturb a concurrent/neighboring batch transferring a
+// different file in the same destination parent.
+func TestLocalRealRsyncSharedRelativePartialDirIsPerFile(t *testing.T) {
+	prog, err := exec.LookPath("rsync")
+	if err != nil {
+		t.Skip("rsync not installed; skipping real local partial test")
+	}
+	src := t.TempDir()
+	dst := t.TempDir()
+	writeSourceFile(t, src, "shared/a.txt", []byte("hello from a"))
+	writeSourceFile(t, src, "shared/b.txt", []byte("hello from b"))
+	mkdirDestParents(t, dst, []string{"shared/a.txt", "shared/b.txt"})
+
+	partialDir := filepath.Join(dst, "shared", DefaultPartialDir)
+	if err := os.MkdirAll(partialDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(partialDir, "a.txt")
+	if err := os.WriteFile(stale, []byte("stale partial bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := validConfig()
+	cfg.Program = prog
+	cfg.SourceDir = src
+	cfg.Paths = []string{"shared/b.txt"}
+	cfg.NoImpliedDirs = true
+	runLocalRsync(t, cfg, dst)
+
+	if got, rerr := os.ReadFile(filepath.Join(dst, "shared", "b.txt")); rerr != nil || string(got) != "hello from b" {
+		t.Fatalf("b.txt = %q, %v", got, rerr)
+	}
+	// The stale partial for the other file is untouched by the b batch.
+	if got, rerr := os.ReadFile(stale); rerr != nil || string(got) != "stale partial bytes" {
+		t.Errorf("stale partial for a.txt was disturbed: %q, %v", got, rerr)
+	}
+	// Transferring a.txt then consumes/replaces its own partial and leaves
+	// the file correct.
+	cfg.Paths = []string{"shared/a.txt"}
+	runLocalRsync(t, cfg, dst)
+	if got, rerr := os.ReadFile(filepath.Join(dst, "shared", "a.txt")); rerr != nil || string(got) != "hello from a" {
+		t.Fatalf("a.txt = %q, %v", got, rerr)
 	}
 }
