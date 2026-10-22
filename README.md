@@ -8,7 +8,9 @@ destination's metadata in one batched SSH call, assigns every file exactly
 one backend in an immutable **disjoint plan**, and drives battle-tested
 external tools to move the data in parallel:
 
-- **fpsync** (fpart + rsync) for the small-file stage,
+- **native parallel rsync** for the small-file stage: CatSync batches
+  small files deterministically and runs up to `--jobs` rsync processes
+  concurrently (no external fpsync/fpart),
 - **mscp** for large files confirmed new at the destination (parallel SSH
   connections per file),
 - **rsync** for everything else, as the conservative correctness fallback
@@ -28,7 +30,8 @@ catsync (local orchestrator)
   │ 3. plan: assign every relative path exactly one backend
   │ 4. persist the run atomically (state dir) before transferring
   │ 5. execute stages sequentially, so writers never overlap:
-  │      fpsync (small files) → mscp (new large files) → rsync (rest)
+  │      native parallel-rsync (small files) → mscp (new large files)
+  │      → rsync (rest)
   │ 6. verify completed tasks (batched remote size check)
   │ 7. mark tasks completed; only then retire mscp checkpoints
   └ all subprocesses are exec'd with argument arrays — no local shell
@@ -49,21 +52,20 @@ revalidates and continues them.
 
 | Tool | Required | Purpose |
 | --- | --- | --- |
-| `rsync` | **yes** | conservative transfer and delta backend |
+| `rsync` | **yes** | conservative transfer backend; the native small-file stage also drives it, one process per batch |
 | `ssh` | **yes** | remote transport, manifest, mkdir |
-| `fpsync` | optional | parallel small-file stage |
-| `fpart` | optional | partitioning helper fpsync drives |
 | `mscp` | optional | parallel large-file backend |
 
-The remote host needs GNU findutils for the optimized manifest collection
-(`find -printf`). If manifest collection fails — no GNU find, no directory
-yet handled separately, SSH failure — auto mode plans **conservatively**:
-every transferable file routes to rsync, and CatSync says so. A missing
-destination directory is detected remotely (the script exits 42) and counts
-as an authoritative *empty* destination, so first-time syncs still use
-fpsync/mscp.
+CatSync does **not** use external `fpsync` or `fpart`; the small-file stage
+is native. The remote host needs GNU findutils for the optimized manifest
+collection (`find -printf`). If manifest collection fails — no GNU find, no
+directory yet handled separately, SSH failure — auto mode plans
+**conservatively**: every transferable file routes to rsync, and CatSync
+says so. A missing destination directory is detected remotely (the script
+exits 42) and counts as an authoritative *empty* destination, so first-time
+syncs still use the native small-file stage and mscp.
 
-`catsync doctor` checks all five tools and reports versions.
+`catsync doctor` checks rsync, ssh, and mscp and reports versions.
 
 ## Build and install
 
@@ -82,10 +84,10 @@ or copy `bin/catsync` into your `PATH`.
 
 ### `catsync doctor`
 
-Probes rsync, ssh, fpsync, fpart, and mscp with bounded version/help
-probes, distinguishing required from optional tools. Missing optional tools
-only narrow auto mode; missing rsync or ssh fails the check. No secrets or
-environment contents are printed.
+Probes rsync, ssh, and mscp with bounded version/help probes,
+distinguishing required from optional tools. Missing mscp only narrows auto
+mode; missing rsync or ssh fails the check. No secrets or environment
+contents are printed.
 
 ### `catsync plan SOURCE [user@]host:/absolute/path`
 
@@ -94,7 +96,9 @@ conservative fallback), runs the planner, and prints the summary: per-backend
 counts, skipped/unsupported counts, and the logical source byte volume (a
 source-side sum, **not** a network-traffic estimate). Nothing is
 transferred and no run state is written. Unsafe forced-backend plans (for
-example `--backend fpsync` with a large file) exit nonzero.
+example `--backend fpsync` with a large file) exit nonzero. `--backend
+fpsync` is kept as a compatibility name; it selects the native
+parallel-rsync small-file backend and never invokes external fpsync/fpart.
 
 ### `catsync sync SOURCE [user@]host:/absolute/path`
 
@@ -106,19 +110,20 @@ interrupted with Ctrl-C stays resumable.
 
 Resumes the named run, or the latest resumable run without an argument.
 Reacquires the destination lock, revalidates source metadata (a changed
-source file fails its task instead of transferring), reuses the fpsync run
-ID and state directory, resumes mscp with `-R CHECKPOINT` from the
-**original working directory** (checkpoint paths are relative to it —
-resume from a different working directory and mscp cannot find its data),
-and reuses rsync's partial directory. Retained checkpoints survive failed
-resumes.
+source file fails its task instead of transferring), rebuilds small-file
+batches deterministically from pending tasks (legacy fpsync run IDs and
+state directories in old runs are ignored and retired on completion),
+resumes mscp with `-R CHECKPOINT` from the **original working directory**
+(checkpoint paths are relative to it — resume from a different working
+directory and mscp cannot find its data), and reuses rsync's partial
+directory. Retained checkpoints survive failed resumes.
 
 ### `catsync status [RUN_ID]`
 
 Prints a run without mutating it: status, source/destination, timestamps,
-configuration, per-status and per-backend task counts, the fpsync run ID,
-retained checkpoint count, and recorded errors. Missing or corrupt state
-exits nonzero.
+configuration, per-status and per-backend task counts, retained checkpoint
+count, and recorded errors. Legacy fpsync run IDs on old runs are shown for
+diagnostics only. Missing or corrupt state exits nonzero.
 
 ### `catsync version`
 
@@ -128,12 +133,12 @@ Prints the version.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--backend` | `auto` | `auto`, `fpsync`, `mscp`, or `rsync` |
+| `--backend` | `auto` | `auto`, `fpsync` (native parallel-rsync; does not invoke fpsync/fpart), `mscp`, or `rsync` |
 | `--dry-run` | off | plan and persist the run, transfer nothing |
 | `--verify` | `size` | `none` or `size` (`sha256` is not implemented, see below) |
-| `--jobs` | 4 | max concurrent transfer processes |
+| `--jobs` | 4 | max concurrent rsync batches (small-file stage) or mscp processes |
 | `--streams` | 4 | mscp SSH connections per process |
-| `--large-threshold` | `512MiB` | size at or above which a file counts as large (must be ≥ 2 bytes for fpsync) |
+| `--large-threshold` | `512MiB` | size at or above which a file counts as large |
 | `--ipv6` | off | restrict ssh, rsync transport, and mscp to IPv6 |
 | `--state-dir` | XDG state | run state directory |
 | `--quiet` / `--verbose` | off | output control |
@@ -145,9 +150,10 @@ deletes destination files.
 
 **SSH connection budget.** A run's estimated worst-case connection count is
 `jobs × streams` (each of up to `jobs` mscp processes holds `streams`
-connections; fpsync uses `jobs`; the manifest and verification phases use
-one). Configurations with `jobs × streams > 64` are rejected, so a typo
-cannot open hundreds of connections.
+connections; the native small-file stage uses up to `jobs` rsync+ssh
+processes; the manifest and verification phases use one). Configurations
+with `jobs × streams > 64` are rejected, so a typo cannot open hundreds of
+connections.
 
 ## Backend selection
 
@@ -156,7 +162,7 @@ Auto mode assigns every regular file exactly one owner:
 | Source / destination state | Backend |
 | --- | --- |
 | unchanged size and mtime (hint only) | skipped — no transfer |
-| new file below the threshold | fpsync (rsync if fpsync/fpart missing, or threshold < 2 bytes) |
+| new file below the threshold | native parallel-rsync batches (backend name `fpsync` for compatibility) |
 | new file at or above the threshold | mscp (rsync if mscp missing) |
 | existing, modified, or state unknown | rsync |
 | symlink, special file, or scan error | unsupported — recorded distinctly, never followed |
@@ -179,37 +185,34 @@ Size and mtime are planning *hints*, not proof of content equality; the
 verification stage is the completion gate. Forced backends must preserve
 the safety policy: `--backend mscp` rejects files that exist at the
 destination or whose destination state is unknown, and `--backend fpsync`
-rejects files at or above the threshold (and any threshold below 2 bytes).
+rejects files at or above the threshold.
 
-### fpsync, fpart, and the two different `-S` flags
+### Native small-file batching (replaces external fpsync/fpart)
 
-CatSync runs `fpsync -v -n JOBS -f 2000 -s (THRESHOLD-1) -O -S -t STATEDIR SRC/ DST/`.
-The `-S` here is passed *through* `fpsync -O` to **fpart**, enabling
-fpart's skip-files-larger-than-the-partition-limit mode — completely
-unrelated to **fpsync's own** `-S`, which enables sudo and is never used.
-fpsync's `-E` (directory mode) is never used either: it enables rsync's
-`--delete`.
+CatSync packs the new small files (size < threshold) into deterministic
+disjoint batches with a pure-Go next-fit partitioner (`internal/partition`,
+max 2000 files and at most `threshold` logical bytes per batch; a batch's
+byte sum never overflows). Then it runs up to `--jobs` rsync processes
+concurrently, each receiving exactly its own batch as a NUL-delimited
+`--files-from=-` list with `--relative --no-implied-dirs`.
 
-The shifted `-s` value matters: fpart skips only files **strictly larger**
-than the limit (verified against fpart 1.7.1: with `-s 1024`, a 1024-byte
-file is copied and only 1025+ bytes are skipped). CatSync treats a file at
-or above the threshold as large, so it passes `threshold-1`, which makes
-fpart's skip boundary exactly `size >= threshold`. A threshold below 2
-bytes cannot be expressed this way (fpart rejects `-s 0`), so auto mode
-falls back to rsync for the below-threshold files and forced fpsync is
-refused — correctness first, never a silent duplicate writer.
+Because batches share destination parent directories and `--relative` would
+otherwise let each rsync update those parents' attributes concurrently,
+CatSync first creates every parent with **one** batched remote `mkdir -p`,
+then runs the batches with `--no-implied-dirs` so rsync never creates or
+attribute-updates an implied directory. This is verified with real rsync
+3.5.1 runs: nested trees copy correctly, shared parents keep their
+attributes, and two concurrent batches into one parent do not interfere.
 
-fpsync still crawls the whole source tree, so the plan's disjointness is
-about *ownership and accounting*, not about fpsync's internal rsync being
-handed a file list (it cannot be). At-or-above-threshold files are skipped
-by fpart and printed as pseudo-partition records (`S<TAB>size<TAB>./path`);
-CatSync parses those records and **fails the run** if a skipped file has no
-other planned backend owner — a large file is never silently dropped. A
-file owned by rsync (for example a modified small file) can additionally be
-copied by fpsync's internal rsync when it differs: stages run strictly
-sequentially, so two writers never overlap in time, the content source is
-the same snapshot, and the later rsync stage finds the destination up to
-date. Verification and failure accounting stay per-owner.
+Per batch, CatSync revalidates every source file right before launch,
+persists each task's running intent before starting the process (a failed
+save blocks the launch), and re-checks the sources after rsync exits. The
+first unrecoverable batch failure cancels the remaining in-flight batches
+and stops launching new ones; cancelled batches' tasks revert to pending
+with a resumable note. Resume rebuilds batches deterministically from the
+pending tasks — no fpsync run IDs or state directories are involved — and
+rsync's per-file partial files survive batching boundaries because the
+partial file lives next to the destination file, not per batch.
 
 ### mscp: new large files only
 
@@ -291,13 +294,14 @@ catsync sync --backend mscp /srv/isos/ deploy@203.0.113.10:/srv/isos   # only if
   escaped.
 - SSH host-key checking is never disabled; CatSync passes no
   `StrictHostKeyChecking` overrides. Configure `~/.ssh/config` as usual.
-- Components never write the same destination path concurrently: the plan
-  assigns one owner per file, and stages (fpsync, mscp, rsync) run strictly
-  sequentially. fpsync is a whole-tree crawler, so its internal rsync can
-  redundantly copy a file owned by another backend when the destination
-  differs; that copy is sequential and content-identical, and ownership
-  still determines verification and failure accounting.
-- There is no deletion: no `--delete`, no fpsync `-E`, no remote cleanup.
+- No destination path ever has two writers at once: the plan assigns one
+  owner per file, stages (native small-file batches, mscp, rsync) run
+  strictly sequentially, and each small-file batch owns a disjoint file
+  set, so concurrent rsync batches never touch the same file. Shared
+  destination parents are pre-created and transferred with
+  `--no-implied-dirs`, so concurrent batches never race on directory
+  metadata either.
+- There is no deletion: no `--delete`, no remote cleanup.
 - Credentials and private keys are never read or printed; no environment
   value is ever printed. See the override scope table below.
 
@@ -310,14 +314,12 @@ printed.
 | Variable | Effective scope |
 | --- | --- |
 | `CATSYNC_SSH` | The ssh invocations for the remote manifest and batched mkdir, **and** rsync's `-e` transport. Must be one token without whitespace or control characters (rsync splits `-e` on whitespace); `--ipv6` appends `-6`. Invalid values are a usage error. |
-| `CATSYNC_RSYNC` | CatSync's own rsync stage process. |
-| `CATSYNC_FPSYNC` | The fpsync process CatSync starts. |
-| `CATSYNC_FPART` | Only CatSync's availability probe. fpsync always locates `fpart` through `PATH` itself, so this cannot change which fpart runs; pointing it at a missing path only makes CatSync treat fpsync as unavailable (rsync fallback). |
+| `CATSYNC_RSYNC` | The rsync processes CatSync starts (conservative stage and every native small-file batch). |
 | `CATSYNC_MSCP` | The mscp process CatSync starts. |
 
-Processes started *inside* those tools — fpsync's own rsync/fpart/ssh
-invocations and mscp's libssh connections — resolve programs and SSH
-configuration themselves and are not affected by these variables.
+`CATSYNC_FPSYNC` and `CATSYNC_FPART` no longer exist: CatSync never runs or
+probes those tools. mscp's libssh connections resolve SSH configuration
+themselves and are not affected by these variables.
 
 ## Known limitations
 
@@ -328,18 +330,12 @@ configuration themselves and are not affected by these variables.
 - **Symlinks, special files, and scan-error entries** are recorded with the
   distinct unsupported status, reported by count and path in sync, resume,
   status, and plan output, and never transferred or followed.
-- **fpsync sees the whole tree**: it cannot take CatSync's per-file list.
-  Files at or above the threshold are excluded by the shifted `-s` limit,
-  but files it does not own below the threshold may be copied by its
-  internal rsync when they differ (sequential stages keep this safe), and
-  small files created *during* a run are copied but untracked.
 - **mscp** transfers new files only; a modified large file always falls to
   rsync. mscp runs where the source lives — no remote-to-remote copies.
-- **fpsync transport options** (e.g. IPv6-only) cannot be forced through
-  fpsync; it uses rsync's defaults.
 - **Progress reporting** is coarse: stage start/finish lines and the tools'
-  own output. There is no aggregate byte-progress percentage; fpsync output
-  is preserved in a log file inside the state directory for inspection.
+  own output. There is no aggregate byte-progress percentage; each rsync
+  batch's stderr is captured and printed with its batch number when
+  non-empty.
 - **Manifest buffering**: the remote manifest is buffered in memory during
   collection (tens of bytes per remote file).
 - **sha256 verification** is not implemented in this MVP.
