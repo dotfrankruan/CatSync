@@ -47,11 +47,13 @@ func runDoctorCmd(t *testing.T, timeout time.Duration, opts Options) (code int, 
 }
 
 func TestDoctorAllToolsPresent(t *testing.T) {
+	// fpsync and fpart may be installed on the host; doctor must not probe
+	// them at all.
 	fakePath(t, map[string]string{
 		"rsync":  "echo 'rsync  version 3.2.7  protocol version 31'",
 		"ssh":    "echo 'OpenSSH_9.7p1, LibreSSL 3.3.6' >&2", // real ssh -V prints to stderr
-		"fpsync": "echo 'fpsync version 1.7.1'",
-		"fpart":  "echo 'fpart 1.7.1'",
+		"fpsync": "echo SHOULD-NOT-BE-PROBED",
+		"fpart":  "echo SHOULD-NOT-BE-PROBED",
 		"mscp":   "echo 'mscp 0.2.4'",
 	})
 	code, stdout, stderr := runDoctorCmd(t, 2*time.Second, Options{})
@@ -59,7 +61,7 @@ func TestDoctorAllToolsPresent(t *testing.T) {
 		t.Errorf("exit = %d, want %d (stderr %q)", code, ExitOK, stderr)
 	}
 	for _, want := range []string{
-		"rsync", "ssh", "fpsync", "fpart", "mscp",
+		"rsync", "ssh", "mscp",
 		"rsync  version 3.2.7", "OpenSSH_9.7p1", "mscp 0.2.4",
 		"all required tools are available",
 	} {
@@ -69,6 +71,11 @@ func TestDoctorAllToolsPresent(t *testing.T) {
 	}
 	if strings.Contains(stdout, "missing") {
 		t.Errorf("no tool should be reported missing:\n%s", stdout)
+	}
+	for _, bad := range []string{"fpsync", "fpart", "SHOULD-NOT-BE-PROBED"} {
+		if strings.Contains(stdout, bad) {
+			t.Errorf("doctor probed or listed %q:\n%s", bad, stdout)
+		}
 	}
 }
 
@@ -81,7 +88,7 @@ func TestDoctorMissingOptionalToolsStillSucceeds(t *testing.T) {
 	if code != ExitOK {
 		t.Errorf("exit = %d, want %d (stderr %q)", code, ExitOK, stderr)
 	}
-	for _, want := range []string{"fpsync  missing", "fpart   missing", "mscp    missing", "optional"} {
+	for _, want := range []string{"mscp    missing", "optional"} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("stdout missing %q:\n%s", want, stdout)
 		}

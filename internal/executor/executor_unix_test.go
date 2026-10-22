@@ -28,7 +28,7 @@ func TestMain(m *testing.M) {
 }
 
 // harness wires a source tree, a state directory, and the mock executables
-// (ssh, rsync, fpsync, fpart, mscp) in script mode.
+// (ssh, rsync, mscp) in script mode.
 type harness struct {
 	t         *testing.T
 	src       string
@@ -41,7 +41,7 @@ type harness struct {
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	binDir := t.TempDir()
-	progs, err := mockexec.LinkPrograms(binDir, "ssh", "rsync", "fpsync", "fpart", "mscp")
+	progs, err := mockexec.LinkPrograms(binDir, "ssh", "rsync", "mscp")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,11 +66,9 @@ func (h *harness) config() Config {
 		LargeThreshold: 1024,
 		StateDir:       h.stateDir,
 		Programs: Programs{
-			SSH:    h.progs["ssh"],
-			Rsync:  h.progs["rsync"],
-			FPSync: h.progs["fpsync"],
-			FPart:  h.progs["fpart"],
-			MSCP:   h.progs["mscp"],
+			SSH:   h.progs["ssh"],
+			Rsync: h.progs["rsync"],
+			MSCP:  h.progs["mscp"],
 		},
 		Env: mockexec.EnvScript(h.scriptDir, h.logPath),
 	}
@@ -430,10 +428,6 @@ func TestSyncWithoutFPSyncProgramsStillUsesNativeBackend(t *testing.T) {
 	h.scriptSSHFreshDest(post)
 	h.writeScript("rsync", "exit=0")
 	cfg := h.config()
-	// Point the legacy fpsync/fpart overrides at nothing: the native
-	// small-file backend must not need or invoke them.
-	cfg.Programs.FPSync = filepath.Join(t.TempDir(), "no-fpsync")
-	cfg.Programs.FPart = cfg.Programs.FPSync
 
 	run, err := Sync(context.Background(), cfg)
 	if err != nil {
@@ -477,8 +471,6 @@ func TestSyncForcedUnavailableBackendFails(t *testing.T) {
 	// "fpsync" with no fpsync executable still works through rsync.
 	cfg2 := h.config()
 	cfg2.Backend = state.BackendFPSync
-	cfg2.Programs.FPSync = filepath.Join(t.TempDir(), "no-fpsync")
-	cfg2.Programs.FPart = cfg2.Programs.FPSync
 	run, err := Sync(context.Background(), cfg2)
 	if err != nil {
 		t.Fatalf("forced fpsync (native) without fpsync/fpart executables: %v", err)
@@ -1376,44 +1368,6 @@ func TestCheckpointReferenceClearFailureRetainsCheckpoint(t *testing.T) {
 	}
 	if _, statErr := os.Stat(cp); !errors.Is(statErr, os.ErrNotExist) {
 		t.Errorf("recovery left checkpoint file behind: %v", statErr)
-	}
-}
-
-// TestFPartOverrideOnlyAffectsProbe pins the documented CATSYNC_FPART
-// scope: the override affects CatSync's availability probe only, because
-// fpsync locates fpart through PATH itself. Pointing it at a missing file
-// makes fpsync unavailable (rsync fallback); CatSync never passes an fpart
-// path to fpsync, so a value that exists does not change which fpart
-// actually runs.
-func TestFPartOverrideOnlyAffectsProbe(t *testing.T) {
-	h := newHarness(t)
-	h.writeSrc("small.txt", 10)
-	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
-	h.scriptSSHFreshDest(post)
-	h.writeScript("rsync", "exit=0")
-	cfg := h.config()
-	cfg.Programs.FPart = filepath.Join(t.TempDir(), "no-fpart")
-
-	run, err := Sync(context.Background(), cfg)
-	if err != nil {
-		t.Fatalf("Sync: %v", err)
-	}
-	if run.Status != state.StatusCompleted {
-		t.Fatalf("run status = %s (%q)", run.Status, run.Error)
-	}
-	if got := len(toolInvocations(h.invocations(), "fpsync")); got != 0 {
-		t.Errorf("fpsync invocations = %d, want 0 (probe found no fpart)", got)
-	}
-	rs := toolInvocations(h.invocations(), "rsync")
-	if len(rs) != 1 {
-		t.Fatalf("rsync invocations = %d, want 1", len(rs))
-	}
-	// CatSync never emits an fpart program argument: fpsync owns that
-	// lookup, so the override cannot be forwarded.
-	for _, a := range rs[0].Args {
-		if strings.Contains(a, "no-fpart") {
-			t.Errorf("fpart override leaked into a backend argv element: %q", a)
-		}
 	}
 }
 

@@ -20,7 +20,7 @@ func run(ctx context.Context, cmd *exec.Cmd, spec Spec) error {
 		grace = DefaultGracePeriod
 	}
 	// Setpgid puts the child in its own process group led by its PID, so
-	// a group signal reaches every descendant (fpart, rsync, ssh) without
+	// a group signal reaches every descendant (rsync, ssh) without
 	// touching catsync or unrelated processes. WaitDelay bounds the time
 	// Wait may spend on stdout/stderr pipes held by survivors.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

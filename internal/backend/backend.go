@@ -4,9 +4,8 @@
 //
 //   - internal/backend/rsync: the conservative correctness fallback; it
 //     transfers a disjoint set of relative paths with archive semantics and
-//     never deletes.
-//   - internal/backend/fpsync: the parallel small-file stage driving
-//     fpart+fpsync, with large-file skipping and resumable runs.
+//     never deletes. The native small-file stage also drives this package,
+//     once per disjoint batch with --no-implied-dirs.
 //   - internal/backend/mscp: the parallel single-large-file stage with
 //     checkpoint/resume.
 //
@@ -23,11 +22,8 @@ import (
 	"github.com/frankruan/catsync/internal/target"
 )
 
-// SSH carries the SSH transport options honored by the backends.
-//
-// fpsync has no per-run SSH option channel (it shells out to a stock rsync
-// with default options), so these settings apply to the rsync and mscp
-// backends only.
+// SSH carries the SSH transport options honored by the backends; they apply
+// to the rsync and mscp backends.
 type SSH struct {
 	// IPv6 restricts connections to IPv6 (rsync transport "ssh -6",
 	// mscp -6).

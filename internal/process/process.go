@@ -10,7 +10,7 @@
 // SIGTERM — the same termination signal is forwarded to the whole group,
 // descendants included; after a bounded grace period any survivor is
 // SIGKILLed. Run returns only after the direct child has been waited for
-// and the process group has been verified empty, so fpart, rsync, and ssh
+// and the process group has been verified empty, so rsync and ssh
 // descendants cannot outlive Run. stdout/stderr pipes cannot block
 // cancellation forever: exec.Cmd.WaitDelay bounds them by the same grace
 // period.

@@ -254,15 +254,14 @@ type Run struct {
 	WorkDir string `json:"work_dir"`
 	// Config is the immutable transfer configuration.
 	Config Config `json:"config"`
-	// FPSyncRunID is the fpsync run identifier of the small-file stage,
-	// needed to resume it with "fpsync -r"; empty while the stage has not
-	// produced one.
+	// FPSyncRunID, FPSyncStateDir, and FPSyncOutput are LEGACY fields
+	// written by the removed external-fpsync implementation. They remain
+	// so old run documents still load; new runs never write them, native
+	// resume does not read them, and a successful completion clears them.
 	FPSyncRunID string `json:"fpsync_run_id,omitempty"`
-	// FPSyncStateDir is the fpsync temp/state directory (-t) the
-	// small-file stage used; resume must reuse exactly this directory.
+	// FPSyncStateDir is the legacy fpsync -t directory; see FPSyncRunID.
 	FPSyncStateDir string `json:"fpsync_state_dir,omitempty"`
-	// FPSyncOutput is the file holding the small-file stage's preserved
-	// standard output; kept for diagnostics and resume auditing.
+	// FPSyncOutput is the legacy preserved fpsync stdout; see FPSyncRunID.
 	FPSyncOutput string `json:"fpsync_output,omitempty"`
 	// Status is the run lifecycle state.
 	Status Status `json:"status"`

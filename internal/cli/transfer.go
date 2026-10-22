@@ -39,16 +39,15 @@ func (o *Options) executorConfig(src string, dst target.Destination, stdout, std
 	}
 }
 
-// programsFromEnv reads the CATSYNC_<TOOL> program overrides. They exist
-// for diagnostics and tests; values are paths or program names and are
-// never printed.
+// programsFromEnv reads the CATSYNC_<TOOL> program overrides for the
+// programs CatSync itself starts (ssh, rsync, mscp). They exist for
+// diagnostics and tests; values are paths or program names and are never
+// printed.
 func programsFromEnv() executor.Programs {
 	return executor.Programs{
-		SSH:    os.Getenv("CATSYNC_SSH"),
-		Rsync:  os.Getenv("CATSYNC_RSYNC"),
-		FPSync: os.Getenv("CATSYNC_FPSYNC"),
-		FPart:  os.Getenv("CATSYNC_FPART"),
-		MSCP:   os.Getenv("CATSYNC_MSCP"),
+		SSH:   os.Getenv("CATSYNC_SSH"),
+		Rsync: os.Getenv("CATSYNC_RSYNC"),
+		MSCP:  os.Getenv("CATSYNC_MSCP"),
 	}
 }
 

@@ -17,6 +17,8 @@ import (
 // validates it.
 type Options struct {
 	// Backend selects the transfer backend: auto, fpsync, mscp, or rsync.
+	// "fpsync" is a compatibility name for the native parallel-rsync
+	// small-file backend; no external fpsync/fpart is used.
 	Backend string
 	// DryRun plans and reports without transferring data.
 	DryRun bool
@@ -67,7 +69,8 @@ func defaultStateDir() string {
 // are the receiver's current values, so callers must start from
 // defaultOptions for help text to render correct defaults.
 func (o *Options) bindSharedFlags(fs *flag.FlagSet) {
-	fs.StringVar(&o.Backend, "backend", o.Backend, "transfer backend: auto, fpsync, mscp, or rsync")
+	fs.StringVar(&o.Backend, "backend", o.Backend,
+		"transfer backend: auto, fpsync (native parallel-rsync; does not invoke fpsync/fpart), mscp, or rsync")
 	fs.BoolVar(&o.DryRun, "dry-run", o.DryRun, "plan and report without transferring data")
 	fs.BoolVar(&o.Verbose, "verbose", o.Verbose, "increase output detail")
 	fs.BoolVar(&o.Quiet, "quiet", o.Quiet, "suppress non-error output")
@@ -76,7 +79,7 @@ func (o *Options) bindSharedFlags(fs *flag.FlagSet) {
 	fs.StringVar(&o.Verify, "verify", o.Verify, "completion verification: none, size, or sha256")
 	fs.IntVar(&o.Jobs, "jobs", o.Jobs, "maximum parallel transfer jobs")
 	fs.IntVar(&o.Streams, "streams", o.Streams, "maximum parallel streams per job")
-	fs.Var(&o.LargeThreshold, "large-threshold", "size at or above which a file counts as large (e.g. 512MiB; fpsync needs >= 2 bytes)")
+	fs.Var(&o.LargeThreshold, "large-threshold", "size at or above which a file counts as large (e.g. 512MiB)")
 }
 
 // validateOutput checks the options shared by every command.

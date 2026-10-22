@@ -23,15 +23,14 @@ type toolSpec struct {
 }
 
 // doctorTools lists the tools CatSync shells out to, in display order.
-// rsync and ssh are required; the rest enable optional acceleration
-// backends, and their absence only narrows auto mode.
+// rsync and ssh are required; mscp enables the optional large-file
+// backend, and its absence only narrows auto mode. The small-file stage is
+// native (parallel rsync) and needs no external tools beyond rsync and ssh.
 var doctorTools = []toolSpec{
-	{name: "rsync", required: true, versionArgs: []string{"--version"}, purpose: "required conservative transfer and delta backend"},
+	{name: "rsync", required: true, versionArgs: []string{"--version"}, purpose: "required transfer backend (conservative and native small-file batches)"},
 	{name: "ssh", required: true, versionArgs: []string{"-V"}, purpose: "required remote transport"},
-	// fpsync and mscp have no --version flag; their -h help banners carry
-	// the version on the first line and exit zero.
-	{name: "fpsync", required: false, versionArgs: []string{"-h"}, purpose: "optional parallel small-file backend"},
-	{name: "fpart", required: false, versionArgs: []string{"-V"}, purpose: "optional partitioning helper used by fpsync"},
+	// mscp has no --version flag; its -h help banner carries the version on
+	// the first line and exits zero.
 	{name: "mscp", required: false, versionArgs: []string{"-h"}, purpose: "optional parallel large-file backend"},
 }
 
@@ -50,8 +49,8 @@ func runDoctorCommand(args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("doctor", `Usage: catsync doctor [options]
 
 Check that the external tools catsync relies on are installed and report
-their versions. Missing optional tools (fpsync, fpart, mscp) only narrow
-what auto mode can use; missing required tools (rsync, ssh) fail the check.
+their versions. Missing optional tools (mscp) only narrow what auto mode
+can use; missing required tools (rsync, ssh) fail the check.
 
 Options:
 `, stderr)

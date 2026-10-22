@@ -641,8 +641,8 @@ func targetRemoteJoin(base, rel string) string {
 // sshOpts renders the backend SSH options for a run. The configured ssh
 // program override (CATSYNC_SSH) reaches rsync's -e transport as well as
 // the manifest/mkdir invocations, so diagnostics and tests control the
-// whole ssh path CatSync itself starts. fpsync's internal rsync/ssh and
-// mscp's libssh always use their own resolution and are not affected.
+// whole ssh path CatSync itself starts; mscp's libssh uses its own
+// resolution and is not affected.
 func (e *Executor) sshOpts(ipv6 bool) backend.SSH {
 	return backend.SSH{IPv6: ipv6, Program: e.progs.sshProgram()}
 }

@@ -1,16 +1,18 @@
 // Package executor drives the durable CatSync run lifecycle: it validates
 // the configuration, locks the destination, discovers the source, collects
 // the remote manifest in one batched SSH call, plans disjoint backend sets,
-// persists the run before any transfer, executes the fpsync, mscp, and
-// rsync stages sequentially (so no destination path ever has concurrent
-// writers), verifies, and only then marks tasks completed.
+// persists the run before any transfer, executes the native parallel-rsync
+// small-file stage, mscp, and rsync stages sequentially (so no destination
+// path ever has concurrent writers), verifies, and only then marks tasks
+// completed.
 //
 // Resume loads a persisted run, recovers interrupted state, reacquires the
 // destination lock, revalidates source metadata, and continues pending and
-// failed tasks with the run's recorded immutable configuration: fpsync
-// resumes by run ID from its recorded state directory, mscp resumes from
-// its retained checkpoint with the recorded working directory, and rsync
-// resumes through its partial directory.
+// failed tasks with the run's recorded immutable configuration: small-file
+// batches are rebuilt deterministically from pending tasks (legacy
+// fpsync-run fields are ignored and retired on completion), mscp resumes
+// from its retained checkpoint with the recorded working directory, and
+// rsync resumes through its partial directory.
 //
 // State transitions are persisted atomically before and after every
 // meaningful operation: a task is marked running before its subprocess
@@ -41,8 +43,8 @@ import (
 
 // Tuning constants of the MVP orchestration.
 const (
-	// DefaultFilesPerPartition is the fpsync -f value; fpsync partitions
-	// the small-file stage into chunks of at most this many files.
+	// DefaultFilesPerPartition is the maximum number of files in one
+	// native small-file batch.
 	DefaultFilesPerPartition = 2000
 
 	// MaxSSHConnections bounds the estimated global SSH connection count,
@@ -75,11 +77,9 @@ var (
 // Programs names the external executables. An empty field uses the default
 // program name resolved through PATH.
 type Programs struct {
-	SSH    string
-	Rsync  string
-	FPSync string
-	FPart  string
-	MSCP   string
+	SSH   string
+	Rsync string
+	MSCP  string
 }
 
 func (p Programs) ssh() string { return orDefault(p.SSH, "ssh") }
@@ -88,10 +88,8 @@ func (p Programs) ssh() string { return orDefault(p.SSH, "ssh") }
 // the transport and probe default to "ssh".
 func (p Programs) sshProgram() string { return p.SSH }
 
-func (p Programs) rsync() string  { return orDefault(p.Rsync, "rsync") }
-func (p Programs) fpsync() string { return orDefault(p.FPSync, "fpsync") }
-func (p Programs) fpart() string  { return orDefault(p.FPart, "fpart") }
-func (p Programs) mscp() string   { return orDefault(p.MSCP, "mscp") }
+func (p Programs) rsync() string { return orDefault(p.Rsync, "rsync") }
+func (p Programs) mscp() string  { return orDefault(p.MSCP, "mscp") }
 
 func orDefault(v, def string) string {
 	if v == "" {
@@ -173,8 +171,6 @@ func (c *Config) validateFull() error {
 	for _, p := range []struct{ name, value string }{
 		{"CATSYNC_SSH", c.Programs.SSH},
 		{"CATSYNC_RSYNC", c.Programs.Rsync},
-		{"CATSYNC_FPSYNC", c.Programs.FPSync},
-		{"CATSYNC_FPART", c.Programs.FPart},
 		{"CATSYNC_MSCP", c.Programs.MSCP},
 	} {
 		if strings.ContainsRune(p.value, 0) {

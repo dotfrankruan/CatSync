@@ -36,7 +36,7 @@ type cliHarness struct {
 func newCLIHarness(t *testing.T) *cliHarness {
 	t.Helper()
 	binDir := t.TempDir()
-	progs, err := mockexec.LinkPrograms(binDir, "ssh", "rsync", "fpsync", "fpart", "mscp")
+	progs, err := mockexec.LinkPrograms(binDir, "ssh", "rsync", "mscp")
 	if err != nil {
 		t.Fatal(err)
 	}
