@@ -205,11 +205,14 @@ attribute-updates an implied directory. This is verified with real rsync
 attributes, and two concurrent batches into one parent do not interfere.
 
 Per batch, CatSync revalidates every source file right before launch,
-persists each task's running intent before starting the process (a failed
-save blocks the launch), and re-checks the sources after rsync exits. The
-first unrecoverable batch failure cancels the remaining in-flight batches
-and stops launching new ones; cancelled batches' tasks revert to pending
-with a resumable note. Resume rebuilds batches deterministically from the
+persists the whole batch's running intent in ONE atomic save (a failed save
+blocks the launch and leaves every task pending, never a partial commit),
+and re-checks the sources after rsync exits. Cancellation is honored at
+every boundary: before a batch starts, during its pre-checks, before the
+save, and between the save and the launch (where the batch reverts to
+pending in one save and no process starts). The first unrecoverable batch
+failure cancels the remaining in-flight batches and stops launching new
+ones; cancelled batches' tasks revert to pending with a resumable note. Resume rebuilds batches deterministically from the
 pending tasks — no fpsync run IDs or state directories are involved — and
 rsync's per-file partial files survive batching boundaries because the
 partial file lives next to the destination file, not per batch.

@@ -109,7 +109,13 @@ interruption error so `resume` can revalidate it.
 
 Persistence failures are correctness failures, not warnings. A task's
 `running` state is saved before its subprocess starts, and a failed save
-prevents the launch and propagates to the command. Completion is saved
+prevents the launch and propagates to the command. For the parallel
+small-file batches, the whole batch's running intent is one atomic save
+(mutate and save under the run lock, with full rollback on failure), so a
+failed save leaves every task pending and no batch process starts.
+Cancellation is checked at every batch boundary — before work, during
+pre-checks, before the intent save, and between save and launch — so a
+cancelled batch never lingers as running and never starts a process. Completion is saved
 before an mscp checkpoint is retired; the checkpoint reference is cleared
 and persisted before the file is removed, so a crash leaves either a
 referenced checkpoint or a harmless orphan file, never a completed task
