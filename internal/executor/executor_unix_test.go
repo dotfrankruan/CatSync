@@ -1700,62 +1700,6 @@ func TestNativeStageIPv6Transport(t *testing.T) {
 	}
 }
 
-// TestNativeStageCancelsSiblingsOnBatchFailure: one batch fails while its
-// siblings sleep; the stage cancels them, their tasks revert to pending
-// (resumable), and no rsync processes survive.
-func TestNativeStageCancelsSiblingsOnBatchFailure(t *testing.T) {
-	h := newHarness(t)
-	h.writeSrc("a.txt", 600)
-	h.writeSrc("b.txt", 600)
-	h.writeSrc("c.txt", 600)
-	post := h.writeManifest("post", manifestContent(
-		h.newFileRecord("a.txt"), h.newFileRecord("b.txt"), h.newFileRecord("c.txt")))
-	h.scriptSSHFreshDest(post)
-	// The first batch to launch fails immediately; the others would sleep.
-	h.writeScript("rsync", "nth=1\nexit=1\n---\nsleep_ms=30000\nexit=0\n")
-	cfg := h.config()
-	cfg.Jobs = 3
-
-	start := time.Now()
-	run, err := Sync(context.Background(), cfg)
-	elapsed := time.Since(start)
-	if err == nil {
-		t.Fatal("Sync with a failing batch = nil, want error")
-	}
-	if elapsed > 20*time.Second {
-		t.Errorf("Sync took %s: sibling batches were not cancelled promptly", elapsed)
-	}
-	if run.Status != state.StatusFailed {
-		t.Errorf("run status = %s, want failed", run.Status)
-	}
-	failed, pending := 0, 0
-	for _, task := range run.Tasks {
-		switch task.Status {
-		case state.StatusFailed:
-			failed++
-			if !strings.Contains(task.Error, "rsync batch failed") {
-				t.Errorf("failed task error = %q", task.Error)
-			}
-		case state.StatusPending:
-			pending++
-			if !strings.Contains(task.Error, "cancelled: another small-file batch failed") {
-				t.Errorf("pending task error = %q, want the cancellation note", task.Error)
-			}
-		default:
-			t.Errorf("task %s status = %s, want failed or pending", task.Path, task.Status)
-		}
-	}
-	if failed != 1 || pending != 2 {
-		t.Errorf("failed=%d pending=%d, want 1 failed + 2 pending", failed, pending)
-	}
-	// No mock rsync process survives Sync.
-	for _, inv := range toolInvocations(h.invocations(), "rsync") {
-		if err := mockexec.ProcessAlive(inv.PID); err == nil {
-			t.Errorf("mock rsync pid %d still alive after cancellation", inv.PID)
-		}
-	}
-}
-
 // TestNativeStageNeverLaunchesUnstartedBatches: with jobs=1, a failing
 // first batch stops the stage before the remaining batches ever launch a
 // process or mark their tasks.
@@ -2219,5 +2163,189 @@ func TestNativeBatchRunningIntentSavedOnce(t *testing.T) {
 	}
 	if runningIntents != 1 {
 		t.Errorf("running-intent saves = %d, want exactly 1 (snapshots: %v)", runningIntents, snapshots)
+	}
+}
+
+// TestNativeStageCancellationDuringBatchPreparation: a 100-file batch is
+// cancelled exactly when its running intent is persisted. Regression: the
+// old per-task loop would have kept saving each file's state and only then
+// hit rsync with a dead context — the fix must do a constant number of
+// saves (initial + batch running + batch revert + interruption record) and
+// start no process.
+func TestNativeStageCancellationDuringBatchPreparation(t *testing.T) {
+	h := newHarness(t)
+	var names []string
+	var recs []string
+	for i := 0; i < 100; i++ {
+		name := fmt.Sprintf("f%03d.txt", i)
+		h.writeSrc(name, 10)
+		names = append(names, name)
+		recs = append(recs, h.newFileRecord(name))
+	}
+	post := h.writeManifest("post", manifestContent(recs...))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "exit=0")
+	cfg := h.config()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var mu sync.Mutex
+	saves := 0
+	var once sync.Once
+	run, err := syncWith(ctx, cfg, func(e *Executor) {
+		orig := e.saveFn
+		e.saveFn = func(r *state.Run) error {
+			running := false
+			for i := range r.Tasks {
+				if r.Tasks[i].Status == state.StatusRunning {
+					running = true
+				}
+			}
+			mu.Lock()
+			saves++
+			mu.Unlock()
+			if running {
+				// The batch's running intent just became durable: cancel
+				// now, between the save and the rsync launch.
+				once.Do(cancel)
+			}
+			return orig(r)
+		}
+	})
+	if run == nil {
+		t.Fatal("Sync returned no run")
+	}
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Sync = %v, want an error wrapping context.Canceled", err)
+	}
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 0 {
+		t.Errorf("rsync invocations = %d, want 0 (cancelled before launch)", got)
+	}
+	mu.Lock()
+	n := saves
+	mu.Unlock()
+	// Exactly: initial save, batch running intent, batch revert to pending,
+	// interruption record. Independent of the 100-file batch size.
+	if n != 4 {
+		t.Errorf("saves = %d, want exactly 4 (constant, not file-count-dependent)", n)
+	}
+	for _, task := range run.Tasks {
+		if task.Status == state.StatusRunning {
+			t.Errorf("task %s stuck at running after cancellation", task.Path)
+		}
+		if task.Status != state.StatusPending {
+			t.Errorf("task %s = %s, want pending", task.Path, task.Status)
+		}
+	}
+
+	// The interrupted run stays resumable.
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, _, err := store.LoadAndRecover(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.Resumable() {
+		t.Error("cancelled-during-preparation run is not resumable")
+	}
+}
+
+// TestNativeStageCancelsSiblingsAndSkipsUnstarted: with jobs=2 and four
+// one-file batches, one in-flight batch fails deterministically (gated on
+// both in-flight batches being live) while two batches have not started.
+// The sibling is cancelled back to pending; the unstarted batches never
+// mark anything or launch anything.
+//
+// Determinism: failme.txt is the only root-level file, so discovery emits
+// it before descending into sub/, making it batch 0 without relying on
+// directory iteration order.
+func TestNativeStageCancelsSiblingsAndSkipsUnstarted(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("failme.txt", 600)
+	h.writeSrc("sub/good1.txt", 600)
+	h.writeSrc("sub/good2.txt", 600)
+	h.writeSrc("sub/good3.txt", 600)
+	// 600-byte files under a 1024-byte threshold: one file per batch.
+	post := h.writeManifest("post", manifestContent(
+		h.newFileRecord("failme.txt"), h.newFileRecord("sub/good1.txt"),
+		h.newFileRecord("sub/good2.txt"), h.newFileRecord("sub/good3.txt")))
+	h.scriptSSHFreshDest(post)
+	// The failing batch waits for the gate so both in-flight batches are
+	// live when it fails — no sleep timing anywhere.
+	gate := filepath.Join(t.TempDir(), "gate")
+	h.writeScript("rsync", "match_stdin=failme.txt\nwait_for="+gate+"\nexit=1\n---\nsleep_ms=30000\nexit=0\n")
+	cfg := h.config()
+	cfg.Jobs = 2
+
+	start := time.Now()
+	done := make(chan error, 1)
+	runCh := make(chan *state.Run, 1)
+	go func() {
+		run, err := Sync(context.Background(), cfg)
+		runCh <- run
+		done <- err
+	}()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if got := len(toolInvocations(h.invocations(), "rsync")); got >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the two in-flight batches never started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := os.WriteFile(gate, []byte("go\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := <-done
+	run := <-runCh
+	if err == nil {
+		t.Fatal("Sync with a failing batch = nil, want error")
+	}
+	if elapsed := time.Since(start); elapsed > 20*time.Second {
+		t.Errorf("Sync took %s: in-flight sibling was not cancelled promptly", elapsed)
+	}
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 2 {
+		t.Errorf("rsync invocations = %d, want exactly 2 (unstarted batches never launched)", got)
+	}
+	if run.Status != state.StatusFailed {
+		t.Errorf("run status = %s, want failed", run.Status)
+	}
+	byPath := map[string]state.Task{}
+	for _, task := range run.Tasks {
+		byPath[task.Path] = task
+	}
+	if got := byPath["failme.txt"]; got.Status != state.StatusFailed || got.Attempts != 1 ||
+		!strings.Contains(got.Error, "rsync batch failed") {
+		t.Errorf("failing batch task = %+v", got)
+	}
+	var cancelled, untouched int
+	for _, task := range run.Tasks {
+		if task.Path == "failme.txt" {
+			continue
+		}
+		switch {
+		case task.Status == state.StatusPending && task.Attempts == 1 &&
+			strings.Contains(task.Error, "cancelled: another small-file batch failed"):
+			cancelled++
+		case task.Status == state.StatusPending && task.Attempts == 0 && task.Error == "":
+			untouched++
+		default:
+			t.Errorf("unexpected task state: %+v", task)
+		}
+	}
+	if cancelled != 1 || untouched != 2 {
+		t.Errorf("cancelled=%d untouched=%d, want 1 cancelled + 2 untouched", cancelled, untouched)
+	}
+	for _, inv := range toolInvocations(h.invocations(), "rsync") {
+		if err := mockexec.ProcessAlive(inv.PID); err == nil {
+			t.Errorf("mock rsync pid %d still alive after cancellation", inv.PID)
+		}
 	}
 }

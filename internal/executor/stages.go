@@ -133,10 +133,21 @@ func (e *Executor) smallFileStage(ctx context.Context) error {
 	var wg sync.WaitGroup
 launch:
 	for bi := range batches {
+		// Never block waiting for a slot once the stage is done.
+		if stageCtx.Err() != nil {
+			break
+		}
 		select {
 		case sem <- struct{}{}:
 		case <-stageCtx.Done():
 			break launch
+		}
+		// The select may acquire a slot at the same moment the stage is
+		// cancelled; re-check before spawning so no new goroutine — and no
+		// state transitions or subprocess — starts after cancellation.
+		if stageCtx.Err() != nil {
+			<-sem
+			break
 		}
 		wg.Add(1)
 		go func(bi int) {
@@ -174,17 +185,43 @@ launch:
 	return nil
 }
 
+// batchCancelMsg picks the task note for a cancelled batch: the
+// interruption wording when the caller cancelled, the sibling wording when
+// another batch's failure tore the stage down.
+func batchCancelMsg(ctx context.Context) string {
+	if ctx.Err() != nil {
+		return "interrupted: catsync stopped before finishing; safe to resume"
+	}
+	return "cancelled: another small-file batch failed; safe to resume"
+}
+
 // runSmallBatch executes one batch of the native small-file stage: per-task
 // source revalidation, durable running intent, one rsync invocation, then
 // per-task post-checks. ctx is the caller's context; stageCtx is cancelled
 // when the stage is torn down early.
+//
+// Cancellation is honored at every boundary: before any work, inside the
+// revalidation loop, before persisting the batch's running intent, and after
+// that save but before launching rsync (where the batch is reverted to
+// pending in one save and rsync never starts).
 func (e *Executor) runSmallBatch(ctx, stageCtx context.Context, batch partition.Batch, byPath map[string]*state.Task) (out batchOutcome) {
+	// Never begin work on a batch when the stage is already cancelled.
+	if stageCtx.Err() != nil {
+		out.cancelled = true
+		return out
+	}
 	out.started = true
 
 	// 1. Revalidate each source file immediately before this batch starts,
 	// catching changes that happened while the batch waited for a slot.
 	active := make([]*state.Task, 0, len(batch.Items))
 	for _, it := range batch.Items {
+		if stageCtx.Err() != nil {
+			// Stop mid-loop: remaining tasks are untouched and stay
+			// pending.
+			out.cancelled = true
+			return out
+		}
 		t := byPath[it.Path]
 		ok, err := e.recheckBefore(t)
 		if err != nil {
@@ -204,12 +241,28 @@ func (e *Executor) runSmallBatch(ctx, stageCtx context.Context, batch partition.
 	// 2. Persist the running intent of the whole batch in ONE atomic save
 	// before the subprocess launches. A save failure aborts the batch
 	// without leaving any task marked running.
+	if stageCtx.Err() != nil {
+		out.cancelled = true
+		return out
+	}
 	if err := e.markBatchRunning(active); err != nil {
 		out.err = err
 		return out
 	}
 
-	// 3. One rsync invocation with the batch's NUL-delimited file list,
+	// 3. The running intent is durable. If cancellation arrived before the
+	// launch, revert the whole batch to pending in one save and never start
+	// rsync.
+	if stageCtx.Err() != nil {
+		if rerr := e.revertToPending(active, batchCancelMsg(ctx)); rerr != nil {
+			out.err = rerr
+			return out
+		}
+		out.cancelled = true
+		return out
+	}
+
+	// 4. One rsync invocation with the batch's NUL-delimited file list,
 	// capturing output per batch (never into a shared buffer).
 	paths := make([]string, 0, len(active))
 	for _, t := range active {
@@ -232,11 +285,7 @@ func (e *Executor) runSmallBatch(ctx, stageCtx context.Context, batch partition.
 		if stageCtx.Err() != nil {
 			// Cancelled by the caller or by a sibling batch failure: the
 			// tasks were not transferred, so they return to pending.
-			msg := "interrupted: catsync stopped before finishing; safe to resume"
-			if ctx.Err() == nil {
-				msg = "cancelled: another small-file batch failed; safe to resume"
-			}
-			if rerr := e.revertToPending(active, msg); rerr != nil {
+			if rerr := e.revertToPending(active, batchCancelMsg(ctx)); rerr != nil {
 				out.err = rerr
 				return out
 			}

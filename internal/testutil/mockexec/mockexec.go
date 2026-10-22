@@ -117,6 +117,9 @@ const (
 	// live and "end <pid>" before it exits, letting tests compute the
 	// maximum observed concurrency from the line interleaving.
 	EnvTrackLog = "MOCKEXEC_TRACK_LOG"
+	// EnvWaitFor names a file the helper waits for before performing its
+	// configured behavior, letting tests gate one invocation on another.
+	EnvWaitFor = "MOCKEXEC_WAIT_FOR"
 	// EnvRole is set for spawned grandchildren; the value "grandchild"
 	// selects the grandchild behavior instead of normal helper behavior.
 	EnvRole = "MOCKEXEC_ROLE"
@@ -159,6 +162,7 @@ type behavior struct {
 	readyFile       string
 	signalFile      string
 	trackLog        string
+	waitFor         string
 }
 
 // RunHelper executes the configured mock behavior and returns the process
@@ -168,13 +172,21 @@ func RunHelper() int {
 		return runGrandchild()
 	}
 	tool := filepath.Base(os.Args[0])
+	// Read stdin once: the record, the invocation log, and the script
+	// section matcher all need it, and it is either a bounded file list or
+	// the null device.
+	needStdin := os.Getenv(EnvRecordDir) != "" || os.Getenv(EnvScriptDir) != ""
+	var stdin []byte
+	if needStdin {
+		stdin, _ = io.ReadAll(os.Stdin)
+	}
 	if dir := os.Getenv(EnvRecordDir); dir != "" {
-		record(dir)
+		record(dir, stdin)
 	}
 	if log := os.Getenv(EnvInvocationLog); log != "" {
-		appendInvocation(log, tool)
+		appendInvocation(log, tool, stdin)
 	}
-	bh, err := configuredBehavior(tool)
+	bh, err := configuredBehavior(tool, string(stdin))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mockexec: %v\n", err)
 		return 2
@@ -206,6 +218,21 @@ func RunHelper() int {
 		if err := os.WriteFile(bh.readyFile, []byte("ready\n"), 0600); err != nil {
 			fmt.Fprintf(os.Stderr, "mockexec: write ready file: %v\n", err)
 			return 2
+		}
+	}
+	if bh.waitFor != "" {
+		// Gate on another invocation reaching some observable state, so
+		// multi-process tests are deterministic without sleep races.
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			if _, err := os.Stat(bh.waitFor); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				fmt.Fprintf(os.Stderr, "mockexec: wait_for %s timed out\n", bh.waitFor)
+				return 2
+			}
+			time.Sleep(5 * time.Millisecond)
 		}
 	}
 	if bh.touch != "" {
@@ -348,12 +375,13 @@ func spawnChildren(bh behavior) {
 }
 
 // configuredBehavior resolves the invocation's behavior: script style when
-// EnvScriptDir is set, environment style otherwise.
-func configuredBehavior(tool string) (behavior, error) {
+// EnvScriptDir is set, environment style otherwise. stdin is the raw
+// standard input, used by script sections matching on match_stdin.
+func configuredBehavior(tool, stdin string) (behavior, error) {
 	if dir := os.Getenv(EnvScriptDir); dir != "" {
 		toolDir := filepath.Join(dir, tool)
 		nth := bumpCounter(toolDir)
-		return loadScript(filepath.Join(toolDir, "config"), tool, nth)
+		return loadScript(filepath.Join(toolDir, "config"), tool, nth, stdin)
 	}
 	return envBehavior()
 }
@@ -400,6 +428,7 @@ func envBehavior() (behavior, error) {
 	bh.zeroExitSignal = os.Getenv(EnvZeroExitSignal)
 	bh.readyFile = os.Getenv(EnvReadyFile)
 	bh.trackLog = os.Getenv(EnvTrackLog)
+	bh.waitFor = os.Getenv(EnvWaitFor)
 	bh.childPidDir = os.Getenv(EnvChildPidDir)
 	bh.childTouch = os.Getenv(EnvChildTouch)
 	bh.childIgnoreTerm = os.Getenv(EnvChildIgnoreTerm) != ""
@@ -433,6 +462,7 @@ func envBehavior() (behavior, error) {
 //
 //	match=TEXT       section applies only when the NUL-joined argument
 //	                 vector contains TEXT; first matching section wins
+//	match_stdin=TEXT section applies only when the raw stdin contains TEXT
 //	nth=N            section applies only to the Nth invocation of this
 //	                 tool (1-based); combines with match
 //	exit=N           decimal exit status (default 0)
@@ -450,6 +480,7 @@ func envBehavior() (behavior, error) {
 //	signal_file=P    where a caught signal name is recorded
 //	ready_file=P     written once handlers and grandchildren are set up
 //	track_log=P      append "start <pid>"/"end <pid>" to P (concurrency tests)
+//	wait_for=P       wait until file P exists before running the behavior
 //	spawn_children=N start N grandchild processes before sleeping
 //	child_sleep_ms=N grandchild sleep (default 30000)
 //	child_touch=P    grandchild writes P after its sleep
@@ -460,7 +491,7 @@ func envBehavior() (behavior, error) {
 // default or as the only section. Blank lines and lines starting with '#'
 // are ignored. No matching section is an error, so misconfigurations are
 // loud.
-func loadScript(path, tool string, nth int) (behavior, error) {
+func loadScript(path, tool string, nth int, stdin string) (behavior, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return behavior{}, fmt.Errorf("tool %q: read script config: %w", tool, err)
@@ -483,6 +514,10 @@ func loadScript(path, tool string, nth int) (behavior, error) {
 			switch k {
 			case "match":
 				if !strings.Contains(joined, v) {
+					ok = false
+				}
+			case "match_stdin":
+				if !strings.Contains(stdin, v) {
 					ok = false
 				}
 			case "nth":
@@ -532,6 +567,7 @@ func loadScript(path, tool string, nth int) (behavior, error) {
 	bh.readyFile = kv["ready_file"]
 	bh.signalFile = kv["signal_file"]
 	bh.trackLog = kv["track_log"]
+	bh.waitFor = kv["wait_for"]
 	bh.childPidDir = kv["child_pid_dir"]
 	bh.childTouch = kv["child_touch"]
 	bh.childIgnoreTerm = kv["child_ignore_term"] != ""
@@ -575,12 +611,9 @@ type Invocation struct {
 
 // appendInvocation records one invocation as a single JSON line. The file
 // is opened O_APPEND and written with one Write call, so concurrent
-// invocations (parallel mscp tasks) never interleave a record.
-func appendInvocation(log, tool string) {
-	stdin, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "mockexec: read stdin: %v\n", err)
-	}
+// invocations (parallel mscp tasks) never interleave a record. stdin is
+// read once by RunHelper and passed in.
+func appendInvocation(log, tool string, stdin []byte) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mockexec: getwd: %v\n", err)
@@ -641,8 +674,8 @@ func (i Invocation) StdinBytes() ([]byte, error) {
 
 // record captures the invocation into dir (environment style). Failures
 // are reported on stderr but do not stop the helper, so the configured
-// behavior still runs.
-func record(dir string) {
+// behavior still runs. stdin is read once by RunHelper and passed in.
+func record(dir string, stdin []byte) {
 	write := func(name string, data []byte) {
 		if err := os.WriteFile(filepath.Join(dir, name), data, 0600); err != nil {
 			fmt.Fprintf(os.Stderr, "mockexec: record %s: %v\n", name, err)
@@ -654,10 +687,6 @@ func record(dir string) {
 		fmt.Fprintf(os.Stderr, "mockexec: getwd: %v\n", err)
 	}
 	write(fileCwd, []byte(cwd))
-	stdin, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "mockexec: read stdin: %v\n", err)
-	}
 	write(fileStdin, stdin)
 	write(filePid, []byte(strconv.Itoa(os.Getpid())))
 }
