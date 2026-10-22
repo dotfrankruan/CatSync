@@ -59,18 +59,14 @@ func (e *Executor) smallFileStage(ctx context.Context) error {
 		return nil
 	}
 	if err := e.requireSSH(); err != nil {
-		for _, i := range idxs {
-			if ferr := e.failTask(&e.run.Tasks[i], fmt.Sprintf("ssh is not available: %v", err)); ferr != nil {
-				return ferr
-			}
+		if ferr := e.failBatch(e.tasksAt(idxs), fmt.Sprintf("ssh is not available: %v", err)); ferr != nil {
+			return ferr
 		}
 		return err
 	}
 	if !e.detectTools().Rsync {
-		for _, i := range idxs {
-			if err := e.failTask(&e.run.Tasks[i], "rsync is not available"); err != nil {
-				return err
-			}
+		if ferr := e.failBatch(e.tasksAt(idxs), "rsync is not available"); ferr != nil {
+			return ferr
 		}
 		return errors.New("rsync unavailable")
 	}
@@ -90,10 +86,8 @@ func (e *Executor) smallFileStage(ctx context.Context) error {
 		MaxBytes: e.run.Config.LargeThreshold,
 	})
 	if err != nil {
-		for _, i := range idxs {
-			if ferr := e.failTask(&e.run.Tasks[i], fmt.Sprintf("partition small files: %v", err)); ferr != nil {
-				return ferr
-			}
+		if ferr := e.failBatch(e.tasksAt(idxs), fmt.Sprintf("partition small files: %v", err)); ferr != nil {
+			return ferr
 		}
 		return fmt.Errorf("executor: partition small files: %w", err)
 	}
@@ -113,10 +107,8 @@ func (e *Executor) smallFileStage(ctx context.Context) error {
 		}
 		sort.Strings(dirs)
 		if err := e.mkdirRemoteParents(ctx, e.destTarget(), e.run.Config.IPv6, dirs); err != nil {
-			for _, i := range idxs {
-				if ferr := e.failTask(&e.run.Tasks[i], fmt.Sprintf("create remote parent directories: %v", err)); ferr != nil {
-					return ferr
-				}
+			if ferr := e.failBatch(e.tasksAt(idxs), fmt.Sprintf("create remote parent directories: %v", err)); ferr != nil {
+				return ferr
 			}
 			return err
 		}
@@ -209,13 +201,12 @@ func (e *Executor) runSmallBatch(ctx, stageCtx context.Context, batch partition.
 		return out
 	}
 
-	// 2. Persist the running intent of every task in the batch before the
-	// subprocess launches. A save failure aborts the batch.
-	for _, t := range active {
-		if err := e.markRunning(t); err != nil {
-			out.err = err
-			return out
-		}
+	// 2. Persist the running intent of the whole batch in ONE atomic save
+	// before the subprocess launches. A save failure aborts the batch
+	// without leaving any task marked running.
+	if err := e.markBatchRunning(active); err != nil {
+		out.err = err
+		return out
 	}
 
 	// 3. One rsync invocation with the batch's NUL-delimited file list,
@@ -252,11 +243,9 @@ func (e *Executor) runSmallBatch(ctx, stageCtx context.Context, batch partition.
 			out.cancelled = true
 			return out
 		}
-		for _, t := range active {
-			if ferr := e.failTask(t, fmt.Sprintf("rsync batch failed: %v", err)); ferr != nil {
-				out.err = ferr
-				return out
-			}
+		if ferr := e.failBatch(active, fmt.Sprintf("rsync batch failed: %v", err)); ferr != nil {
+			out.err = ferr
+			return out
 		}
 		out.err = fmt.Errorf("rsync batch failed: %w", err)
 		return out
@@ -532,10 +521,10 @@ func (e *Executor) rsyncStage(ctx context.Context) error {
 	for _, t := range active {
 		paths = append(paths, t.Path)
 	}
-	for _, t := range active {
-		if err := e.markRunning(t); err != nil {
-			return err
-		}
+	// One atomic running-intent save for the whole set; a failure means no
+	// rsync launch and no partially-marked set.
+	if err := e.markBatchRunning(active); err != nil {
+		return err
 	}
 	e.logf("stage rsync: %d file(s)", len(active))
 	cfg := rsync.Config{

@@ -268,16 +268,79 @@ func (e *Executor) lockDestination(dest state.Destination) (*state.Lock, error) 
 	return lock, nil
 }
 
+// saveRunLocked persists the run; the caller must hold runMu.
+func (e *Executor) saveRunLocked() error {
+	if err := e.saveFn(e.run); err != nil {
+		return fmt.Errorf("executor: save run %s: %w", e.run.ID, err)
+	}
+	return nil
+}
+
 // saveRun persists the run under the run mutex. Callers must treat an
 // error as fatal for the current operation: a transfer whose intent or
 // outcome could not be recorded must not start or be reported as finished.
 func (e *Executor) saveRun() error {
 	e.runMu.Lock()
 	defer e.runMu.Unlock()
-	if err := e.saveFn(e.run); err != nil {
-		return fmt.Errorf("executor: save run %s: %w", e.run.ID, err)
+	return e.saveRunLocked()
+}
+
+// transitionTasks applies mutate to every task and persists the whole run
+// exactly once. runMu is held across mutation and save, so a concurrent
+// batch goroutine can never interleave between them. If the save fails,
+// every task's previous Status/Attempts/Error is restored in memory and the
+// error is returned: a partially committed transition is impossible, on
+// disk or in memory.
+func (e *Executor) transitionTasks(tasks []*state.Task, mutate func(*state.Task)) error {
+	e.runMu.Lock()
+	defer e.runMu.Unlock()
+	type snapshot struct {
+		status   state.Status
+		attempts int
+		err      string
+	}
+	snaps := make([]snapshot, len(tasks))
+	for i, t := range tasks {
+		snaps[i] = snapshot{t.Status, t.Attempts, t.Error}
+		mutate(t)
+	}
+	if err := e.saveRunLocked(); err != nil {
+		for i, t := range tasks {
+			t.Status, t.Attempts, t.Error = snaps[i].status, snaps[i].attempts, snaps[i].err
+		}
+		return err
 	}
 	return nil
+}
+
+// tasksAt resolves task indexes to task pointers.
+func (e *Executor) tasksAt(idxs []int) []*state.Task {
+	e.runMu.Lock()
+	defer e.runMu.Unlock()
+	out := make([]*state.Task, 0, len(idxs))
+	for _, i := range idxs {
+		out = append(out, &e.run.Tasks[i])
+	}
+	return out
+}
+
+// markBatchRunning marks every task running with one incremented attempt
+// count and persists the whole batch in a single save. The subprocess for
+// the batch must not start when this returns an error.
+func (e *Executor) markBatchRunning(tasks []*state.Task) error {
+	return e.transitionTasks(tasks, func(t *state.Task) {
+		t.Status = state.StatusRunning
+		t.Attempts++
+		t.Error = ""
+	})
+}
+
+// failBatch marks every task failed with the same message in one save.
+func (e *Executor) failBatch(tasks []*state.Task, msg string) error {
+	return e.transitionTasks(tasks, func(t *state.Task) {
+		t.Status = state.StatusFailed
+		t.Error = msg
+	})
 }
 
 // collectManifest runs one batched SSH manifest collection. The boolean
@@ -817,22 +880,9 @@ func (e *Executor) recheckAfter(t *state.Task) (bool, error) {
 }
 
 // failTask marks a task failed and persists the run, returning any
-// persistence error.
+// persistence error. It is the single-task form of failBatch.
 func (e *Executor) failTask(t *state.Task, msg string) error {
-	e.runMu.Lock()
-	prevStatus, prevErr := t.Status, t.Error
-	t.Status = state.StatusFailed
-	t.Error = msg
-	e.runMu.Unlock()
-	if err := e.saveRun(); err != nil {
-		// Keep memory consistent with the disk document so later logic and
-		// finalization do not build on an unrecorded transition.
-		e.runMu.Lock()
-		t.Status, t.Error = prevStatus, prevErr
-		e.runMu.Unlock()
-		return err
-	}
-	return nil
+	return e.failBatch([]*state.Task{t}, msg)
 }
 
 // pendingTasks returns the indexes of tasks that are pending or failed
@@ -855,21 +905,9 @@ func (e *Executor) pendingTasks(b state.Backend) []int {
 // transfer whose running state could not be recorded would be invisible and
 // unrecoverable after a crash. On failure the in-memory transition is
 // rolled back and the error propagated to the stage, which must not start
-// the subprocess.
+// the subprocess. It is the single-task form of markBatchRunning.
 func (e *Executor) markRunning(t *state.Task) error {
-	e.runMu.Lock()
-	prevStatus, prevAttempts, prevErr := t.Status, t.Attempts, t.Error
-	t.Status = state.StatusRunning
-	t.Attempts++
-	t.Error = ""
-	e.runMu.Unlock()
-	if err := e.saveRun(); err != nil {
-		e.runMu.Lock()
-		t.Status, t.Attempts, t.Error = prevStatus, prevAttempts, prevErr
-		e.runMu.Unlock()
-		return err
-	}
-	return nil
+	return e.markBatchRunning([]*state.Task{t})
 }
 
 // retireCheckpoint clears a completed task's checkpoint reference and then

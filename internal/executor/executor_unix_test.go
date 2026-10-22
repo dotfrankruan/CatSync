@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -2089,5 +2090,134 @@ func TestNativeStageBatchedParentMkdir(t *testing.T) {
 	}
 	if firstRsync < 0 || mkdirs[0] > firstRsync {
 		t.Errorf("mkdir at invocation %d, first rsync at %d: mkdir must come first", mkdirs[0], firstRsync)
+	}
+}
+
+// TestNativeBatchSaveFailureIsAtomic: three files in one batch; the
+// batch-level running-intent save is injected to fail. No task may be left
+// running (the old per-task loop left the first tasks committed as running
+// while the later save failed), rsync must not start, and the reloaded
+// state must contain no partial commit.
+func TestNativeBatchSaveFailureIsAtomic(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("a.txt", 10)
+	h.writeSrc("b.txt", 10)
+	h.writeSrc("c.txt", 10)
+	post := h.writeManifest("post", manifestContent(
+		h.newFileRecord("a.txt"), h.newFileRecord("b.txt"), h.newFileRecord("c.txt")))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "exit=0")
+	cfg := h.config()
+
+	// Save #1 is the initial run document; save #2 is the batch's running
+	// intent — make it fail. TestNativeBatchRunningIntentSavedOnce proves
+	// this is the ONLY save that can carry the running intent, so the old
+	// partial-commit window (first task saved running, second task's save
+	// fails, nothing rolled back) no longer exists.
+	run, err := syncWith(context.Background(), cfg, func(e *Executor) { failSavesFrom(e, 2) })
+	if err == nil {
+		t.Fatal("Sync with failing batch save = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "injected persistence failure") {
+		t.Errorf("error = %v, want the injected failure", err)
+	}
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 0 {
+		t.Errorf("rsync invocations = %d, want 0 (the batch never started)", got)
+	}
+	if run == nil {
+		t.Fatal("Sync returned no run")
+	}
+	for _, task := range run.Tasks {
+		if task.Status == state.StatusRunning {
+			t.Errorf("task %s stuck at running after a failed batch save", task.Path)
+		}
+		if task.Status != state.StatusPending {
+			t.Errorf("task %s = %s, want pending (resumable)", task.Path, task.Status)
+		}
+		if task.Attempts != 0 {
+			t.Errorf("task %s attempts = %d, want 0 (never launched)", task.Path, task.Attempts)
+		}
+	}
+
+	// The durable document has no half-commit either: recovery finds the
+	// pre-transfer run and every task pending.
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, recovered, err := store.LoadAndRecover(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recovered {
+		t.Error("expected recovery to fix the run status recorded before the failed batch save")
+	}
+	for _, task := range loaded.Tasks {
+		if task.Status != state.StatusPending {
+			t.Errorf("durable task %s = %s, want pending", task.Path, task.Status)
+		}
+	}
+	if !loaded.Resumable() {
+		t.Error("run after failed batch save is not resumable")
+	}
+}
+
+// TestNativeBatchRunningIntentSavedOnce: the whole batch's running intent
+// costs exactly ONE run save, independent of batch size; the initial save,
+// per-task completion saves, and any verification saves are distinct.
+func TestNativeBatchRunningIntentSavedOnce(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("a.txt", 10)
+	h.writeSrc("b.txt", 10)
+	h.writeSrc("c.txt", 10)
+	post := h.writeManifest("post", manifestContent(
+		h.newFileRecord("a.txt"), h.newFileRecord("b.txt"), h.newFileRecord("c.txt")))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "exit=0")
+	cfg := h.config()
+	cfg.Verify = state.VerifyNone
+
+	var mu sync.Mutex
+	var snapshots [][]state.Status
+	run, err := syncWith(context.Background(), cfg, func(e *Executor) {
+		orig := e.saveFn
+		e.saveFn = func(r *state.Run) error {
+			snap := make([]state.Status, len(r.Tasks))
+			for i := range r.Tasks {
+				snap[i] = r.Tasks[i].Status
+			}
+			mu.Lock()
+			snapshots = append(snapshots, snap)
+			mu.Unlock()
+			return orig(r)
+		}
+	})
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if run.Status != state.StatusCompleted {
+		t.Fatalf("run status = %s (%q)", run.Status, run.Error)
+	}
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 1 {
+		t.Fatalf("rsync invocations = %d, want 1 (one batch)", got)
+	}
+
+	// Count saves that newly introduce a running task relative to the
+	// previous save — exactly one, however many files the batch holds.
+	runningIntents := 0
+	for i, snap := range snapshots {
+		if i == 0 {
+			continue
+		}
+		prev := snapshots[i-1]
+		for j := range snap {
+			if snap[j] == state.StatusRunning && prev[j] != state.StatusRunning {
+				runningIntents++
+				break
+			}
+		}
+	}
+	if runningIntents != 1 {
+		t.Errorf("running-intent saves = %d, want exactly 1 (snapshots: %v)", runningIntents, snapshots)
 	}
 }
