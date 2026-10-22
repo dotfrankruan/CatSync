@@ -437,3 +437,55 @@ func TestCheckpointTrailingJSONStrictness(t *testing.T) {
 		})
 	}
 }
+
+// TestCheckpointDirCreationRace: another process won the directory-creation
+// race between our Stat and Mkdir; the loser must not chmod the directory,
+// but must verify it is one.
+func TestCheckpointDirCreationRace(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "parent")
+	// Fake Mkdir: the "other process" creates the directory first with
+	// 0755, then reports ErrExist like a real losing Mkdir would.
+	fakeMkdir := func(path string, perm os.FileMode) error {
+		if err := os.Mkdir(path, 0o755); err != nil {
+			return err
+		}
+		return os.ErrExist
+	}
+	if err := ensurePrivateDir(dir, fakeMkdir); err != nil {
+		t.Fatalf("ensurePrivateDir: %v", err)
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o755 {
+		t.Errorf("raced directory mode = %o, want 755 (untouched by the loser)", got)
+	}
+
+	// ErrExist for something that is not a directory is an error.
+	filePath := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(filePath, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	badMkdir := func(path string, perm os.FileMode) error { return os.ErrExist }
+	err = ensurePrivateDir(filePath, badMkdir)
+	if err == nil {
+		t.Fatal("ensurePrivateDir on an existing file = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "not a directory") {
+		t.Errorf("error = %v, want not-a-directory", err)
+	}
+
+	// A successful creation through the seam still enforces 0700.
+	created := filepath.Join(t.TempDir(), "made")
+	if err := ensurePrivateDir(created, os.Mkdir); err != nil {
+		t.Fatal(err)
+	}
+	fi, err = os.Stat(created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o700 {
+		t.Errorf("created directory mode = %o, want 700", got)
+	}
+}

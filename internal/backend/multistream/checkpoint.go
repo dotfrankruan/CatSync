@@ -175,7 +175,7 @@ func (c *Checkpoint) Save(path string) error {
 	data = append(data, '\n')
 
 	dir := filepath.Dir(path)
-	if err := ensurePrivateDir(dir); err != nil {
+	if err := ensurePrivateDir(dir, os.Mkdir); err != nil {
 		return fmt.Errorf("multistream: create checkpoint directory: %w", err)
 	}
 	// CreateTemp guarantees mode 0600 and a unique hidden name in the same
@@ -217,8 +217,11 @@ func (c *Checkpoint) Save(path string) error {
 // ensurePrivateDir creates the missing parents of dir with mode 0700 and
 // leaves every directory that already exists untouched — in particular it
 // never changes the mode of an existing directory, including the working
-// directory when the checkpoint path is a bare file name.
-func ensurePrivateDir(dir string) error {
+// directory when the checkpoint path is a bare file name. A directory is
+// chmod'ed only when this call created it; when Mkdir reports ErrExist
+// (another process won the creation race), the path is re-stat'ed, must be
+// a directory, and is left alone.
+func ensurePrivateDir(dir string, mkdir func(string, os.FileMode) error) error {
 	var missing []string
 	d := dir
 	for {
@@ -240,13 +243,25 @@ func ensurePrivateDir(dir string) error {
 		d = parent
 	}
 	for i := len(missing) - 1; i >= 0; i-- {
-		if err := os.Mkdir(missing[i], 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		err := mkdir(missing[i], 0o700)
+		switch {
+		case err == nil:
+			// We created it; enforce 0700 exactly (umask may strip bits).
+			if err := os.Chmod(missing[i], 0o700); err != nil {
+				return fmt.Errorf("multistream: checkpoint directory permissions: %w", err)
+			}
+		case errors.Is(err, os.ErrExist):
+			// Another process won the race: verify it is a directory and
+			// leave its permissions untouched.
+			fi, statErr := os.Stat(missing[i])
+			if statErr != nil {
+				return fmt.Errorf("multistream: stat raced checkpoint directory %q: %w", missing[i], statErr)
+			}
+			if !fi.IsDir() {
+				return fmt.Errorf("multistream: %q exists and is not a directory", missing[i])
+			}
+		default:
 			return fmt.Errorf("multistream: create checkpoint directory %q: %w", missing[i], err)
-		}
-		// Mkdir applies the umask; enforce 0700 exactly for the
-		// directories this call created.
-		if err := os.Chmod(missing[i], 0o700); err != nil {
-			return fmt.Errorf("multistream: checkpoint directory permissions: %w", err)
 		}
 	}
 	return nil
