@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -158,9 +159,10 @@ func (c *Checkpoint) MarkComplete(index int) error {
 
 // Save writes the checkpoint atomically and durably at path: a temporary
 // file in the same directory (mode 0600), fsynced, renamed into place, and
-// the directory fsynced where supported. The parent directory is created
-// with mode 0700 when missing. A failed save leaves any previously valid
-// checkpoint at path intact.
+// the directory fsynced where supported. Parent directories missing from
+// the path are created with mode 0700; the permissions of directories that
+// already exist are never modified. A failed save leaves any previously
+// valid checkpoint at path intact.
 func (c *Checkpoint) Save(path string) error {
 	sort.Ints(c.Completed)
 	if err := c.validate(); err != nil {
@@ -173,11 +175,8 @@ func (c *Checkpoint) Save(path string) error {
 	data = append(data, '\n')
 
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := ensurePrivateDir(dir); err != nil {
 		return fmt.Errorf("multistream: create checkpoint directory: %w", err)
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return fmt.Errorf("multistream: checkpoint directory permissions: %w", err)
 	}
 	// CreateTemp guarantees mode 0600 and a unique hidden name in the same
 	// directory, so the rename stays on one filesystem.
@@ -215,6 +214,44 @@ func (c *Checkpoint) Save(path string) error {
 	return nil
 }
 
+// ensurePrivateDir creates the missing parents of dir with mode 0700 and
+// leaves every directory that already exists untouched — in particular it
+// never changes the mode of an existing directory, including the working
+// directory when the checkpoint path is a bare file name.
+func ensurePrivateDir(dir string) error {
+	var missing []string
+	d := dir
+	for {
+		fi, err := os.Stat(d)
+		if err == nil {
+			if !fi.IsDir() {
+				return fmt.Errorf("multistream: %q is not a directory", d)
+			}
+			break
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("multistream: stat checkpoint directory: %w", err)
+		}
+		missing = append(missing, d)
+		parent := filepath.Dir(d)
+		if parent == d {
+			break
+		}
+		d = parent
+	}
+	for i := len(missing) - 1; i >= 0; i-- {
+		if err := os.Mkdir(missing[i], 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("multistream: create checkpoint directory %q: %w", missing[i], err)
+		}
+		// Mkdir applies the umask; enforce 0700 exactly for the
+		// directories this call created.
+		if err := os.Chmod(missing[i], 0o700); err != nil {
+			return fmt.Errorf("multistream: checkpoint directory permissions: %w", err)
+		}
+	}
+	return nil
+}
+
 // LoadCheckpoint reads and strictly validates a checkpoint. Unknown fields,
 // trailing content, malformed JSON, and invalid values are
 // ErrCheckpointCorrupt; a missing file is ErrCheckpointNotFound; a version
@@ -233,8 +270,11 @@ func LoadCheckpoint(path string) (*Checkpoint, error) {
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("%w: %s: %v", ErrCheckpointCorrupt, path, err)
 	}
-	// Reject trailing content after the JSON document.
-	if dec.More() {
+	// Reject anything after the JSON document: a second decode must hit
+	// io.EOF. Trailing whitespace is fine (the decoder skips it); any
+	// trailing value or token — {} or null included — is corruption.
+	var trailing json.RawMessage
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("%w: %s: trailing content after JSON document", ErrCheckpointCorrupt, path)
 	}
 	// Report version mismatch distinctly from corruption.

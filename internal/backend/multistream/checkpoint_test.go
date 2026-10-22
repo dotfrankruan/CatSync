@@ -316,3 +316,124 @@ func TestCheckpointCompletedSetFeedsCopy(t *testing.T) {
 		t.Error("content mismatch after checkpoint-driven resume")
 	}
 }
+
+// TestCheckpointKeepsExistingDirPermissions: saving into a pre-existing
+// directory must not change its mode, and newly created parents get 0700
+// while their pre-existing ancestors keep their modes.
+func TestCheckpointKeepsExistingDirPermissions(t *testing.T) {
+	base := t.TempDir()
+	parent := filepath.Join(base, "parent")
+	if err := os.Mkdir(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := validCheckpoint(t)
+	if err := c.Save(filepath.Join(parent, "ckpt.json")); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o755 {
+		t.Errorf("existing parent mode = %o, want 755 (unchanged)", got)
+	}
+
+	// Nested: the created leaf directory is 0700, the existing parent
+	// stays 0755.
+	leaf := filepath.Join(parent, "new", "leaf")
+	if err := c.Save(filepath.Join(leaf, "ckpt.json")); err != nil {
+		t.Fatal(err)
+	}
+	fi, err = os.Stat(leaf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o700 {
+		t.Errorf("created parent mode = %o, want 700", got)
+	}
+	fi, err = os.Stat(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o755 {
+		t.Errorf("existing ancestor mode = %o, want 755 (unchanged)", got)
+	}
+}
+
+// TestCheckpointBareFilenameKeepsCwdPermissions: a bare file name resolves
+// against the working directory; saving must never chmod it.
+func TestCheckpointBareFilenameKeepsCwdPermissions(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(prev); err != nil {
+			t.Fatalf("restore working directory: %v", err)
+		}
+	}()
+	c := validCheckpoint(t)
+	if err := c.Save("ckpt.json"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := after.Mode().Perm(); got != before.Mode().Perm() {
+		t.Errorf("working directory mode changed: %o -> %o", before.Mode().Perm(), got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "ckpt.json")); err != nil {
+		t.Fatalf("checkpoint not written: %v", err)
+	}
+}
+
+// TestCheckpointTrailingJSONStrictness: any JSON token after the document
+// is corruption; plain trailing whitespace is fine.
+func TestCheckpointTrailingJSONStrictness(t *testing.T) {
+	c := validCheckpoint(t)
+	base := filepath.Join(t.TempDir(), "ckpt.json")
+	if err := c.Save(base); err != nil {
+		t.Fatal(err)
+	}
+	valid, err := os.ReadFile(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, trailer := range []string{"{}", "null", "true", "123", "]", "}"} {
+		t.Run("trailer "+trailer, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "ckpt.json")
+			if err := os.WriteFile(path, append(append([]byte{}, valid...), []byte(trailer)...), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadCheckpoint(path); !errors.Is(err, ErrCheckpointCorrupt) {
+				t.Errorf("trailer %q: Load = %v, want ErrCheckpointCorrupt", trailer, err)
+			}
+		})
+	}
+	for _, trailer := range []string{"   ", "\n\n", " \t\n "} {
+		t.Run("whitespace only", func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "ckpt.json")
+			if err := os.WriteFile(path, append(append([]byte{}, valid...), []byte(trailer)...), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadCheckpoint(path); err != nil {
+				t.Errorf("trailing whitespace %q: Load = %v, want success", trailer, err)
+			}
+		})
+	}
+}
