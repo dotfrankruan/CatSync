@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -287,5 +288,97 @@ func TestValidateRejectsUnexpressibleSSHOverride(t *testing.T) {
 	cfg.Programs.MSCP = "/tmp/a\x00b"
 	if err := cfg.validateFull(); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("NUL program override = %v, want ErrInvalidConfig", err)
+	}
+}
+
+// TestRevertToPendingMutatesOnlyRunningTasks: a successful revert flips
+// running tasks to pending with the cancellation note in exactly one save,
+// keeps their attempt counts, and leaves tasks in any other status
+// untouched.
+func TestRevertToPendingMutatesOnlyRunningTasks(t *testing.T) {
+	cfg := validTestConfig(t)
+	e, err := newExecutor(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.run = &state.Run{ID: "run-revert", Source: state.Source{Path: cfg.SourceDir}}
+	tasks := []*state.Task{
+		{Path: "a.txt", Status: state.StatusRunning, Attempts: 1},
+		{Path: "b.txt", Status: state.StatusCompleted, Attempts: 1},
+		{Path: "c.txt", Status: state.StatusFailed, Attempts: 2, Error: "boom"},
+	}
+	saves := 0
+	e.saveFn = func(*state.Run) error { saves++; return nil }
+
+	if err := e.revertToPending(tasks, "cancelled: safe to resume"); err != nil {
+		t.Fatalf("revertToPending: %v", err)
+	}
+	if saves != 1 {
+		t.Errorf("save calls = %d, want exactly 1 (single batch save)", saves)
+	}
+	if got := tasks[0]; got.Status != state.StatusPending || got.Error != "cancelled: safe to resume" || got.Attempts != 1 {
+		t.Errorf("running task after revert = %+v, want pending with the note and 1 attempt", got)
+	}
+	if got := tasks[1]; got.Status != state.StatusCompleted || got.Error != "" || got.Attempts != 1 {
+		t.Errorf("completed task after revert = %+v, want untouched", got)
+	}
+	if got := tasks[2]; got.Status != state.StatusFailed || got.Error != "boom" || got.Attempts != 2 {
+		t.Errorf("failed task after revert = %+v, want untouched", got)
+	}
+}
+
+// TestRevertToPendingSaveFailureRollsBack is the atomic-cancellation
+// regression: the revert is one batch transition, so when its single
+// persistence call fails, revertToPending returns the error and every
+// task's in-memory Status/Attempts/Error is restored to its pre-revert
+// running values. Memory must never claim pending while the durable record
+// may still say running.
+func TestRevertToPendingSaveFailureRollsBack(t *testing.T) {
+	cfg := validTestConfig(t)
+	e, err := newExecutor(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.run = &state.Run{ID: "run-revert", Source: state.Source{Path: cfg.SourceDir}}
+	tasks := []*state.Task{
+		{Path: "a.txt", Status: state.StatusRunning, Attempts: 1},
+		{Path: "b.txt", Status: state.StatusRunning, Attempts: 3, Error: "previous attempt note"},
+		{Path: "c.txt", Status: state.StatusPending}, // not running: untouched
+	}
+	injected := errors.New("injected persistence failure")
+	saves := 0
+	var observed []state.Status
+	e.saveFn = func(*state.Run) error {
+		saves++
+		// The single batch save must observe the fully reverted batch:
+		// mutation and persistence happen in one critical section.
+		observed = []state.Status{tasks[0].Status, tasks[1].Status, tasks[2].Status}
+		return injected
+	}
+
+	err = e.revertToPending(tasks, "cancelled: safe to resume")
+	if !errors.Is(err, injected) {
+		t.Fatalf("revertToPending = %v, want the persistence error", err)
+	}
+	if saves != 1 {
+		t.Errorf("save calls = %d, want exactly 1 (single batch save)", saves)
+	}
+	wantObserved := []state.Status{state.StatusPending, state.StatusPending, state.StatusPending}
+	if !reflect.DeepEqual(observed, wantObserved) {
+		t.Errorf("save observed statuses %v, want %v", observed, wantObserved)
+	}
+
+	// The failed save rolls the whole batch back in memory.
+	if got := tasks[0].Status; got != state.StatusRunning {
+		t.Errorf("status after failed save = %s, want rollback to running", got)
+	}
+	if got := tasks[0]; got.Attempts != 1 || got.Error != "" {
+		t.Errorf("task a.txt after failed save = attempts %d error %q, want rollback to 1/\"\"", got.Attempts, got.Error)
+	}
+	if got := tasks[1]; got.Status != state.StatusRunning || got.Attempts != 3 || got.Error != "previous attempt note" {
+		t.Errorf("task b.txt after failed save = %+v, want rollback to running/3/\"previous attempt note\"", got)
+	}
+	if got := tasks[2]; got.Status != state.StatusPending || got.Attempts != 0 || got.Error != "" {
+		t.Errorf("untouched task c.txt after failed save = %+v, want pending/0/\"\"", got)
 	}
 }

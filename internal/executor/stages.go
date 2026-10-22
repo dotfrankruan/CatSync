@@ -324,17 +324,18 @@ func (e *Executor) runSmallBatch(ctx, stageCtx context.Context, batch partition.
 }
 
 // revertToPending returns running tasks to pending with a cancellation
-// note, persisting the transition once for the whole batch.
+// note, persisting the transition once for the whole batch. Like every
+// batch transition it is atomic: runMu is held across the mutation and the
+// single save, and a save failure restores every task's previous
+// Status/Attempts/Error in memory — memory never claims pending while the
+// durable record may still say running.
 func (e *Executor) revertToPending(tasks []*state.Task, msg string) error {
-	e.runMu.Lock()
-	for _, t := range tasks {
+	return e.transitionTasks(tasks, func(t *state.Task) {
 		if t.Status == state.StatusRunning {
 			t.Status = state.StatusPending
 			t.Error = msg
 		}
-	}
-	e.runMu.Unlock()
-	return e.saveRun()
+	})
 }
 
 func quoteAll(paths []string, max int) []string {

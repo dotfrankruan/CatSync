@@ -2349,3 +2349,123 @@ func TestNativeStageCancelsSiblingsAndSkipsUnstarted(t *testing.T) {
 		}
 	}
 }
+
+// TestNativeStageCancellationRevertSaveFailure: cancellation arrives between
+// the batch's running intent and the rsync launch, and the revert save
+// itself fails. The revert error aborts the batch without ever launching
+// rsync, and because the revert is atomic the in-memory tasks roll back to
+// running (interruption recovery then returns them to pending), leaving the
+// durable state recoverable and resumable.
+//
+// Determinism: the save wrapper cancels the context inside the batch's
+// running-intent save (#2) and fails exactly the next save (#3), which is
+// the revert; the interruption record (#4) succeeds.
+func TestNativeStageCancellationRevertSaveFailure(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("a.txt", 10)
+	h.writeSrc("b.txt", 10)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("a.txt"), h.newFileRecord("b.txt")))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "exit=0")
+	cfg := h.config()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var mu sync.Mutex
+	saves := 0
+	var once sync.Once
+	run, err := syncWith(ctx, cfg, func(e *Executor) {
+		orig := e.saveFn
+		e.saveFn = func(r *state.Run) error {
+			running := false
+			for i := range r.Tasks {
+				if r.Tasks[i].Status == state.StatusRunning {
+					running = true
+				}
+			}
+			mu.Lock()
+			saves++
+			n := saves
+			mu.Unlock()
+			if running {
+				// The batch's running intent just became durable: cancel
+				// now, between the save and the rsync launch.
+				once.Do(cancel)
+				return orig(r)
+			}
+			if n == 3 {
+				// Save #3 is the cancelled batch's revert to pending:
+				// inject the persistence failure exactly there.
+				return errors.New("injected persistence failure")
+			}
+			return orig(r)
+		}
+	})
+	if run == nil {
+		t.Fatal("Sync returned no run")
+	}
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Sync = %v, want an error wrapping context.Canceled", err)
+	}
+	// The revert aborted the batch before any subprocess.
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 0 {
+		t.Errorf("rsync invocations = %d, want 0 (cancelled before launch)", got)
+	}
+	mu.Lock()
+	n := saves
+	mu.Unlock()
+	// Exactly: initial save, batch running intent, failed batch revert,
+	// interruption record.
+	if n != 4 {
+		t.Errorf("saves = %d, want exactly 4", n)
+	}
+	// After the rollback and the interruption recovery, no task is stuck at
+	// running and every task is resumable pending with its one recorded
+	// (rolled-back, then recovered) attempt.
+	for _, task := range run.Tasks {
+		if task.Status == state.StatusRunning {
+			t.Errorf("task %s stuck at running after the failed revert", task.Path)
+		}
+		if task.Status != state.StatusPending {
+			t.Errorf("task %s = %s, want pending", task.Path, task.Status)
+		}
+		if task.Attempts != 1 {
+			t.Errorf("task %s attempts = %d, want 1 (running intent was recorded once)", task.Path, task.Attempts)
+		}
+	}
+
+	// The durable state agrees and stays recoverable.
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, _, err := store.LoadAndRecover(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, task := range loaded.Tasks {
+		if task.Status != state.StatusPending {
+			t.Errorf("durable task %s = %s, want pending", task.Path, task.Status)
+		}
+	}
+	if !loaded.Resumable() {
+		t.Error("run after failed cancellation revert is not resumable")
+	}
+
+	// Resume finishes the work: exactly one rsync launch overall.
+	run2, err := Resume(context.Background(), Config{
+		StateDir: h.stateDir,
+		Programs: cfg.Programs,
+		Env:      cfg.Env,
+	}, run.ID)
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if run2.Status != state.StatusCompleted {
+		t.Fatalf("resumed run = %s (%q), want completed", run2.Status, run2.Error)
+	}
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 1 {
+		t.Errorf("rsync invocations = %d, want exactly 1 (only the resumed batch)", got)
+	}
+}
