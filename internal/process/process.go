@@ -198,10 +198,9 @@ func (e *ExitError) Unwrap() error { return e.Err }
 //   - an error wrapping ErrDescendantsAlive: cleanup could not guarantee
 //     the process tree is gone.
 //   - any other error: the process could not be started at all.
-func Run(ctx context.Context, spec Spec) error {
-	if ctx == nil {
-		return errors.New("process: nil context")
-	}
+//
+// validateSpec rejects unusable specs before any process starts.
+func validateSpec(spec Spec) error {
 	if spec.Name == "" {
 		return errors.New("process: empty program name")
 	}
@@ -213,11 +212,12 @@ func Run(ctx context.Context, spec Spec) error {
 			return fmt.Errorf("process: argument %q contains a NUL byte", a)
 		}
 	}
-	if err := ctx.Err(); err != nil {
-		// A pre-cancelled context must not start a subprocess at all:
-		// running then killing it would be a race, not a cancellation.
-		return fmt.Errorf("process: %s: %w", spec.Name, err)
-	}
+	return nil
+}
+
+// buildCmd constructs the exec.Cmd for spec: argument array, working
+// directory, environment additions, and the given stdio.
+func buildCmd(spec Spec) *exec.Cmd {
 	cmd := exec.Command(spec.Name, spec.Args...)
 	cmd.Dir = spec.Dir
 	if spec.Env != nil {
@@ -228,7 +228,45 @@ func Run(ctx context.Context, spec Spec) error {
 	cmd.Stdin = spec.Stdin
 	cmd.Stdout = spec.Stdout
 	cmd.Stderr = spec.Stderr
-	return run(ctx, cmd, spec)
+	return cmd
+}
+
+func Run(ctx context.Context, spec Spec) error {
+	if ctx == nil {
+		return errors.New("process: nil context")
+	}
+	if err := validateSpec(spec); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		// A pre-cancelled context must not start a subprocess at all:
+		// running then killing it would be a race, not a cancellation.
+		return fmt.Errorf("process: %s: %w", spec.Name, err)
+	}
+	h, err := startInteractive(ctx, buildCmd(spec), spec)
+	if err != nil {
+		return err
+	}
+	return h.Wait()
+}
+
+// StartInteractive starts spec exactly like Run, but returns a Handle for
+// interactive sessions: the caller drives the subprocess's stdin/stdout
+// while it runs (for example an SFTP session over ssh). The caller must
+// call Wait once the session is over; Wait reaps the process and cleans up
+// the process group exactly like Run. A pre-cancelled context fails before
+// the process starts.
+func StartInteractive(ctx context.Context, spec Spec) (*Handle, error) {
+	if ctx == nil {
+		return nil, errors.New("process: nil context")
+	}
+	if err := validateSpec(spec); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("process: %s: %w", spec.Name, err)
+	}
+	return startInteractive(ctx, buildCmd(spec), spec)
 }
 
 // classifyRunResult converts the outcomes of one execution into the

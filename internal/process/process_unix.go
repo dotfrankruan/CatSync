@@ -12,9 +12,29 @@ import (
 	"time"
 )
 
-// run starts cmd as the leader of a new process group, waits for it, and
-// guarantees the group is gone before returning.
-func run(ctx context.Context, cmd *exec.Cmd, spec Spec) error {
+// Handle is a running interactive subprocess in its own process group.
+// The caller drives its stdio while it runs and must call Wait exactly
+// once, after the session is over. Wait reaps the direct child, verifies
+// the process group is empty, and reports the result with the same
+// classification as Run.
+type Handle struct {
+	name           string
+	ctx            context.Context
+	cmd            *exec.Cmd
+	pgid           int
+	grace          time.Duration
+	exited         chan struct{} // closed once the direct child is reaped
+	cancelObserved chan struct{} // closed when the watcher saw cancellation
+	watcherDone    chan struct{} // closed when the watcher is finished
+	done           chan struct{} // closed when cleanup is complete
+	waitErr        error
+	reapErr        error
+}
+
+// startInteractive starts cmd in its own process group and returns a
+// Handle. Cancellation of ctx forwards the graceful signal to the whole
+// group, then SIGKILLs survivors after the grace period.
+func startInteractive(ctx context.Context, cmd *exec.Cmd, spec Spec) (*Handle, error) {
 	grace := spec.GracePeriod
 	if grace <= 0 {
 		grace = DefaultGracePeriod
@@ -26,49 +46,60 @@ func run(ctx context.Context, cmd *exec.Cmd, spec Spec) error {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = grace
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("process: start %s: %w", spec.Name, err)
+		return nil, fmt.Errorf("process: start %s: %w", spec.Name, err)
 	}
-	pgid := cmd.Process.Pid
+	h := &Handle{
+		name:           spec.Name,
+		ctx:            ctx,
+		cmd:            cmd,
+		pgid:           cmd.Process.Pid,
+		grace:          grace,
+		exited:         make(chan struct{}),
+		cancelObserved: make(chan struct{}),
+		watcherDone:    make(chan struct{}),
+		done:           make(chan struct{}),
+	}
+	go h.watch()
+	go h.wait()
+	return h, nil
+}
 
-	exited := make(chan struct{})
-	// cancelObserved is closed only when the watcher takes the ctx.Done()
-	// branch and actually performs the teardown. A late cancellation after
-	// the child exited normally leaves it closed, so the completed command
-	// is not reclassified as interrupted.
-	cancelObserved := make(chan struct{})
-	watcherDone := make(chan struct{})
-	go func() {
-		defer close(watcherDone)
-		select {
-		case <-ctx.Done():
-			close(cancelObserved)
-		case <-exited:
-			return
-		}
-		terminateGroup(pgid, gracefulSignal(ctx), grace)
-	}()
+// watch forwards cancellation to the process group.
+func (h *Handle) watch() {
+	defer close(h.watcherDone)
+	select {
+	case <-h.ctx.Done():
+		close(h.cancelObserved)
+	case <-h.exited:
+		return
+	}
+	terminateGroup(h.pgid, gracefulSignal(h.ctx), h.grace)
+}
 
-	waitErr := cmd.Wait()
-	close(exited)
-	// The direct child is now waited for. If the context was cancelled,
-	// let the watcher finish its bounded teardown before checking the
-	// group, so Run never returns while a descendant is still being
-	// signalled.
-	<-watcherDone
+// wait reaps the direct child, cleans the group, and joins the watcher.
+func (h *Handle) wait() {
+	h.waitErr = h.cmd.Wait()
+	close(h.exited)
+	h.reapErr = reapGroup(h.pgid, h.grace)
+	<-h.watcherDone
+	close(h.done)
+}
 
-	reapErr := reapGroup(pgid, grace)
+// Exited returns a channel closed once the direct child has exited (but
+// possibly before group cleanup has finished).
+func (h *Handle) Exited() <-chan struct{} { return h.exited }
 
-	// Only a watcher-observed cancellation is treated as a cancellation.
-	// ctx.Err() is read here because the watcher observed Done, so it is
-	// non-nil; reading it through ctx keeps the returned error wrapping
-	// the caller's context cause (Canceled or DeadlineExceeded).
+// Wait blocks until the process and its group are cleaned up, then returns
+// the classified result.
+func (h *Handle) Wait() error {
+	<-h.done
 	var ctxErr error
 	select {
-	case <-cancelObserved:
-		ctxErr = ctx.Err()
+	case <-h.cancelObserved:
+		ctxErr = h.ctx.Err()
 	default:
 	}
-	return classifyRunResult(spec.Name, waitErr, ctxErr, reapErr)
+	return classifyRunResult(h.name, h.waitErr, ctxErr, h.reapErr)
 }
 
 // gracefulSignal picks the signal forwarded to the child group: the one
