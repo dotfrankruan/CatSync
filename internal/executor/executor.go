@@ -249,10 +249,8 @@ func (e *Executor) detectTools() planner.Tools {
 		return err == nil
 	}
 	return planner.Tools{
-		Rsync:  found(e.progs.rsync()),
-		FPSync: found(e.progs.fpsync()),
-		FPart:  found(e.progs.fpart()),
-		MSCP:   found(e.progs.mscp()),
+		Rsync: found(e.progs.rsync()),
+		MSCP:  found(e.progs.mscp()),
 	}
 }
 
@@ -658,7 +656,7 @@ func (e *Executor) execute(ctx context.Context) error {
 		name string
 		fn   func(context.Context) error
 	}{
-		{"fpsync", e.fpsyncStage},
+		{"parallel-rsync", e.smallFileStage},
 		{"mscp", e.mscpStage},
 		{"rsync", e.rsyncStage},
 	}
@@ -725,6 +723,12 @@ func (e *Executor) finalize(errs []string) error {
 		e.run.Status = state.StatusCompleted
 		e.run.FinishedAt = &now
 		e.run.Error = ""
+		// Retire legacy external-fpsync artifacts in the same atomic save
+		// as the completion: resume never reads them, and the fields stay
+		// set on a failed or interrupted run for diagnostics.
+		e.run.FPSyncRunID = ""
+		e.run.FPSyncStateDir = ""
+		e.run.FPSyncOutput = ""
 		for _, t := range e.run.Tasks {
 			if t.Status == state.StatusUnsupported {
 				unsupported++
@@ -848,18 +852,6 @@ func (e *Executor) pendingTasks(b state.Backend) []int {
 		}
 	}
 	return out
-}
-
-// taskByPath returns the task with the given path, or nil.
-func (e *Executor) taskByPath(path string) *state.Task {
-	e.runMu.Lock()
-	defer e.runMu.Unlock()
-	for i := range e.run.Tasks {
-		if e.run.Tasks[i].Path == path {
-			return &e.run.Tasks[i]
-		}
-	}
-	return nil
 }
 
 // markRunning marks a task running, increments its attempt count, and

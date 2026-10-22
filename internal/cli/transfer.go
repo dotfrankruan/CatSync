@@ -86,7 +86,7 @@ func printPlan(w io.Writer, out *executor.PlanOutcome, opts *Options) {
 	}
 	fmt.Fprintf(w, "to transfer: %d file(s), %d logical source bytes (not a network-traffic estimate)\n",
 		counts[planner.StatusPending], out.LogicalBytes)
-	fmt.Fprintf(w, "  fpsync (small new):   %d\n", byBackend[state.BackendFPSync])
+	fmt.Fprintf(w, "  native small-file (parallel rsync): %d\n", byBackend[state.BackendFPSync])
 	fmt.Fprintf(w, "  mscp (large new):     %d\n", byBackend[state.BackendMSCP])
 	fmt.Fprintf(w, "  rsync (conservative): %d\n", byBackend[state.BackendRsync])
 	fmt.Fprintf(w, "skipped (unchanged): %d\n", counts[planner.StatusSkipped])
@@ -247,10 +247,12 @@ func printRunStatus(w io.Writer, run *state.Run, verbose bool) {
 	if n := counts[state.StatusUnsupported]; n > 0 {
 		fmt.Fprintf(w, "  unsupported: %d (NOT transferred: symlinks, special files, or scan errors)\n", n)
 	}
-	fmt.Fprintf(w, "  backends:    fpsync %d, mscp %d, rsync %d\n",
+	fmt.Fprintf(w, "  backends:    native-small %d, mscp %d, rsync %d\n",
 		byBackend[state.BackendFPSync], byBackend[state.BackendMSCP], byBackend[state.BackendRsync])
 	if run.FPSyncRunID != "" {
-		fmt.Fprintf(w, "  fpsync run:  %s (state dir %s)\n", run.FPSyncRunID, run.FPSyncStateDir)
+		// Legacy runs recorded an external-fpsync run id; the native
+		// backend ignores it, but keep it visible for diagnostics.
+		fmt.Fprintf(w, "  legacy fpsync run id: %s (state dir %s)\n", run.FPSyncRunID, run.FPSyncStateDir)
 	}
 	if checkpoints > 0 {
 		fmt.Fprintf(w, "  checkpoints: %d retained (resume artifacts)\n", checkpoints)

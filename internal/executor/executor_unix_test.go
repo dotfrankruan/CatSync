@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"syscall"
@@ -138,19 +139,6 @@ func (h *harness) writeManifest(name, content string) string {
 	return p
 }
 
-// fpsyncOutputFile writes a verbose fpsync output carrying a run ID and the
-// given S records (skipped large files).
-func (h *harness) fpsyncOutputFile(name string, skipped ...string) string {
-	var b strings.Builder
-	b.WriteString("1792333896 Info: Fpsync started (pid: 74154)\n")
-	b.WriteString("1792333896 Info: Run ID: 1792333896-74154\n")
-	for _, s := range skipped {
-		b.WriteString(s + "\n")
-	}
-	b.WriteString("1792333897 Info: Fpsync stopped (with success)\n")
-	return h.writeManifest(name, b.String())
-}
-
 // scriptSSHFreshDest scripts ssh for a sync against a missing destination:
 // the first manifest call exits 42 (no such directory), later manifest
 // calls serve postManifestFile, and mkdir succeeds.
@@ -203,14 +191,13 @@ func stdinPaths(t *testing.T, inv mockexec.Invocation) []string {
 	sort.Strings(out)
 	return out
 }
-
 func TestSyncAutoFreshDest(t *testing.T) {
 	h := newHarness(t)
 	h.writeSrc("small.txt", 10)
 	h.writeSrc("big.bin", 2048)
 	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt"), h.newFileRecord("big.bin")))
 	h.scriptSSHFreshDest(post)
-	h.writeScript("fpsync", "stdout_file="+h.fpsyncOutputFile("fpsync.out", "S\t2048\t./big.bin"))
+	h.writeScript("rsync", "exit=0")
 	h.writeScript("mscp", "touch_flag=-W")
 
 	run, err := Sync(context.Background(), h.config())
@@ -225,26 +212,37 @@ func TestSyncAutoFreshDest(t *testing.T) {
 			t.Errorf("task %s = %s (%q), want completed", task.Path, task.Status, task.Error)
 		}
 	}
-	if run.FPSyncRunID != "1792333896-74154" {
-		t.Errorf("fpsync run id = %q", run.FPSyncRunID)
+	// The native stage never writes the legacy external-fpsync artifacts.
+	if run.FPSyncRunID != "" || run.FPSyncStateDir != "" || run.FPSyncOutput != "" {
+		t.Errorf("legacy fpsync artifacts set on a native run: %q %q %q", run.FPSyncRunID, run.FPSyncStateDir, run.FPSyncOutput)
 	}
 
 	invs := h.invocations()
-	fps := toolInvocations(invs, "fpsync")
-	if len(fps) != 1 {
-		t.Fatalf("fpsync invocations = %d, want 1", len(fps))
+	if fps := toolInvocations(invs, "fpsync"); len(fps) != 0 {
+		t.Errorf("external fpsync invoked %d times, want 0", len(fps))
 	}
-	joined := strings.Join(fps[0].Args, "\x00")
-	// fpart receives threshold-1 so its strictly-greater skip-big
-	// boundary matches the at-or-above-threshold ownership policy.
-	for _, want := range []string{"-n\x002", "-f", "-s\x001023", "-O\x00-S", "/data/"} {
+	if fp := toolInvocations(invs, "fpart"); len(fp) != 0 {
+		t.Errorf("external fpart invoked %d times, want 0", len(fp))
+	}
+
+	// The small file went through one native rsync batch.
+	rs := toolInvocations(invs, "rsync")
+	if len(rs) != 1 {
+		t.Fatalf("rsync invocations = %d, want 1 (the small-file batch)", len(rs))
+	}
+	joined := strings.Join(rs[0].Args, "\x00")
+	for _, want := range []string{"--no-implied-dirs", "--files-from=-", "--from0", "--partial-dir="} {
 		if !strings.Contains(joined, want) {
-			t.Errorf("fpsync argv missing %q: %v", want, fps[0].Args)
+			t.Errorf("rsync batch argv missing %q: %v", want, rs[0].Args)
 		}
 	}
-	// The last two argv elements are the source and destination operands.
-	if n := len(fps[0].Args); fps[0].Args[n-1] != "u@h:/data/" || !strings.HasSuffix(fps[0].Args[n-2], "/") {
-		t.Errorf("fpsync operands = %v", fps[0].Args[n-2:])
+	for _, bad := range []string{"--delete", "--whole-file", "--inplace"} {
+		if strings.Contains(joined, bad) {
+			t.Errorf("rsync batch argv contains forbidden flag %q: %v", bad, rs[0].Args)
+		}
+	}
+	if got := stdinPaths(t, rs[0]); len(got) != 1 || got[0] != "small.txt" {
+		t.Errorf("rsync batch stdin paths = %v, want [small.txt]", got)
 	}
 
 	ms := toolInvocations(invs, "mscp")
@@ -254,9 +252,6 @@ func TestSyncAutoFreshDest(t *testing.T) {
 	mj := strings.Join(ms[0].Args, "\x00")
 	if !strings.Contains(mj, "-W\x00") || !strings.Contains(mj, "--\x00big.bin\x00u@h:/data/big.bin") {
 		t.Errorf("mscp argv = %v", ms[0].Args)
-	}
-	if rs := toolInvocations(invs, "rsync"); len(rs) != 0 {
-		t.Errorf("rsync invocations = %d, want 0 (no rsync-owned files)", len(rs))
 	}
 	if ssh := toolInvocations(invs, "ssh"); len(ssh) != 2 {
 		t.Errorf("ssh invocations = %d, want 2 (plan manifest + verify manifest)", len(ssh))
@@ -301,7 +296,6 @@ stdout_file=`+post+`
 match=mkdir -p
 exit=0
 `)
-	h.writeScript("fpsync", "stdout_file="+h.fpsyncOutputFile("fpsync.out", "S\t2048\t./big-new.bin", "S\t4096\t./big-mod.bin"))
 	h.writeScript("mscp", "touch_flag=-W")
 	h.writeScript("rsync", "exit=0")
 
@@ -320,7 +314,7 @@ exit=0
 		t.Errorf("unchanged file = %s, want skipped", got)
 	}
 	if got := byPath["small-new.txt"].Backend; got != state.BackendFPSync {
-		t.Errorf("small new file backend = %s, want fpsync", got)
+		t.Errorf("small new file backend = %s, want fpsync (native)", got)
 	}
 	if got := byPath["big-new.bin"].Backend; got != state.BackendMSCP {
 		t.Errorf("large new file backend = %s, want mscp", got)
@@ -331,20 +325,35 @@ exit=0
 
 	invs := h.invocations()
 	rs := toolInvocations(invs, "rsync")
-	if len(rs) != 1 {
-		t.Fatalf("rsync invocations = %d, want 1", len(rs))
+	if len(rs) != 2 {
+		t.Fatalf("rsync invocations = %d, want 2 (native small batch + conservative)", len(rs))
 	}
-	if got := stdinPaths(t, rs[0]); len(got) != 1 || got[0] != "big-mod.bin" {
-		t.Errorf("rsync stdin paths = %v, want exactly [big-mod.bin] (single writer)", got)
+	var native, conservative *mockexec.Invocation
+	for i := range rs {
+		joined := strings.Join(rs[i].Args, "\x00")
+		if strings.Contains(joined, "--no-implied-dirs") {
+			native = &rs[i]
+		} else {
+			conservative = &rs[i]
+		}
 	}
-	if strings.Contains(strings.Join(rs[0].Args, "\x00"), "--delete") {
-		t.Errorf("rsync argv contains --delete: %v", rs[0].Args)
+	if native == nil || conservative == nil {
+		t.Fatalf("expected one native (--no-implied-dirs) and one conservative rsync run, got %d invocations", len(rs))
+	}
+	if got := stdinPaths(t, *native); len(got) != 1 || got[0] != "small-new.txt" {
+		t.Errorf("native batch stdin = %v, want exactly [small-new.txt]", got)
+	}
+	if got := stdinPaths(t, *conservative); len(got) != 1 || got[0] != "big-mod.bin" {
+		t.Errorf("conservative stdin = %v, want exactly [big-mod.bin] (single writer)", got)
+	}
+	for _, inv := range rs {
+		if strings.Contains(strings.Join(inv.Args, "\x00"), "--delete") {
+			t.Errorf("rsync argv contains --delete: %v", inv.Args)
+		}
 	}
 	if ms := toolInvocations(invs, "mscp"); len(ms) != 1 {
 		t.Errorf("mscp invocations = %d, want 1", len(ms))
 	}
-	// ssh: pre manifest, mkdir (big files live at root? no subdirs here, so
-	// no mkdir), post manifest.
 	if ssh := toolInvocations(invs, "ssh"); len(ssh) != 2 {
 		t.Errorf("ssh invocations = %d, want 2", len(ssh))
 	}
@@ -414,14 +423,15 @@ func TestSyncForcedMSCPRejectsExistingFile(t *testing.T) {
 		t.Error("mscp ran despite the existing destination file")
 	}
 }
-
-func TestSyncMissingFPSyncFallsBackToRsync(t *testing.T) {
+func TestSyncWithoutFPSyncProgramsStillUsesNativeBackend(t *testing.T) {
 	h := newHarness(t)
 	h.writeSrc("small.txt", 10)
 	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
 	h.scriptSSHFreshDest(post)
 	h.writeScript("rsync", "exit=0")
 	cfg := h.config()
+	// Point the legacy fpsync/fpart overrides at nothing: the native
+	// small-file backend must not need or invoke them.
 	cfg.Programs.FPSync = filepath.Join(t.TempDir(), "no-fpsync")
 	cfg.Programs.FPart = cfg.Programs.FPSync
 
@@ -433,12 +443,15 @@ func TestSyncMissingFPSyncFallsBackToRsync(t *testing.T) {
 		t.Fatalf("run status = %s (error %q)", run.Status, run.Error)
 	}
 	invs := h.invocations()
-	if len(toolInvocations(invs, "fpsync")) != 0 {
-		t.Error("fpsync ran despite being unavailable")
+	if got := len(toolInvocations(invs, "fpsync")) + len(toolInvocations(invs, "fpart")); got != 0 {
+		t.Errorf("fpsync/fpart invocations = %d, want 0 (native backend)", got)
 	}
 	rs := toolInvocations(invs, "rsync")
 	if len(rs) != 1 {
-		t.Fatalf("rsync invocations = %d, want 1", len(rs))
+		t.Fatalf("rsync invocations = %d, want 1 (native small-file batch)", len(rs))
+	}
+	if !strings.Contains(strings.Join(rs[0].Args, "\x00"), "--no-implied-dirs") {
+		t.Errorf("small-file batch missing --no-implied-dirs: %v", rs[0].Args)
 	}
 	if got := stdinPaths(t, rs[0]); len(got) != 1 || got[0] != "small.txt" {
 		t.Errorf("rsync paths = %v, want [small.txt]", got)
@@ -450,15 +463,31 @@ func TestSyncForcedUnavailableBackendFails(t *testing.T) {
 	h.writeSrc("small.txt", 10)
 	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
 	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "exit=0")
 	cfg := h.config()
-	cfg.Backend = state.BackendFPSync
-	cfg.Programs.FPSync = filepath.Join(t.TempDir(), "no-fpsync")
+	// mscp is the only backend with a real tool dependency; forcing it
+	// without the program must fail at planning.
+	cfg.Backend = state.BackendMSCP
+	cfg.Programs.MSCP = filepath.Join(t.TempDir(), "no-mscp")
 
 	if _, err := Sync(context.Background(), cfg); err == nil {
-		t.Fatal("forced fpsync without fpsync = nil, want error")
+		t.Fatal("forced mscp without mscp = nil, want error")
 	}
-	if len(toolInvocations(h.invocations(), "fpsync")) != 0 {
-		t.Error("fpsync ran despite being unavailable")
+	// The native small-file backend has no extra tool dependency: forcing
+	// "fpsync" with no fpsync executable still works through rsync.
+	cfg2 := h.config()
+	cfg2.Backend = state.BackendFPSync
+	cfg2.Programs.FPSync = filepath.Join(t.TempDir(), "no-fpsync")
+	cfg2.Programs.FPart = cfg2.Programs.FPSync
+	run, err := Sync(context.Background(), cfg2)
+	if err != nil {
+		t.Fatalf("forced fpsync (native) without fpsync/fpart executables: %v", err)
+	}
+	if run.Status != state.StatusCompleted {
+		t.Errorf("forced fpsync run = %s (%q), want completed", run.Status, run.Error)
+	}
+	if got := len(toolInvocations(h.invocations(), "fpsync")); got != 0 {
+		t.Errorf("external fpsync invoked %d times, want 0", got)
 	}
 }
 
@@ -695,70 +724,90 @@ func TestResumeWithoutCheckpointRestartsWithDashW(t *testing.T) {
 		t.Errorf("resume without checkpoint must restart with -W: %v", ms[1].Args)
 	}
 }
-
-func TestFPSyncResumeByRunID(t *testing.T) {
+func TestResumeLegacyFPSyncStateNatively(t *testing.T) {
 	h := newHarness(t)
 	h.writeSrc("small.txt", 10)
 	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
-	h.scriptSSHFreshDest(post)
-	resumed := h.writeManifest("resumed.out", "1792333911 Info: Run ID: 1792333896-74154 (resumed)\n1792333912 Info: Fpsync stopped (with success)\n")
-	h.writeScript("fpsync", "nth=1\nexit=1\nstdout_file="+h.fpsyncOutputFile("fpsync.out")+"\n---\nexit=0\nstdout_file="+resumed+"\n")
+	// Resume has no plan-phase manifest; the only ssh call is verification.
+	h.writeScript("ssh", "match=if [ -d\nstdout_file="+post+"\n")
+	h.writeScript("rsync", "exit=0")
 
-	run, err := Sync(context.Background(), h.config())
-	if err == nil {
-		t.Fatal("Sync with failing fpsync = nil, want error")
+	// Persist a run exactly as the removed external-fpsync implementation
+	// left it: failed run, failed small-file task, legacy artifacts set,
+	// legacy state directory absent on disk.
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if run.FPSyncRunID != "1792333896-74154" {
-		t.Fatalf("fpsync run id = %q", run.FPSyncRunID)
+	size, mt := h.srcMeta("small.txt")
+	id, err := state.NewID()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if run.Tasks[0].Status != state.StatusFailed {
-		t.Fatalf("task = %s (%q)", run.Tasks[0].Status, run.Tasks[0].Error)
+	run := &state.Run{
+		ID:          id,
+		Source:      state.Source{Path: h.src},
+		Destination: state.Destination{User: "u", Host: "h", Path: "/data"},
+		WorkDir:     h.src,
+		Config: state.Config{
+			Backend: state.BackendAuto, Verify: state.VerifySize,
+			Jobs: 2, Streams: 2, LargeThreshold: 1024,
+		},
+		Status:         state.StatusFailed,
+		FPSyncRunID:    "1792333896-74154",
+		FPSyncStateDir: filepath.Join(h.stateDir, "legacy-fpsync"),
+		FPSyncOutput:   filepath.Join(h.stateDir, "legacy-fpsync.out"),
+		CreatedAt:      time.Now().UTC(),
+		Tasks: []state.Task{{
+			Path: "small.txt", Size: size, ModTime: mt, DestSize: -1,
+			Backend: state.BackendFPSync, Status: state.StatusFailed,
+			Attempts: 1, Error: "interrupted",
+		}},
+	}
+	if err := store.Save(run); err != nil {
+		t.Fatal(err)
 	}
 
+	cfg := h.config()
 	run2, err := Resume(context.Background(), Config{
 		StateDir: h.stateDir,
-		Programs: h.config().Programs,
-		Env:      mockexec.EnvScript(h.scriptDir, h.logPath),
+		Programs: cfg.Programs,
+		Env:      cfg.Env,
 	}, run.ID)
 	if err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
 	if run2.Status != state.StatusCompleted {
-		t.Errorf("resumed run = %s (%q)", run2.Status, run2.Error)
+		t.Fatalf("resumed run = %s (%q), want completed", run2.Status, run2.Error)
 	}
-	fps := toolInvocations(h.invocations(), "fpsync")
-	if len(fps) != 2 {
-		t.Fatalf("fpsync invocations = %d, want 2", len(fps))
+	if run2.Tasks[0].Status != state.StatusCompleted {
+		t.Errorf("task = %s (%q), want completed", run2.Tasks[0].Status, run2.Tasks[0].Error)
 	}
-	joined := strings.Join(fps[1].Args, "\x00")
-	if !strings.Contains(joined, "-r\x001792333896-74154") {
-		t.Errorf("resume argv missing -r runid: %v", fps[1].Args)
-	}
-	for _, a := range fps[1].Args {
-		if strings.Contains(a, "u@h") || a == "-O" {
-			t.Errorf("resume argv carries initial-run token %q: %v", a, fps[1].Args)
-		}
-	}
-}
 
-func TestFPSyncOrphanSkipFails(t *testing.T) {
-	h := newHarness(t)
-	h.writeSrc("small.txt", 10)
-	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
-	h.scriptSSHFreshDest(post)
-	// fpsync reports skipping a file the plan never saw: no backend owns
-	// it, so the run must fail loudly instead of silently dropping data.
-	h.writeScript("fpsync", "stdout_file="+h.fpsyncOutputFile("fpsync.out", "S\t9999\t./surprise.bin"))
+	// The legacy artifacts were retired atomically with completion.
+	loaded, err := store.Load(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.FPSyncRunID != "" || loaded.FPSyncStateDir != "" || loaded.FPSyncOutput != "" {
+		t.Errorf("legacy fpsync artifacts not retired: runID=%q stateDir=%q out=%q",
+			loaded.FPSyncRunID, loaded.FPSyncStateDir, loaded.FPSyncOutput)
+	}
 
-	run, err := Sync(context.Background(), h.config())
-	if err == nil {
-		t.Fatal("Sync with orphan skip = nil, want error")
+	// No external fpsync/fpart ran; one native rsync batch did.
+	invs := h.invocations()
+	if got := len(toolInvocations(invs, "fpsync")) + len(toolInvocations(invs, "fpart")); got != 0 {
+		t.Errorf("fpsync/fpart invocations = %d, want 0", got)
 	}
-	if run.Status != state.StatusFailed {
-		t.Errorf("run status = %s, want failed", run.Status)
+	rs := toolInvocations(invs, "rsync")
+	if len(rs) != 1 {
+		t.Fatalf("rsync invocations = %d, want 1", len(rs))
 	}
-	if !strings.Contains(run.Error, "no owning backend") {
-		t.Errorf("run error = %q, want the orphan-skip explanation", run.Error)
+	if !strings.Contains(strings.Join(rs[0].Args, "\x00"), "--no-implied-dirs") {
+		t.Errorf("resumed small-file batch missing --no-implied-dirs: %v", rs[0].Args)
+	}
+	if got := stdinPaths(t, rs[0]); len(got) != 1 || got[0] != "small.txt" {
+		t.Errorf("resumed batch stdin = %v, want [small.txt]", got)
 	}
 }
 
@@ -784,8 +833,7 @@ func TestSyncSpecialFilenames(t *testing.T) {
 	postRecs = append(postRecs, h.newFileRecord("big dir/-large.bin"), h.newFileRecord("-big.bin"))
 	post := h.writeManifest("post", manifestContent(postRecs...))
 	h.scriptSSHFreshDest(post)
-	h.writeScript("fpsync", "stdout_file="+h.fpsyncOutputFile("fpsync.out",
-		"S\t2048\t./big dir/-large.bin", "S\t4096\t./-big.bin"))
+	h.writeScript("rsync", "exit=0")
 	h.writeScript("mscp", "touch_flag=-W")
 
 	run, err := Sync(context.Background(), h.config())
@@ -796,6 +844,30 @@ func TestSyncSpecialFilenames(t *testing.T) {
 		t.Fatalf("run status = %s (error %q)", run.Status, run.Error)
 	}
 	invs := h.invocations()
+
+	// The five small special files went through one native rsync batch,
+	// NUL-delimited on stdin, never through argv.
+	rs := toolInvocations(invs, "rsync")
+	if len(rs) != 1 {
+		t.Fatalf("rsync invocations = %d, want 1 (native small-file batch)", len(rs))
+	}
+	joined := strings.Join(rs[0].Args, "\x00")
+	if !strings.Contains(joined, "--no-implied-dirs") {
+		t.Errorf("native batch missing --no-implied-dirs: %v", rs[0].Args)
+	}
+	// The batch content is a set; discovery order defines the on-wire order.
+	gotPaths := stdinPaths(t, rs[0])
+	wantPaths := append([]string{}, names...)
+	sort.Strings(wantPaths)
+	if !reflect.DeepEqual(gotPaths, wantPaths) {
+		t.Errorf("batch stdin paths = %q, want the five special names NUL-delimited", gotPaths)
+	}
+	for _, n := range names {
+		if strings.Contains(joined, n) {
+			t.Errorf("special filename %q leaked into argv: %v", n, rs[0].Args)
+		}
+	}
+
 	ms := toolInvocations(invs, "mscp")
 	if len(ms) != 2 {
 		t.Fatalf("mscp invocations = %d, want 2", len(ms))
@@ -811,7 +883,8 @@ func TestSyncSpecialFilenames(t *testing.T) {
 		t.Errorf("space-containing large file operand corrupted: %v", operands)
 	}
 	// The remote parent directory of "big dir/-large.bin" was created with
-	// one batched, quoted mkdir.
+	// one batched, quoted mkdir (no small-file parents are needed here:
+	// all special names are at the source root).
 	var mkdirs []mockexec.Invocation
 	for _, inv := range toolInvocations(invs, "ssh") {
 		if strings.Contains(strings.Join(inv.Args, "\x00"), "mkdir -p") {
@@ -1041,12 +1114,13 @@ func TestSyncCancellationKillsWriterDescendants(t *testing.T) {
 	}
 }
 
-// TestSyncThresholdEqualToFileIsNotCopiedByFPSync covers the boundary that
-// motivated the -s (threshold-1) mapping: a file exactly at the large
-// threshold belongs to mscp, and the fpsync stage's fpart limit must make
-// fpart skip it (reported as an S record) rather than copy it. The run
-// completes only because every skipped file has another planned owner.
-func TestSyncThresholdEqualToFileIsNotCopiedByFPSync(t *testing.T) {
+// TestSyncThresholdBoundaryWithNativeBackend covers the boundary that
+// previously needed the fpart -s (threshold-1) workaround: a file exactly
+// at the large threshold belongs to mscp, and the native small-file batch
+// contains only the below-threshold file. Ownership is enforced by the
+// planner, not by a tool-side skip list, so the equal file can never be
+// copied twice.
+func TestSyncThresholdBoundaryWithNativeBackend(t *testing.T) {
 	h := newHarness(t)
 	h.writeSrc("small.txt", 10)
 	h.writeSrc("equal.bin", 1024)
@@ -1057,9 +1131,7 @@ func TestSyncThresholdEqualToFileIsNotCopiedByFPSync(t *testing.T) {
 		h.newFileRecord("above.bin"),
 	))
 	h.scriptSSHFreshDest(post)
-	// Real fpart with -s 1023 reports both the equal and the above file.
-	h.writeScript("fpsync", "stdout_file="+h.fpsyncOutputFile("fpsync.out",
-		"S\t1024\t./equal.bin", "S\t2048\t./above.bin"))
+	h.writeScript("rsync", "exit=0")
 	h.writeScript("mscp", "touch_flag=-W")
 
 	run, err := Sync(context.Background(), h.config())
@@ -1077,35 +1149,27 @@ func TestSyncThresholdEqualToFileIsNotCopiedByFPSync(t *testing.T) {
 		t.Errorf("equal-threshold file backend = %s, want mscp", got)
 	}
 	if got := byPath["small.txt"].Backend; got != state.BackendFPSync {
-		t.Errorf("below-threshold file backend = %s, want fpsync", got)
+		t.Errorf("below-threshold file backend = %s, want fpsync (native)", got)
 	}
 	invs := h.invocations()
-	fps := toolInvocations(invs, "fpsync")
-	if len(fps) != 1 {
-		t.Fatalf("fpsync invocations = %d, want 1", len(fps))
+	rs := toolInvocations(invs, "rsync")
+	if len(rs) != 1 {
+		t.Fatalf("rsync invocations = %d, want 1", len(rs))
 	}
-	joined := strings.Join(fps[0].Args, "\x00")
-	if !strings.Contains(joined, "-s\x001023") {
-		t.Errorf("fpsync argv must use fpart -s 1023 (threshold-1), got %v", fps[0].Args)
+	if got := stdinPaths(t, rs[0]); len(got) != 1 || got[0] != "small.txt" {
+		t.Errorf("native batch stdin = %v, want exactly [small.txt]", got)
 	}
-	if strings.Contains(joined, "-s\x001024") {
-		t.Errorf("fpsync argv still uses the unshifted threshold: %v", fps[0].Args)
-	}
-	// Only the two at-or-above-threshold files go to mscp; the small file
-	// is never handed to rsync or mscp.
+	// Only the two at-or-above-threshold files go to mscp.
 	ms := toolInvocations(invs, "mscp")
 	if len(ms) != 2 {
 		t.Errorf("mscp invocations = %d, want 2 (equal and above)", len(ms))
 	}
-	if rs := toolInvocations(invs, "rsync"); len(rs) != 0 {
-		t.Errorf("rsync invocations = %d, want 0", len(rs))
-	}
 }
 
-// TestSyncTinyThresholdDisablesFPSync covers the correctness-first
-// fallback: a threshold of 1 byte cannot be expressed as an fpart -s limit,
-// so auto mode routes the zero-byte files to rsync and never runs fpsync.
-func TestSyncTinyThresholdDisablesFPSync(t *testing.T) {
+// TestSyncTinyThresholdNative: with the native small-file backend there is
+// no minimum threshold: threshold=1 keeps zero-byte files on the small
+// batch and routes the 1-byte file (at the threshold) to mscp.
+func TestSyncTinyThresholdNative(t *testing.T) {
 	h := newHarness(t)
 	h.writeSrc("empty.bin", 0)
 	h.writeSrc("one.bin", 1)
@@ -1127,11 +1191,15 @@ func TestSyncTinyThresholdDisablesFPSync(t *testing.T) {
 		t.Fatalf("run status = %s (%q)", run.Status, run.Error)
 	}
 	invs := h.invocations()
-	if len(toolInvocations(invs, "fpsync")) != 0 {
-		t.Error("fpsync ran with a threshold below 2 bytes")
+	if got := len(toolInvocations(invs, "fpsync")) + len(toolInvocations(invs, "fpart")); got != 0 {
+		t.Errorf("fpsync/fpart invocations = %d, want 0", got)
 	}
-	if got := len(toolInvocations(invs, "rsync")); got != 1 {
-		t.Errorf("rsync invocations = %d, want 1 (zero-byte fallback)", got)
+	rs := toolInvocations(invs, "rsync")
+	if len(rs) != 1 {
+		t.Fatalf("rsync invocations = %d, want 1 (native batch for the zero-byte file)", len(rs))
+	}
+	if got := stdinPaths(t, rs[0]); len(got) != 1 || got[0] != "empty.bin" {
+		t.Errorf("native batch stdin = %v, want [empty.bin]", got)
 	}
 	if got := len(toolInvocations(invs, "mscp")); got != 1 {
 		t.Errorf("mscp invocations = %d, want 1 (1-byte file is at the threshold)", got)
@@ -1528,5 +1596,544 @@ func TestResumeRejectsUnexpressibleSSHOverrideBeforeExecution(t *testing.T) {
 	}
 	if loaded.Tasks[0].Status != state.StatusFailed {
 		t.Errorf("persisted task status = %q, want failed", loaded.Tasks[0].Status)
+	}
+}
+
+// maxObservedConcurrency computes the maximum number of simultaneously live
+// mock processes from a track log of "start <pid>"/"end <pid>" lines.
+func maxObservedConcurrency(t *testing.T, logPath string) int {
+	t.Helper()
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read track log: %v", err)
+	}
+	live, max := 0, 0
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		switch {
+		case strings.HasPrefix(line, "start "):
+			live++
+			if live > max {
+				max = live
+			}
+		case strings.HasPrefix(line, "end "):
+			live--
+		}
+	}
+	return max
+}
+
+// batchPathSet returns the sorted stdin path list of a mock invocation.
+func batchPathSet(t *testing.T, inv mockexec.Invocation) []string {
+	t.Helper()
+	return stdinPaths(t, inv)
+}
+
+// TestNativeParallelRsyncRespectsJobs proves the native stage runs at most
+// Config.Jobs concurrent rsync processes, that batches are disjoint and
+// cover every planned small file exactly once, and that the configured
+// rsync/ssh overrides reach the batch commands.
+func TestNativeParallelRsyncRespectsJobs(t *testing.T) {
+	h := newHarness(t)
+	// 600-byte files with a 1024-byte threshold: one file per batch.
+	var names []string
+	for i := 0; i < 6; i++ {
+		names = append(names, fmt.Sprintf("f%d.txt", i))
+		h.writeSrc(names[i], 600)
+	}
+	var recs []string
+	for _, n := range names {
+		recs = append(recs, h.newFileRecord(n))
+	}
+	post := h.writeManifest("post", manifestContent(recs...))
+	h.scriptSSHFreshDest(post)
+	trackLog := filepath.Join(t.TempDir(), "track.log")
+	h.writeScript("rsync", "track_log="+trackLog+"\nsleep_ms=400\n")
+	cfg := h.config()
+	cfg.Jobs = 2
+
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if run.Status != state.StatusCompleted {
+		t.Fatalf("run status = %s (%q)", run.Status, run.Error)
+	}
+
+	invs := h.invocations()
+	rs := toolInvocations(invs, "rsync")
+	if len(rs) != 6 {
+		t.Fatalf("rsync invocations = %d, want 6 (one file per batch)", len(rs))
+	}
+	if got := maxObservedConcurrency(t, trackLog); got != 2 {
+		t.Errorf("max observed concurrency = %d, want exactly 2 (jobs=2)", got)
+	}
+	if got := len(toolInvocations(invs, "fpsync")) + len(toolInvocations(invs, "fpart")); got != 0 {
+		t.Errorf("fpsync/fpart invocations = %d, want 0", got)
+	}
+	// Disjoint union: every planned small file appears in exactly one batch.
+	var all []string
+	for _, inv := range rs {
+		all = append(all, batchPathSet(t, inv)...)
+	}
+	sort.Strings(all)
+	want := append([]string{}, names...)
+	sort.Strings(want)
+	if !reflect.DeepEqual(all, want) {
+		t.Errorf("union of batch paths = %v, want %v", all, want)
+	}
+	// Every batch uses --no-implied-dirs and the configured ssh transport.
+	for i, inv := range rs {
+		joined := strings.Join(inv.Args, "\x00")
+		if !strings.Contains(joined, "--no-implied-dirs") {
+			t.Errorf("batch %d missing --no-implied-dirs: %v", i, inv.Args)
+		}
+		wantTransport := h.progs["ssh"]
+		found := false
+		for j, a := range inv.Args {
+			if a == "-e" && j+1 < len(inv.Args) {
+				if inv.Args[j+1] != wantTransport {
+					t.Errorf("batch %d transport = %q, want CATSYNC_SSH override %q", i, inv.Args[j+1], wantTransport)
+				}
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("batch %d has no -e transport: %v", i, inv.Args)
+		}
+	}
+}
+
+// TestNativeStageIPv6Transport proves --ipv6 reaches the native stage:
+// ssh calls get -6 and the rsync -e transport becomes "<ssh> -6".
+func TestNativeStageIPv6Transport(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 10)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "exit=0")
+	cfg := h.config()
+	cfg.IPv6 = true
+
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if run.Status != state.StatusCompleted {
+		t.Fatalf("run status = %s (%q)", run.Status, run.Error)
+	}
+	rs := toolInvocations(h.invocations(), "rsync")
+	if len(rs) != 1 {
+		t.Fatalf("rsync invocations = %d, want 1", len(rs))
+	}
+	want := h.progs["ssh"] + " -6"
+	found := false
+	for i, a := range rs[0].Args {
+		if a == "-e" && i+1 < len(rs[0].Args) {
+			found = true
+			if rs[0].Args[i+1] != want {
+				t.Errorf("transport = %q, want %q", rs[0].Args[i+1], want)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("no -e in rsync argv: %v", rs[0].Args)
+	}
+	for _, inv := range toolInvocations(h.invocations(), "ssh") {
+		if len(inv.Args) < 2 || inv.Args[0] != "-6" {
+			t.Errorf("ssh argv missing -6: %v", inv.Args)
+		}
+	}
+}
+
+// TestNativeStageCancelsSiblingsOnBatchFailure: one batch fails while its
+// siblings sleep; the stage cancels them, their tasks revert to pending
+// (resumable), and no rsync processes survive.
+func TestNativeStageCancelsSiblingsOnBatchFailure(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("a.txt", 600)
+	h.writeSrc("b.txt", 600)
+	h.writeSrc("c.txt", 600)
+	post := h.writeManifest("post", manifestContent(
+		h.newFileRecord("a.txt"), h.newFileRecord("b.txt"), h.newFileRecord("c.txt")))
+	h.scriptSSHFreshDest(post)
+	// The first batch to launch fails immediately; the others would sleep.
+	h.writeScript("rsync", "nth=1\nexit=1\n---\nsleep_ms=30000\nexit=0\n")
+	cfg := h.config()
+	cfg.Jobs = 3
+
+	start := time.Now()
+	run, err := Sync(context.Background(), cfg)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("Sync with a failing batch = nil, want error")
+	}
+	if elapsed > 20*time.Second {
+		t.Errorf("Sync took %s: sibling batches were not cancelled promptly", elapsed)
+	}
+	if run.Status != state.StatusFailed {
+		t.Errorf("run status = %s, want failed", run.Status)
+	}
+	failed, pending := 0, 0
+	for _, task := range run.Tasks {
+		switch task.Status {
+		case state.StatusFailed:
+			failed++
+			if !strings.Contains(task.Error, "rsync batch failed") {
+				t.Errorf("failed task error = %q", task.Error)
+			}
+		case state.StatusPending:
+			pending++
+			if !strings.Contains(task.Error, "cancelled: another small-file batch failed") {
+				t.Errorf("pending task error = %q, want the cancellation note", task.Error)
+			}
+		default:
+			t.Errorf("task %s status = %s, want failed or pending", task.Path, task.Status)
+		}
+	}
+	if failed != 1 || pending != 2 {
+		t.Errorf("failed=%d pending=%d, want 1 failed + 2 pending", failed, pending)
+	}
+	// No mock rsync process survives Sync.
+	for _, inv := range toolInvocations(h.invocations(), "rsync") {
+		if err := mockexec.ProcessAlive(inv.PID); err == nil {
+			t.Errorf("mock rsync pid %d still alive after cancellation", inv.PID)
+		}
+	}
+}
+
+// TestNativeStageNeverLaunchesUnstartedBatches: with jobs=1, a failing
+// first batch stops the stage before the remaining batches ever launch a
+// process or mark their tasks.
+func TestNativeStageNeverLaunchesUnstartedBatches(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("a.txt", 600)
+	h.writeSrc("b.txt", 600)
+	h.writeSrc("c.txt", 600)
+	post := h.writeManifest("post", manifestContent(
+		h.newFileRecord("a.txt"), h.newFileRecord("b.txt"), h.newFileRecord("c.txt")))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "nth=1\nexit=1\n---\nexit=0\n")
+	cfg := h.config()
+	cfg.Jobs = 1
+
+	run, err := Sync(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("Sync with failing first batch = nil, want error")
+	}
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 1 {
+		t.Errorf("rsync invocations = %d, want exactly 1 (later batches never launched)", got)
+	}
+	failed, pending := 0, 0
+	for _, task := range run.Tasks {
+		switch task.Status {
+		case state.StatusFailed:
+			failed++
+			if task.Attempts != 1 {
+				t.Errorf("failed task attempts = %d, want 1", task.Attempts)
+			}
+		case state.StatusPending:
+			pending++
+			if task.Attempts != 0 {
+				t.Errorf("never-launched task %s attempts = %d, want 0", task.Path, task.Attempts)
+			}
+		}
+	}
+	if failed != 1 || pending != 2 {
+		t.Errorf("failed=%d pending=%d, want 1 failed + 2 pending", failed, pending)
+	}
+	if run.Status != state.StatusFailed {
+		t.Errorf("run status = %s, want failed", run.Status)
+	}
+}
+
+// TestNativeStageDetectsSourceChangeWhileQueued: a file that changes while
+// its batch waits for a slot is caught by the per-batch pre-check and never
+// enters rsync.
+func TestNativeStageDetectsSourceChangeWhileQueued(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("first.txt", 600)
+	h.writeSrc("second.txt", 600)
+	post := h.writeManifest("post", manifestContent(
+		h.newFileRecord("first.txt"), h.newFileRecord("second.txt")))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "nth=1\nsleep_ms=800\nexit=0\n---\nexit=0\n")
+	cfg := h.config()
+	cfg.Jobs = 1
+
+	done := make(chan error, 1)
+	go func() {
+		run, err := Sync(context.Background(), cfg)
+		_ = run
+		done <- err
+	}()
+
+	// Wait for the first batch to start, learn which file it carries, and
+	// mutate the OTHER file while its batch is still queued.
+	deadline := time.Now().Add(10 * time.Second)
+	var firstBatch []mockexec.Invocation
+	for {
+		firstBatch = toolInvocations(h.invocations(), "rsync")
+		if len(firstBatch) >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("first rsync batch never started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	running := batchPathSet(t, firstBatch[0])
+	queued := "second.txt"
+	if len(running) == 1 && running[0] == "second.txt" {
+		queued = "first.txt"
+	}
+	if err := os.WriteFile(filepath.Join(h.src, queued), []byte("mutated while queued, different size"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err == nil {
+		t.Fatal("Sync = nil, want error (one task failed its queued revalidation)")
+	}
+
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 1 {
+		t.Errorf("rsync invocations = %d, want 1 (the mutated file never launched)", got)
+	}
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Latest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPath := map[string]state.Task{}
+	for _, task := range loaded.Tasks {
+		byPath[task.Path] = task
+	}
+	if got := byPath[queued].Status; got != state.StatusFailed {
+		t.Errorf("queued-and-mutated file status = %s, want failed", got)
+	}
+	if !strings.Contains(byPath[queued].Error, "source changed since planning") {
+		t.Errorf("queued file error = %q", byPath[queued].Error)
+	}
+	if got := byPath[running[0]].Status; got != state.StatusCompleted {
+		t.Errorf("first batch file status = %s, want completed", got)
+	}
+}
+
+// TestNativeStageVerifyNone: with --verify none the small-file batch
+// completes tasks right after the post-check and no verification manifest
+// is collected.
+func TestNativeStageVerifyNone(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 10)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "exit=0")
+	cfg := h.config()
+	cfg.Verify = state.VerifyNone
+
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if run.Tasks[0].Status != state.StatusCompleted {
+		t.Errorf("task = %s (%q), want completed", run.Tasks[0].Status, run.Tasks[0].Error)
+	}
+	if got := len(toolInvocations(h.invocations(), "ssh")); got != 1 {
+		t.Errorf("ssh invocations = %d, want 1 (plan manifest only)", got)
+	}
+}
+
+// TestNativeStageInterruptionThenResume: cancelling mid-batch reverts the
+// running task to pending and resume finishes the work with fresh native
+// batches, never touching fpsync.
+func TestNativeStageInterruptionThenResume(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("a.txt", 600)
+	h.writeSrc("b.txt", 600)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("a.txt"), h.newFileRecord("b.txt")))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "nth=1\nsleep_ms=30000\nexit=0\n---\nexit=0\n")
+	cfg := h.config()
+	cfg.Jobs = 1
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	runCh := make(chan *state.Run, 1)
+	go func() {
+		run, err := Sync(ctx, cfg)
+		runCh <- run
+		done <- err
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for len(toolInvocations(h.invocations(), "rsync")) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("first batch never started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	err := <-done
+	run := <-runCh
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Sync = %v, want context.Canceled", err)
+	}
+	if run.Status != state.StatusFailed {
+		t.Errorf("run status = %s, want failed (interrupted)", run.Status)
+	}
+	for _, task := range run.Tasks {
+		if task.Status != state.StatusPending {
+			t.Errorf("task %s = %s after cancellation, want pending", task.Path, task.Status)
+		}
+	}
+
+	run2, err := Resume(context.Background(), Config{
+		StateDir: h.stateDir,
+		Programs: cfg.Programs,
+		Env:      cfg.Env,
+	}, run.ID)
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if run2.Status != state.StatusCompleted {
+		t.Fatalf("resumed run = %s (%q), want completed", run2.Status, run2.Error)
+	}
+	for _, task := range run2.Tasks {
+		if task.Status != state.StatusCompleted {
+			t.Errorf("resumed task %s = %s (%q)", task.Path, task.Status, task.Error)
+		}
+	}
+	invs := h.invocations()
+	if got := len(toolInvocations(invs, "fpsync")) + len(toolInvocations(invs, "fpart")); got != 0 {
+		t.Errorf("fpsync/fpart invocations = %d, want 0", got)
+	}
+	if got := len(toolInvocations(invs, "rsync")); got != 3 {
+		t.Errorf("rsync invocations = %d, want 3 (cancelled + two resumed batches)", got)
+	}
+}
+
+// TestNativeStageZeroExitCancellation: the backend catches TERM and exits 0
+// on cancellation; the stage must still report the cancellation and leave
+// the task resumable, never completed.
+func TestNativeStageZeroExitCancellation(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 10)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
+	h.scriptSSHFreshDest(post)
+	ready := filepath.Join(t.TempDir(), "ready")
+	sigFile := filepath.Join(t.TempDir(), "signal")
+	h.writeScript("rsync", "zero_exit_signal=TERM\nready_file="+ready+"\nsignal_file="+sigFile+"\nsleep_ms=30000\n")
+	cfg := h.config()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	runCh := make(chan *state.Run, 1)
+	go func() {
+		run, err := Sync(ctx, cfg)
+		runCh <- run
+		done <- err
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("mock rsync never became ready")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	err := <-done
+	run := <-runCh
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Sync = %v, want context.Canceled (zero-exit backend must not be a success)", err)
+	}
+	if run.Status == state.StatusCompleted {
+		t.Fatal("cancelled zero-exit run was marked completed")
+	}
+	if run.Tasks[0].Status != state.StatusPending {
+		t.Errorf("task = %s, want pending (resumable)", run.Tasks[0].Status)
+	}
+	sig, serr := os.ReadFile(sigFile)
+	if serr != nil {
+		t.Fatalf("mock did not record the forwarded signal: %v", serr)
+	}
+	if got := strings.TrimSpace(string(sig)); got != "terminated" {
+		t.Errorf("forwarded signal = %q, want terminated", got)
+	}
+}
+
+// TestNativeStageSaveFailureBlocksLaunch: a persistence failure while
+// marking the batch running prevents the rsync subprocess from starting.
+func TestNativeStageSaveFailureBlocksLaunch(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 10)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "exit=0")
+	cfg := h.config()
+
+	run, err := syncWith(context.Background(), cfg, func(e *Executor) { failSavesFrom(e, 2) })
+	if err == nil {
+		t.Fatal("Sync with failing markRunning save = nil, want error")
+	}
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 0 {
+		t.Errorf("rsync invocations = %d, want 0 (batch must not launch)", got)
+	}
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Load(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Tasks[0].Status != state.StatusPending {
+		t.Errorf("durable task status = %s, want pending", loaded.Tasks[0].Status)
+	}
+}
+
+// TestNativeStageBatchedParentMkdir: all remote parents for the small-file
+// batches are created by one mkdir call before any rsync batch launches.
+func TestNativeStageBatchedParentMkdir(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("dir a/f1.txt", 10)
+	h.writeSrc("dir b/nested/f2.txt", 10)
+	post := h.writeManifest("post", manifestContent(
+		h.newFileRecord("dir a/f1.txt"), h.newFileRecord("dir b/nested/f2.txt")))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "exit=0")
+
+	run, err := Sync(context.Background(), h.config())
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if run.Status != state.StatusCompleted {
+		t.Fatalf("run status = %s (%q)", run.Status, run.Error)
+	}
+	invs := h.invocations()
+	var mkdirs []int
+	for i, inv := range invs {
+		if inv.Tool == "ssh" && strings.Contains(strings.Join(inv.Args, "\x00"), "mkdir -p") {
+			mkdirs = append(mkdirs, i)
+		}
+	}
+	if len(mkdirs) != 1 {
+		t.Fatalf("mkdir ssh calls = %d, want exactly 1", len(mkdirs))
+	}
+	script := invs[mkdirs[0]].Args[len(invs[mkdirs[0]].Args)-1]
+	if !strings.Contains(script, "'/data/dir a'") || !strings.Contains(script, "'/data/dir b/nested'") {
+		t.Errorf("mkdir script missing quoted parents: %q", script)
+	}
+	// mkdir happens before the first rsync batch.
+	firstRsync := -1
+	for i, inv := range invs {
+		if inv.Tool == "rsync" {
+			firstRsync = i
+			break
+		}
+	}
+	if firstRsync < 0 || mkdirs[0] > firstRsync {
+		t.Errorf("mkdir at invocation %d, first rsync at %d: mkdir must come first", mkdirs[0], firstRsync)
 	}
 }

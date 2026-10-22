@@ -113,6 +113,10 @@ const (
 	// EnvSignalFile, when set, receives the name of a caught cancellation
 	// signal; otherwise <record dir>/signal is used in environment style.
 	EnvSignalFile = "MOCKEXEC_SIGNAL_FILE"
+	// EnvTrackLog names a file receiving "start <pid>" when the helper is
+	// live and "end <pid>" before it exits, letting tests compute the
+	// maximum observed concurrency from the line interleaving.
+	EnvTrackLog = "MOCKEXEC_TRACK_LOG"
 	// EnvRole is set for spawned grandchildren; the value "grandchild"
 	// selects the grandchild behavior instead of normal helper behavior.
 	EnvRole = "MOCKEXEC_ROLE"
@@ -154,6 +158,7 @@ type behavior struct {
 	zeroExitSignal  string
 	readyFile       string
 	signalFile      string
+	trackLog        string
 }
 
 // RunHelper executes the configured mock behavior and returns the process
@@ -173,6 +178,10 @@ func RunHelper() int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mockexec: %v\n", err)
 		return 2
+	}
+	if bh.trackLog != "" {
+		appendLine(bh.trackLog, "start")
+		defer appendLine(bh.trackLog, "end")
 	}
 	if bh.ignoreTerm {
 		ignoreTerm()
@@ -235,6 +244,18 @@ func RunHelper() int {
 		// The signal may be caught or ignored; fall through to exit.
 	}
 	return bh.exit
+}
+
+// appendLine appends "<event> <pid>" to the track log with a single
+// O_APPEND write, so concurrent helpers never interleave a record.
+func appendLine(path, event string) {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mockexec: open track log: %v\n", err)
+		return
+	}
+	_, _ = fmt.Fprintf(f, "%s %d\n", event, os.Getpid())
+	_ = f.Close()
 }
 
 // signalPath returns where a caught signal should be recorded: the
@@ -378,6 +399,7 @@ func envBehavior() (behavior, error) {
 	bh.catchSignal = os.Getenv(EnvCatchSignal) != ""
 	bh.zeroExitSignal = os.Getenv(EnvZeroExitSignal)
 	bh.readyFile = os.Getenv(EnvReadyFile)
+	bh.trackLog = os.Getenv(EnvTrackLog)
 	bh.childPidDir = os.Getenv(EnvChildPidDir)
 	bh.childTouch = os.Getenv(EnvChildTouch)
 	bh.childIgnoreTerm = os.Getenv(EnvChildIgnoreTerm) != ""
@@ -427,6 +449,7 @@ func envBehavior() (behavior, error) {
 //	zero_exit_signal=TERM|INT  catch the signal, record it, exit 0
 //	signal_file=P    where a caught signal name is recorded
 //	ready_file=P     written once handlers and grandchildren are set up
+//	track_log=P      append "start <pid>"/"end <pid>" to P (concurrency tests)
 //	spawn_children=N start N grandchild processes before sleeping
 //	child_sleep_ms=N grandchild sleep (default 30000)
 //	child_touch=P    grandchild writes P after its sleep
@@ -508,6 +531,7 @@ func loadScript(path, tool string, nth int) (behavior, error) {
 	bh.zeroExitSignal = kv["zero_exit_signal"]
 	bh.readyFile = kv["ready_file"]
 	bh.signalFile = kv["signal_file"]
+	bh.trackLog = kv["track_log"]
 	bh.childPidDir = kv["child_pid_dir"]
 	bh.childTouch = kv["child_touch"]
 	bh.childIgnoreTerm = kv["child_ignore_term"] != ""

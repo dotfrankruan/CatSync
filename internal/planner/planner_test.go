@@ -17,7 +17,7 @@ func file(path string, size int64) discovery.Entry {
 }
 
 func allTools() Tools {
-	return Tools{Rsync: true, FPSync: true, FPart: true, MSCP: true}
+	return Tools{Rsync: true, MSCP: true}
 }
 
 func rsyncOnly() Tools {
@@ -74,22 +74,23 @@ func TestAutoChangedMetadataGoesRsync(t *testing.T) {
 }
 
 func TestAutoNewSmallFile(t *testing.T) {
-	tests := []struct {
+	// The native parallel-rsync small-file backend needs only rsync, so
+	// tool availability beyond rsync no longer influences the assignment.
+	for _, tc := range []struct {
 		name  string
 		tools Tools
-		want  state.Backend
 	}{
-		{"fpsync and fpart available", allTools(), state.BackendFPSync},
-		{"fpart missing", Tools{Rsync: true, FPSync: true, MSCP: true}, state.BackendRsync},
-		{"fpsync missing", Tools{Rsync: true, FPart: true, MSCP: true}, state.BackendRsync},
-		{"both missing", rsyncOnly(), state.BackendRsync},
-	}
-	for _, tc := range tests {
+		{"all tools", allTools()},
+		{"rsync only", rsyncOnly()},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dest := map[string]discovery.RemoteEntry{} // known-empty destination
 			d := decide(t, file("new.txt", 512), dest, Config{Backend: state.BackendAuto, Threshold: 1024, Tools: tc.tools})
-			if d.Status != StatusPending || d.Backend != tc.want {
-				t.Fatalf("decision = %+v, want pending %q", d, tc.want)
+			if d.Status != StatusPending || d.Backend != state.BackendFPSync {
+				t.Fatalf("decision = %+v, want pending %q", d, state.BackendFPSync)
+			}
+			if !strings.Contains(d.Reason, "native parallel rsync") {
+				t.Errorf("reason = %q, want the native backend named", d.Reason)
 			}
 		})
 	}
@@ -102,7 +103,7 @@ func TestAutoNewLargeFile(t *testing.T) {
 		want  state.Backend
 	}{
 		{"mscp available", allTools(), state.BackendMSCP},
-		{"mscp missing", Tools{Rsync: true, FPSync: true, FPart: true}, state.BackendRsync},
+		{"mscp missing", Tools{Rsync: true}, state.BackendRsync},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -177,7 +178,8 @@ func TestForcedFPSync(t *testing.T) {
 		"same.txt": {Path: "same.txt", Size: 5, ModTime: testMtime},
 		"diff.txt": {Path: "diff.txt", Size: 1, ModTime: testMtime},
 	}
-	cfg := Config{Backend: state.BackendFPSync, Threshold: 1024, Tools: Tools{Rsync: true, FPSync: true, FPart: true}}
+	// Forced fpsync is the native small-file backend; it needs only rsync.
+	cfg := Config{Backend: state.BackendFPSync, Threshold: 1024, Tools: Tools{Rsync: true}}
 	entries := []discovery.Entry{file("same.txt", 5), file("diff.txt", 5), file("new.txt", 10)}
 	res, err := Plan(entries, dest, cfg)
 	if err != nil {
@@ -192,18 +194,19 @@ func TestForcedFPSync(t *testing.T) {
 	}
 	for _, p := range []string{"diff.txt", "new.txt"} {
 		if got[p].Status != StatusPending || got[p].Backend != state.BackendFPSync {
-			t.Errorf("%s = %+v, want pending fpsync", p, got[p])
+			t.Errorf("%s = %+v, want pending fpsync (native parallel rsync)", p, got[p])
 		}
 	}
-	// Unknown destination state is fine for forced fpsync: fpsync drives
-	// rsync, which handles existing files safely.
+	// Unknown destination state is fine for forced fpsync: rsync handles
+	// existing files safely.
 	if d := decide(t, file("mystery.txt", 10), nil, cfg); d.Backend != state.BackendFPSync {
 		t.Errorf("unknown dest, small file: backend = %q, want fpsync", d.Backend)
 	}
 }
 
 func TestForcedFPSyncRejectsLarge(t *testing.T) {
-	cfg := Config{Backend: state.BackendFPSync, Threshold: 1024, Tools: Tools{Rsync: true, FPSync: true, FPart: true}}
+	// The native small-file backend needs no fpsync/fpart executables.
+	cfg := Config{Backend: state.BackendFPSync, Threshold: 1024, Tools: Tools{Rsync: true}}
 	entries := []discovery.Entry{file("small.txt", 1), file("big.bin", 1024), file("huge.bin", 4096)}
 	res, err := Plan(entries, map[string]discovery.RemoteEntry{}, cfg)
 	if err == nil {
@@ -290,11 +293,10 @@ func TestMissingTools(t *testing.T) {
 			}
 		})
 	}
-	if _, err := Plan(entries, dest, Config{Backend: state.BackendFPSync, Threshold: 1024, Tools: Tools{Rsync: true, FPart: true}}); err == nil {
-		t.Error("forced fpsync without fpsync succeeded")
-	}
-	if _, err := Plan(entries, dest, Config{Backend: state.BackendFPSync, Threshold: 1024, Tools: Tools{Rsync: true, FPSync: true}}); err == nil {
-		t.Error("forced fpsync without fpart succeeded")
+	// Forced fpsync is the native small-file backend: it needs no fpsync
+	// or fpart executables, only rsync.
+	if _, err := Plan(entries, dest, Config{Backend: state.BackendFPSync, Threshold: 1024, Tools: Tools{Rsync: true}}); err != nil {
+		t.Errorf("forced fpsync (native) without fpsync/fpart failed: %v", err)
 	}
 	if _, err := Plan(entries, dest, Config{Backend: state.BackendMSCP, Threshold: 1024, Tools: rsyncOnly()}); err == nil {
 		t.Error("forced mscp without mscp succeeded")
@@ -466,21 +468,18 @@ func TestNegativeSizeUnsupported(t *testing.T) {
 	}
 }
 
-// TestThresholdEdgeCases pins the at-or-above semantics and the fpsync
-// safety rule for thresholds that fpart cannot express: a threshold below 2
-// bytes disables the small-file stage (rsync fallback), and forced fpsync
-// with such a threshold is refused.
+// TestThresholdEdgeCases pins the at-or-above semantics of the native
+// parallel-rsync small-file backend: no fpart boundary workaround, no
+// minimum threshold, so zero-byte files are small whenever the threshold
+// is positive.
 func TestThresholdEdgeCases(t *testing.T) {
 	dest := map[string]discovery.RemoteEntry{}
 
-	t.Run("threshold one routes zero-byte files to rsync", func(t *testing.T) {
+	t.Run("threshold one keeps zero-byte files small", func(t *testing.T) {
 		cfg := Config{Backend: state.BackendAuto, Threshold: 1, Tools: allTools()}
 		d := decide(t, file("empty", 0), dest, cfg)
-		if d.Backend != state.BackendRsync || d.Status != StatusPending {
-			t.Errorf("size 0, threshold 1: %+v, want pending rsync fallback", d)
-		}
-		if !strings.Contains(d.Reason, "threshold below 2") {
-			t.Errorf("reason = %q, want the threshold explanation", d.Reason)
+		if d.Backend != state.BackendFPSync || d.Status != StatusPending {
+			t.Errorf("size 0, threshold 1: %+v, want pending fpsync (native)", d)
 		}
 		// A 1-byte file is at the threshold: large, so mscp.
 		if d := decide(t, file("one-byte", 1), dest, cfg); d.Backend != state.BackendMSCP {
@@ -516,12 +515,15 @@ func TestThresholdEdgeCases(t *testing.T) {
 		}
 	})
 
-	t.Run("forced fpsync rejects a threshold below two", func(t *testing.T) {
-		for _, threshold := range []uint64{0, 1} {
-			cfg := Config{Backend: state.BackendFPSync, Threshold: threshold, Tools: allTools()}
-			if _, err := Plan([]discovery.Entry{file("f", 10)}, dest, cfg); err == nil {
-				t.Errorf("forced fpsync, threshold %d: plan succeeded, want refusal", threshold)
-			}
+	t.Run("forced fpsync has no minimum threshold", func(t *testing.T) {
+		// With the native backend there is no fpart -s mapping, so any
+		// threshold is valid; the per-file at-or-above rule still applies.
+		cfg := Config{Backend: state.BackendFPSync, Threshold: 1, Tools: Tools{Rsync: true}}
+		if d := decide(t, file("zero", 0), dest, cfg); d.Backend != state.BackendFPSync {
+			t.Errorf("forced fpsync, zero-byte file: %+v, want pending fpsync", d)
+		}
+		if _, err := Plan([]discovery.Entry{file("one", 1)}, dest, cfg); err == nil {
+			t.Error("forced fpsync accepted an at-threshold file, want refusal")
 		}
 	})
 }

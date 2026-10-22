@@ -6,8 +6,9 @@
 // the large-file threshold, the requested backend, and tool availability:
 //
 //   - unchanged size and mtime:        skipped (no transfer)
-//   - new file below the threshold:    fpsync when fpsync+fpart are
-//     available, otherwise rsync
+//   - new file below the threshold:    BackendFPSync, the native parallel
+//     rsync small-file stage (the backend name is kept for compatibility
+//     with existing runs; no external fpsync or fpart process is used)
 //   - new file at or above threshold:  mscp when available, otherwise rsync
 //   - existing/modified/unknown file:  rsync
 //   - symlink, special, or scan error: unsupported (explicit)
@@ -23,9 +24,9 @@
 // Forced backends must preserve the safety policy or fail: a forced mscp
 // rejects files that exist at the destination or whose destination state is
 // unknown (mscp writes only files confirmed absent), and a forced fpsync
-// rejects files at or above the large threshold. Rejections abort planning
-// with an error naming the offending paths. Duplicate source paths are
-// likewise fatal.
+// (the native parallel-rsync small-file backend) rejects files at or above
+// the large threshold. Rejections abort planning with an error naming the
+// offending paths. Duplicate source paths are likewise fatal.
 package planner
 
 import (
@@ -59,37 +60,11 @@ const (
 // Tools reports which external transfer tools are available.
 type Tools struct {
 	// Rsync is the required correctness fallback; planning fails without
-	// it, as every fallback path lands on rsync.
+	// it, as every fallback path lands on rsync and the native parallel
+	// small-file stage drives rsync directly.
 	Rsync bool
-	// FPSync is the optional parallel small-file backend.
-	FPSync bool
-	// FPart is the partitioning helper fpsync drives; fpsync is usable
-	// only when both are present.
-	FPart bool
 	// MSCP is the optional parallel large-file backend.
 	MSCP bool
-}
-
-// FPSyncCompatible reports whether fpsync can be used: it drives fpart, so
-// both must be available.
-func (t Tools) FPSyncCompatible() bool { return t.FPSync && t.FPart }
-
-// FPSyncMinThreshold is the smallest large-file threshold fpsync can
-// reproduce without breaking the planner's ownership boundary.
-//
-// fpart's -S skips only files strictly larger than its -s partition limit,
-// while the planner treats a file at or above the threshold as large.
-// CatSync therefore runs fpsync with -s (threshold - 1), which makes the
-// tool boundary match exactly. That needs a threshold of at least 2 bytes:
-// fpart rejects -s 0, and any other value would let at-or-above-threshold
-// files into the small-file stage, where mscp/rsync also own them.
-const FPSyncMinThreshold = 2
-
-// FPSyncUsable reports whether the fpsync small-file stage can safely
-// carry the below-threshold files: both tools must exist and the threshold
-// must be expressible as fpart's -s limit (see FPSyncMinThreshold).
-func (c *Config) FPSyncUsable() bool {
-	return c.Tools.FPSyncCompatible() && c.Threshold >= FPSyncMinThreshold
 }
 
 // Config is one planning request.
@@ -97,10 +72,7 @@ type Config struct {
 	// Backend is the requested backend: auto or a concrete backend.
 	Backend state.Backend
 	// Threshold is the size in bytes at which a file counts as large; a
-	// file of exactly Threshold bytes is large. fpsync is only usable
-	// when the threshold is at least FPSyncMinThreshold, because fpart's
-	// skip-big boundary is strictly-greater and must be shifted by one to
-	// match this at-or-above semantics.
+	// file of exactly Threshold bytes is large.
 	Threshold uint64
 	// Tools reports external tool availability.
 	Tools Tools
@@ -115,14 +87,8 @@ func (c *Config) validate() error {
 	if !c.Tools.Rsync {
 		return errors.New("planner: rsync is required but not available")
 	}
+	// The native small-file stage needs only rsync, which is required above.
 	switch c.Backend {
-	case state.BackendFPSync:
-		if !c.Tools.FPSyncCompatible() {
-			return errors.New("planner: backend fpsync requested but fpsync and fpart are not both available")
-		}
-		if c.Threshold < FPSyncMinThreshold {
-			return fmt.Errorf("planner: backend fpsync requires a large threshold of at least %d bytes; fpart cannot exclude at-or-above-threshold files with a smaller -s limit", FPSyncMinThreshold)
-		}
 	case state.BackendMSCP:
 		if !c.Tools.MSCP {
 			return errors.New("planner: backend mscp requested but mscp is not available")
@@ -256,12 +222,12 @@ func planFile(d *Decision, e discovery.Entry, dest map[string]discovery.RemoteEn
 			*rejected = append(*rejected, e.Path)
 			d.Status = StatusUnsupported
 			d.Backend = state.BackendRsync
-			d.Reason = "forced fpsync refuses files at or above the large threshold"
+			d.Reason = "forced fpsync (native parallel rsync) refuses files at or above the large threshold"
 			return
 		}
 		d.Status = StatusPending
 		d.Backend = state.BackendFPSync
-		d.Reason = "forced fpsync"
+		d.Reason = "forced fpsync (native parallel rsync)"
 	case state.BackendMSCP:
 		if !isNew {
 			*rejected = append(*rejected, e.Path)
@@ -287,17 +253,10 @@ func planAuto(d *Decision, e discovery.Entry, dest map[string]discovery.RemoteEn
 	d.Status = StatusPending
 	switch {
 	case isNew && !large:
-		switch {
-		case cfg.FPSyncUsable():
-			d.Backend = state.BackendFPSync
-			d.Reason = "new file below threshold: fpsync"
-		case !cfg.Tools.FPSyncCompatible():
-			d.Backend = state.BackendRsync
-			d.Reason = "new file below threshold: fpsync/fpart unavailable, rsync fallback"
-		default:
-			d.Backend = state.BackendRsync
-			d.Reason = "new file below threshold: threshold below 2 bytes, fpsync cannot exclude at-or-above-threshold files, rsync fallback"
-		}
+		// The native small-file stage is always usable: it drives rsync,
+		// which is a required tool.
+		d.Backend = state.BackendFPSync
+		d.Reason = "new file below threshold: native parallel rsync"
 	case isNew && large:
 		if cfg.Tools.MSCP {
 			d.Backend = state.BackendMSCP

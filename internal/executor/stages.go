@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,9 +14,9 @@ import (
 	"sync"
 
 	"github.com/frankruan/catsync/internal/backend"
-	"github.com/frankruan/catsync/internal/backend/fpsync"
 	"github.com/frankruan/catsync/internal/backend/mscp"
 	"github.com/frankruan/catsync/internal/backend/rsync"
+	"github.com/frankruan/catsync/internal/partition"
 	"github.com/frankruan/catsync/internal/state"
 	"github.com/frankruan/catsync/internal/target"
 )
@@ -36,204 +37,266 @@ func (e *Executor) stageVerifyNone() bool {
 	return e.run.Config.Verify == state.VerifyNone
 }
 
-// fpsyncStage runs the parallel small-file stage. fpsync always sees the
-// whole source tree; files at or above the size threshold are skipped by
-// fpart's -S and reported as S records, and each skipped path must be owned
-// by another backend (or need no transfer), otherwise the stage fails
-// loudly instead of silently dropping data.
-func (e *Executor) fpsyncStage(ctx context.Context) error {
+// batchOutcome is one batch's result in the native small-file stage. The
+// results slice is indexed by batch, so aggregation and logging follow
+// batch order, never goroutine completion order.
+type batchOutcome struct {
+	started   bool
+	cancelled bool
+	stderr    string
+	err       error
+}
+
+// smallFileStage runs the native parallel-rsync small-file stage: the
+// pending BackendFPSync tasks are packed into deterministic disjoint
+// batches, and up to Config.Jobs rsync processes run concurrently, each
+// transferring one batch via --files-from over NUL-delimited stdin. No
+// external fpsync or fpart process is used; "fpsync" is kept only as the
+// persisted backend name for compatibility with existing runs.
+func (e *Executor) smallFileStage(ctx context.Context) error {
 	idxs := e.pendingTasks(state.BackendFPSync)
 	if len(idxs) == 0 {
 		return nil
 	}
-	if !e.detectTools().FPSyncCompatible() {
+	if err := e.requireSSH(); err != nil {
 		for _, i := range idxs {
-			if err := e.failTask(&e.run.Tasks[i], "fpsync or fpart is no longer available; start a new run to replan"); err != nil {
-				return err
-			}
-		}
-		return errors.New("fpsync or fpart unavailable")
-	}
-	// The fpart partition limit is shifted by one so fpart's skip-big
-	// boundary is exactly "size >= large threshold". Thresholds below 2
-	// cannot express that boundary in fpart; the planner never assigns
-	// fpsync tasks for them, but a resumed run recorded by an older build
-	// (or a corrupted plan) must fail loudly instead of letting fpsync
-	// copy files that another backend owns.
-	partitionLimit, err := fpsync.LimitForThreshold(e.run.Config.LargeThreshold)
-	if err != nil {
-		for _, i := range idxs {
-			if ferr := e.failTask(&e.run.Tasks[i], fmt.Sprintf("%v; start a new run to replan", err)); ferr != nil {
+			if ferr := e.failTask(&e.run.Tasks[i], fmt.Sprintf("ssh is not available: %v", err)); ferr != nil {
 				return ferr
 			}
 		}
 		return err
 	}
+	if !e.detectTools().Rsync {
+		for _, i := range idxs {
+			if err := e.failTask(&e.run.Tasks[i], "rsync is not available"); err != nil {
+				return err
+			}
+		}
+		return errors.New("rsync unavailable")
+	}
 
-	// Revalidate every small file immediately before the stage.
-	var active []*state.Task
+	// Pack deterministically from the recorded plan order and sizes; the
+	// same inputs always produce the same batches, so a resumed run
+	// rebuilds equivalent batches from its pending tasks.
+	byPath := make(map[string]*state.Task, len(idxs))
+	var items []partition.Item
 	for _, i := range idxs {
 		t := &e.run.Tasks[i]
-		ok, rerr := e.recheckBefore(t)
-		if rerr != nil {
-			return rerr
+		byPath[t.Path] = t
+		items = append(items, partition.Item{Path: t.Path, Size: t.Size})
+	}
+	batches, err := partition.Pack(items, partition.Config{
+		MaxFiles: DefaultFilesPerPartition,
+		MaxBytes: e.run.Config.LargeThreshold,
+	})
+	if err != nil {
+		for _, i := range idxs {
+			if ferr := e.failTask(&e.run.Tasks[i], fmt.Sprintf("partition small files: %v", err)); ferr != nil {
+				return ferr
+			}
+		}
+		return fmt.Errorf("executor: partition small files: %w", err)
+	}
+
+	// Create every remote parent directory once, before any batch starts:
+	// batches share parents, and --no-implied-dirs assumes they exist.
+	parents := map[string]struct{}{}
+	for _, it := range items {
+		if slash := strings.LastIndexByte(it.Path, '/'); slash >= 0 {
+			parents[targetRemoteJoin(e.run.Destination.Path, it.Path[:slash])] = struct{}{}
+		}
+	}
+	if len(parents) > 0 {
+		dirs := make([]string, 0, len(parents))
+		for d := range parents {
+			dirs = append(dirs, d)
+		}
+		sort.Strings(dirs)
+		if err := e.mkdirRemoteParents(ctx, e.destTarget(), e.run.Config.IPv6, dirs); err != nil {
+			for _, i := range idxs {
+				if ferr := e.failTask(&e.run.Tasks[i], fmt.Sprintf("create remote parent directories: %v", err)); ferr != nil {
+					return ferr
+				}
+			}
+			return err
+		}
+	}
+
+	jobs := e.run.Config.Jobs
+	if jobs > len(batches) {
+		jobs = len(batches)
+	}
+	e.logf("stage parallel-rsync: %d small file(s), %d batch(es), up to %d concurrent rsync process(es)",
+		len(items), len(batches), jobs)
+
+	// stageCtx lets the first unrecoverable batch failure cancel the
+	// remaining in-flight batches and stop new launches.
+	stageCtx, cancelStage := context.WithCancel(ctx)
+	defer cancelStage()
+	var cancelOnce sync.Once
+
+	results := make([]batchOutcome, len(batches))
+
+	sem := make(chan struct{}, jobs)
+	var wg sync.WaitGroup
+launch:
+	for bi := range batches {
+		select {
+		case sem <- struct{}{}:
+		case <-stageCtx.Done():
+			break launch
+		}
+		wg.Add(1)
+		go func(bi int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			results[bi] = e.runSmallBatch(ctx, stageCtx, batches[bi], byPath)
+			if results[bi].err != nil {
+				// First failure wins: cancel the rest of the stage.
+				cancelOnce.Do(cancelStage)
+			}
+		}(bi)
+	}
+	wg.Wait()
+
+	// Deterministic aggregation: report batch diagnostics in batch order,
+	// never in goroutine completion order.
+	var errs []string
+	for bi, r := range results {
+		if !r.started {
+			continue
+		}
+		if r.stderr != "" {
+			e.warnf("parallel-rsync batch %d/%d stderr:\n%s", bi+1, len(results), r.stderr)
+		}
+		if r.err != nil {
+			errs = append(errs, fmt.Sprintf("batch %d/%d: %v", bi+1, len(results), r.err))
+		}
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// runSmallBatch executes one batch of the native small-file stage: per-task
+// source revalidation, durable running intent, one rsync invocation, then
+// per-task post-checks. ctx is the caller's context; stageCtx is cancelled
+// when the stage is torn down early.
+func (e *Executor) runSmallBatch(ctx, stageCtx context.Context, batch partition.Batch, byPath map[string]*state.Task) (out batchOutcome) {
+	out.started = true
+
+	// 1. Revalidate each source file immediately before this batch starts,
+	// catching changes that happened while the batch waited for a slot.
+	active := make([]*state.Task, 0, len(batch.Items))
+	for _, it := range batch.Items {
+		t := byPath[it.Path]
+		ok, err := e.recheckBefore(t)
+		if err != nil {
+			out.err = err
+			return out
 		}
 		if ok {
 			active = append(active, t)
 		}
 	}
 	if len(active) == 0 {
-		return errors.New("all fpsync tasks failed source revalidation")
+		// Every task in this batch failed its pre-check (already recorded
+		// as failed); no subprocess runs.
+		return out
 	}
 
-	stateDir, err := e.fpsyncStateDir()
-	if err != nil {
-		return err
-	}
-	cfg := fpsync.Config{
-		Program:           e.progs.fpsync(),
-		SourceDir:         e.run.Source.Path,
-		Dest:              e.destTarget(),
-		Jobs:              e.run.Config.Jobs,
-		FilesPerPartition: DefaultFilesPerPartition,
-		// fpart -S skips size > limit, so limit = threshold-1 keeps
-		// at-or-above-threshold files out of this stage's writes.
-		Threshold: partitionLimit,
-		StateDir:  stateDir,
-		Env:       e.cfg.Env,
-		Stderr:    e.stderr,
-	}
-
-	// Persist every task's running intent before launching. If any save
-	// fails, no subprocess is started; tasks already marked running are
-	// recovered as pending by interruption handling.
+	// 2. Persist the running intent of every task in the batch before the
+	// subprocess launches. A save failure aborts the batch.
 	for _, t := range active {
 		if err := e.markRunning(t); err != nil {
-			return err
-		}
-	}
-	e.logf("stage fpsync: %d file(s) below %d bytes (fpart -s %d)", len(active), e.run.Config.LargeThreshold, partitionLimit)
-
-	// Resume only when the recorded run metadata and its on-disk state
-	// directory are both still valid; otherwise start a fresh fpsync run.
-	e.runMu.Lock()
-	prevOutput := e.run.FPSyncOutput
-	e.runMu.Unlock()
-	var res *fpsync.Result
-	if e.run.FPSyncRunID != "" && dirExists(stateDir) {
-		res, err = cfg.Resume(ctx, e.run.FPSyncRunID)
-	} else {
-		if e.run.FPSyncRunID != "" {
-			e.warnf("fpsync state directory %s is gone; starting a fresh fpsync run", stateDir)
-		}
-		res, err = cfg.Run(ctx)
-	}
-	// Persist the resume artifacts before anything else, success or
-	// failure: an interrupted run needs them. A failed save is reported but
-	// does not hide the transfer error below.
-	var artifactErr error
-	if res != nil {
-		e.runMu.Lock()
-		if res.RunID != "" {
-			e.run.FPSyncRunID = res.RunID
-		}
-		e.run.FPSyncStateDir = stateDir
-		if res.OutputPath != "" {
-			e.run.FPSyncOutput = res.OutputPath
-		}
-		e.runMu.Unlock()
-		if serr := e.saveRun(); serr != nil {
-			artifactErr = serr
-			e.warnf("save fpsync run artifacts: %v", serr)
-		}
-	}
-	if err != nil {
-		if ctx.Err() == nil {
-			for _, t := range active {
-				if ferr := e.failTask(t, fmt.Sprintf("fpsync failed: %v", err)); ferr != nil {
-					return ferr
-				}
-			}
-		}
-		if artifactErr != nil {
-			return fmt.Errorf("%w (also failed to record fpsync run artifacts: %v)", err, artifactErr)
-		}
-		return err
-	}
-	if artifactErr != nil {
-		return artifactErr
-	}
-
-	// On resume fpsync reports no S records again; re-verify the original
-	// run's preserved output instead.
-	skipped := res.Skipped
-	if len(skipped) == 0 && prevOutput != "" && prevOutput != res.OutputPath {
-		if data, rerr := os.ReadFile(prevOutput); rerr == nil {
-			_, skipped = fpsync.ParseOutput(string(data))
-		}
-	}
-	var orphans []string
-	for _, s := range skipped {
-		ot := e.taskByPath(s.Path)
-		switch {
-		case ot == nil:
-			// A file that appeared after planning and is too large for
-			// this stage: it has no owner, so it must not pass silently.
-			orphans = append(orphans, s.Path)
-		case ot.Status == state.StatusSkipped || ot.Status == state.StatusUnsupported:
-			// Unchanged or untransferable: needs no other owner.
-		case ot.Backend == state.BackendFPSync:
-			if ferr := e.failTask(ot, "file grew to or past the large threshold during the run; start a new run"); ferr != nil {
-				return ferr
-			}
-		default:
-			// Owned by mscp or rsync as planned.
+			out.err = err
+			return out
 		}
 	}
 
+	// 3. One rsync invocation with the batch's NUL-delimited file list,
+	// capturing output per batch (never into a shared buffer).
+	paths := make([]string, 0, len(active))
 	for _, t := range active {
-		e.runMu.Lock()
-		still := t.Status == state.StatusRunning
-		e.runMu.Unlock()
-		if !still {
-			continue
+		paths = append(paths, t.Path)
+	}
+	var stdout, stderr bytes.Buffer
+	cfg := rsync.Config{
+		Program:       e.progs.rsync(),
+		SourceDir:     e.run.Source.Path,
+		Dest:          e.destTarget(),
+		SSH:           e.sshOpts(e.run.Config.IPv6),
+		Paths:         paths,
+		NoImpliedDirs: true,
+		Env:           e.cfg.Env,
+		Stdout:        &stdout,
+		Stderr:        &stderr,
+	}
+	if err := cfg.Run(stageCtx); err != nil {
+		out.stderr = stderr.String()
+		if stageCtx.Err() != nil {
+			// Cancelled by the caller or by a sibling batch failure: the
+			// tasks were not transferred, so they return to pending.
+			msg := "interrupted: catsync stopped before finishing; safe to resume"
+			if ctx.Err() == nil {
+				msg = "cancelled: another small-file batch failed; safe to resume"
+			}
+			if rerr := e.revertToPending(active, msg); rerr != nil {
+				out.err = rerr
+				return out
+			}
+			out.cancelled = true
+			return out
 		}
+		for _, t := range active {
+			if ferr := e.failTask(t, fmt.Sprintf("rsync batch failed: %v", err)); ferr != nil {
+				out.err = ferr
+				return out
+			}
+		}
+		out.err = fmt.Errorf("rsync batch failed: %w", err)
+		return out
+	}
+	out.stderr = stderr.String()
+
+	// 4. Post-transfer source revalidation per task; verification=none
+	// completes the task, otherwise it stays running for the batched
+	// verification stage.
+	for _, t := range active {
 		ok, rerr := e.recheckAfter(t)
 		if rerr != nil {
-			return rerr
+			out.err = rerr
+			return out
 		}
 		if !ok {
 			continue
 		}
 		if e.stageVerifyNone() {
 			if cerr := e.completeTask(t); cerr != nil {
-				return cerr
+				out.err = cerr
+				return out
 			}
 		}
 	}
-	if len(orphans) > 0 {
-		return fmt.Errorf("fpsync skipped %d large file(s) with no owning backend (new files appeared mid-run?): %s",
-			len(orphans), strings.Join(quoteAll(orphans, 5), ", "))
-	}
-	return nil
+	return out
 }
 
-// fpsyncStateDir returns the persistent fpsync -t directory: the recorded
-// one on resume, otherwise a fresh per-state-dir location.
-func (e *Executor) fpsyncStateDir() (string, error) {
-	if e.run.FPSyncStateDir != "" {
-		return e.run.FPSyncStateDir, nil
+// revertToPending returns running tasks to pending with a cancellation
+// note, persisting the transition once for the whole batch.
+func (e *Executor) revertToPending(tasks []*state.Task, msg string) error {
+	e.runMu.Lock()
+	for _, t := range tasks {
+		if t.Status == state.StatusRunning {
+			t.Status = state.StatusPending
+			t.Error = msg
+		}
 	}
-	abs, err := filepath.Abs(e.cfg.StateDir)
-	if err != nil {
-		return "", fmt.Errorf("executor: resolve state directory: %w", err)
-	}
-	return filepath.Join(abs, "fpsync"), nil
-}
-
-func dirExists(p string) bool {
-	fi, err := os.Stat(p)
-	return err == nil && fi.IsDir()
+	e.runMu.Unlock()
+	return e.saveRun()
 }
 
 func quoteAll(paths []string, max int) []string {

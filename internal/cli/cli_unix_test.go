@@ -129,11 +129,6 @@ exit=0
 `)
 }
 
-const fpsyncOK = `1792333896 Info: Fpsync started (pid: 74154)
-1792333896 Info: Run ID: 1792333896-74154
-1792333897 Info: Fpsync stopped (with success)
-`
-
 // TestCLISyncEndToEnd drives the whole CLI with mock tools: sync completes
 // and status then reports the persisted run.
 func TestCLISyncEndToEnd(t *testing.T) {
@@ -142,7 +137,7 @@ func TestCLISyncEndToEnd(t *testing.T) {
 	h.writeSrc("big.bin", 2048)
 	post := h.writeManifest("post", h.record("small.txt")+h.record("big.bin"))
 	h.scriptFreshDestSSH(post)
-	h.writeScript("fpsync", "stdout_file="+h.writeManifest("fpsync.out", fpsyncOK+"S\t2048\t./big.bin\n"))
+	h.writeScript("rsync", "exit=0")
 	h.writeScript("mscp", "touch_flag=-W")
 
 	code, stdout, stderr := run(t, "sync", "--state-dir", h.stateDir,
@@ -153,16 +148,20 @@ func TestCLISyncEndToEnd(t *testing.T) {
 	if !strings.Contains(stdout, "run ") || !strings.Contains(stdout, "completed") {
 		t.Errorf("sync stdout missing the run summary:\n%s", stdout)
 	}
-	if len(h.invocations("fpsync")) != 1 || len(h.invocations("mscp")) != 1 {
-		t.Errorf("invocations: fpsync=%d mscp=%d, want 1 each",
-			len(h.invocations("fpsync")), len(h.invocations("mscp")))
+	if len(h.invocations("fpsync")) != 0 || len(h.invocations("fpart")) != 0 {
+		t.Errorf("external fpsync/fpart invoked: fpsync=%d fpart=%d, want 0",
+			len(h.invocations("fpsync")), len(h.invocations("fpart")))
+	}
+	if len(h.invocations("rsync")) != 1 || len(h.invocations("mscp")) != 1 {
+		t.Errorf("invocations: rsync=%d mscp=%d, want 1 each",
+			len(h.invocations("rsync")), len(h.invocations("mscp")))
 	}
 
 	code, stdout, stderr = run(t, "status", "--state-dir", h.stateDir)
 	if code != ExitOK {
 		t.Fatalf("status exit = %d, stderr:\n%s", code, stderr)
 	}
-	for _, want := range []string{"completed", "fpsync 1, mscp 1, rsync 0", "user@host:/data"} {
+	for _, want := range []string{"completed", "native-small 1, mscp 1, rsync 0", "user@host:/data"} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("status output missing %q:\n%s", want, stdout)
 		}
@@ -193,7 +192,7 @@ func TestCLIPlanPrintsSummary(t *testing.T) {
 			t.Errorf("plan output missing %q:\n%s", want, stdout)
 		}
 	}
-	if got := len(h.invocations("rsync")) + len(h.invocations("fpsync")) + len(h.invocations("mscp")); got != 0 {
+	if got := len(h.invocations("rsync")) + len(h.invocations("fpsync")) + len(h.invocations("mscp")) + len(h.invocations("fpart")); got != 0 {
 		t.Errorf("plan invoked %d transfer processes, want 0", got)
 	}
 }
@@ -454,7 +453,7 @@ func TestCLIInterspersedArgsEndToEnd(t *testing.T) {
 	h.writeSrc("big.bin", 2048)
 	post := h.writeManifest("post", h.record("small.txt")+h.record("big.bin"))
 	h.scriptFreshDestSSH(post)
-	h.writeScript("fpsync", "stdout_file="+h.writeManifest("fpsync.out", fpsyncOK+"S\t2048\t./big.bin\n"))
+	h.writeScript("rsync", "exit=0")
 	h.writeScript("mscp", "touch_flag=-W")
 
 	// Every option trails the operands.
