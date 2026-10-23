@@ -105,6 +105,11 @@ func (e *Executor) nativeLargeStage(ctx context.Context) error {
 	// the server cannot publish without clobbering.
 	hardlinkOK, probeErr := e.probeHardlink(ctx)
 	if probeErr != nil {
+		if ctx.Err() != nil {
+			// Cancelled during the probe: never rewrite task ownership
+			// while the run is being torn down.
+			return ctx.Err()
+		}
 		e.warnf("native-large: hardlink capability probe failed: %v (tasks keep their checkpoints and stay resumable)", probeErr)
 	}
 	if !hardlinkOK {
@@ -243,6 +248,15 @@ func (e *Executor) nativeLargeTask(ctx context.Context, t *state.Task, ckptDir s
 
 	var result *multistream.TransferResult
 	if fileExists(checkpoint) {
+		// The checkpoint is a contract: its bound source relative path must
+		// be this task's path, or a stale/foreign checkpoint is refused.
+		ck, lerr := multistream.LoadCheckpoint(checkpoint)
+		if lerr != nil {
+			return e.failTask(t, fmt.Sprintf("load native checkpoint: %v", lerr))
+		}
+		if ck.Source != t.Path {
+			return e.failTask(t, fmt.Sprintf("native checkpoint is bound to source %q, not %q; refusing to resume", ck.Source, t.Path))
+		}
 		result, err = multistream.Resume(ctx, sourceAbs, checkpoint, remoteFinal, opts)
 		if errors.Is(err, multistream.ErrRemoteTempMissing) {
 			// The recorded transfer never created its temp (it failed

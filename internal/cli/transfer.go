@@ -246,7 +246,7 @@ func printRunStatus(w io.Writer, run *state.Run, verbose bool) {
 	if n := counts[state.StatusUnsupported]; n > 0 {
 		fmt.Fprintf(w, "  unsupported: %d (NOT transferred: symlinks, special files, or scan errors)\n", n)
 	}
-	fmt.Fprintf(w, "  backends:    native-small %d, mscp %d, rsync %d\n",
+	fmt.Fprintf(w, "  backends:    native-small %d, native-large (mscp) %d, rsync %d\n",
 		byBackend[state.BackendFPSync], byBackend[state.BackendMSCP], byBackend[state.BackendRsync])
 	if run.FPSyncRunID != "" {
 		// Legacy runs recorded an external-fpsync run id; the native
