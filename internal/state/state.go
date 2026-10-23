@@ -22,10 +22,37 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 )
+
+// Direction records which endpoint owns the source data. The empty value
+// is accepted only for backward compatibility with schema-v1 upload runs.
+type Direction string
+
+const (
+	DirectionLocalToRemote Direction = "local-to-remote"
+	DirectionRemoteToLocal Direction = "remote-to-local"
+)
+
+// Effective returns the direction used by execution. Runs created before
+// the direction field existed are uploads.
+func (d Direction) Effective() Direction {
+	if d == "" {
+		return DirectionLocalToRemote
+	}
+	return d
+}
+
+func (d Direction) valid() bool {
+	switch d {
+	case "", DirectionLocalToRemote, DirectionRemoteToLocal:
+		return true
+	}
+	return false
+}
 
 // SchemaVersion is the on-disk schema version written by Save and the only
 // version Load accepts, so an incompatible future format is never
@@ -112,6 +139,9 @@ const (
 // Config is the transfer configuration recorded with a run. It is immutable
 // for the life of the run so resume reproduces the original behavior.
 type Config struct {
+	// Direction is local-to-remote or remote-to-local. Empty means a legacy
+	// local-to-remote run written before this additive field existed.
+	Direction Direction `json:"direction,omitempty"`
 	// Backend is the requested backend selection (auto or concrete).
 	Backend Backend `json:"backend"`
 	// DryRun records a plan-only run that transfers nothing.
@@ -130,6 +160,9 @@ type Config struct {
 
 // validate checks the configuration invariants.
 func (c *Config) validate() error {
+	if !c.Direction.valid() {
+		return fmt.Errorf("invalid direction %q", c.Direction)
+	}
 	if !c.Backend.Valid() {
 		return fmt.Errorf("invalid backend %q", c.Backend)
 	}
@@ -147,13 +180,19 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// Source describes the local tree a run transfers.
+// Source describes the tree a run transfers. User and Host are populated
+// only for a remote-to-local run.
 type Source struct {
-	// Path is the absolute local source directory.
+	User string `json:"user,omitempty"`
+	Host string `json:"host,omitempty"`
 	Path string `json:"path"`
 }
 
-// Destination describes the remote tree a run writes to.
+// String renders the source endpoint.
+func (s Source) String() string { return endpointString(s.User, s.Host, s.Path) }
+
+// Destination describes the tree a run writes to. User and Host are empty
+// for a remote-to-local run whose destination is an absolute local path.
 type Destination struct {
 	// User is the optional remote user name; empty means the SSH default.
 	User string `json:"user,omitempty"`
@@ -167,17 +206,23 @@ type Destination struct {
 // containing a colon) are bracketed, whether or not the stored host already
 // carries brackets, so equal destinations always produce equal strings.
 func (d Destination) String() string {
-	host := d.Host
+	return endpointString(d.User, d.Host, d.Path)
+}
+
+func endpointString(user, host, path string) string {
+	if host == "" {
+		return path
+	}
 	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
 		host = host[1 : len(host)-1]
 	}
 	if strings.Contains(host, ":") {
 		host = "[" + host + "]"
 	}
-	if d.User != "" {
-		return d.User + "@" + host + ":" + d.Path
+	if user != "" {
+		return user + "@" + host + ":" + path
 	}
-	return host + ":" + d.Path
+	return host + ":" + path
 }
 
 // Task is the per-file unit of work recorded in a run.
@@ -288,11 +333,8 @@ func (r *Run) validate() error {
 	if !r.Status.Valid() {
 		return fmt.Errorf("state: run %s: invalid status %q", r.ID, r.Status)
 	}
-	if r.Source.Path == "" {
-		return fmt.Errorf("state: run %s: source path is empty", r.ID)
-	}
-	if r.Destination.Host == "" || r.Destination.Path == "" {
-		return fmt.Errorf("state: run %s: destination host and path are required", r.ID)
+	if err := validateEndpoints(r.Config.Direction.Effective(), r.Source, r.Destination); err != nil {
+		return fmt.Errorf("state: run %s: %w", r.ID, err)
 	}
 	if r.WorkDir == "" {
 		return fmt.Errorf("state: run %s: working directory is empty", r.ID)
@@ -307,6 +349,28 @@ func (r *Run) validate() error {
 		if err := r.Tasks[i].validate(); err != nil {
 			return fmt.Errorf("state: run %s: task %d (%s): %w", r.ID, i, r.Tasks[i].Path, err)
 		}
+	}
+	return nil
+}
+
+func validateEndpoints(direction Direction, source Source, destination Destination) error {
+	switch direction {
+	case DirectionLocalToRemote:
+		if source.Host != "" || source.User != "" || source.Path == "" || !filepath.IsAbs(source.Path) {
+			return errors.New("local-to-remote source must be an absolute local path")
+		}
+		if destination.Host == "" || destination.Path == "" || !strings.HasPrefix(destination.Path, "/") {
+			return errors.New("local-to-remote destination must be an absolute remote endpoint")
+		}
+	case DirectionRemoteToLocal:
+		if source.Host == "" || source.Path == "" || !strings.HasPrefix(source.Path, "/") {
+			return errors.New("remote-to-local source must be an absolute remote endpoint")
+		}
+		if destination.Host != "" || destination.User != "" || destination.Path == "" || !filepath.IsAbs(destination.Path) {
+			return errors.New("remote-to-local destination must be an absolute local path")
+		}
+	default:
+		return fmt.Errorf("invalid direction %q", direction)
 	}
 	return nil
 }

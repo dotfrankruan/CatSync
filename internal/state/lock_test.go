@@ -108,11 +108,25 @@ func TestLockIncompleteDestination(t *testing.T) {
 	for _, d := range []state.Destination{
 		{},
 		{Host: "example.com"},
-		{Path: "/data"},
+		{Path: "relative"},
+		{User: "alice", Path: "/data"},
 	} {
 		if _, err := s.LockDestination(d); err == nil {
 			t.Errorf("LockDestination(%+v) = nil, want error", d)
 		}
+	}
+}
+
+func TestLockLocalDestination(t *testing.T) {
+	s := newStore(t)
+	dest := state.Destination{Path: filepath.Join(t.TempDir(), "download")}
+	lock, err := s.LockDestination(dest)
+	if err != nil {
+		t.Fatalf("LockDestination(local): %v", err)
+	}
+	defer lock.Unlock()
+	if _, err := s.LockDestination(dest); !errors.Is(err, state.ErrLocked) {
+		t.Fatalf("second local lock = %v, want ErrLocked", err)
 	}
 }
 

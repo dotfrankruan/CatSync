@@ -115,6 +115,38 @@ func TestDestinationStringCanonical(t *testing.T) {
 	}
 }
 
+func TestBidirectionalEndpointStrings(t *testing.T) {
+	remote := state.Source{User: "alice", Host: "2001:db8::1", Path: "/source"}
+	if got := remote.String(); got != "alice@[2001:db8::1]:/source" {
+		t.Fatalf("remote source String() = %q", got)
+	}
+	local := state.Destination{Path: "/tmp/download"}
+	if got := local.String(); got != "/tmp/download" {
+		t.Fatalf("local destination String() = %q", got)
+	}
+}
+
+func TestDownloadRunValidatesAndRoundTrips(t *testing.T) {
+	r := testRun("20251018T120000Z-download00000001")
+	r.Config.Direction = state.DirectionRemoteToLocal
+	r.Source = state.Source{User: "alice", Host: "example.com", Path: "/srv/source"}
+	r.Destination = state.Destination{Path: filepath.Join(t.TempDir(), "download")}
+	store, err := state.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(r); err != nil {
+		t.Fatalf("Save download run: %v", err)
+	}
+	got, err := store.Load(r.ID)
+	if err != nil {
+		t.Fatalf("Load download run: %v", err)
+	}
+	if got.Config.Direction != state.DirectionRemoteToLocal || got.Source.String() != "alice@example.com:/srv/source" || got.Destination.String() != r.Destination.Path {
+		t.Fatalf("round trip endpoints = source %q destination %q direction %q", got.Source.String(), got.Destination.String(), got.Config.Direction)
+	}
+}
+
 func TestRecoverInterrupted(t *testing.T) {
 	r := testRun("20251018T120000Z-deadbeefdeadbeef")
 	r.Status = state.StatusRunning

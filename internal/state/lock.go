@@ -59,10 +59,16 @@ func lockPath(locksDir, key string) string {
 // dies holding it: a stale lock file is reported, and a human can remove it
 // once the holder is confirmed gone.
 func (s *Store) LockDestination(dest Destination) (*Lock, error) {
-	if dest.Host == "" || dest.Path == "" {
+	if dest.Path == "" {
 		return nil, errors.New("state: cannot lock an incomplete destination")
 	}
 	key := dest.String()
+	if dest.Host == "" {
+		if !filepath.IsAbs(dest.Path) || dest.User != "" {
+			return nil, errors.New("state: cannot lock an invalid local destination")
+		}
+		key = "local:" + filepath.Clean(dest.Path)
+	}
 	locksDir := filepath.Join(s.dir, locksDirName)
 	if err := ensurePrivateDir(locksDir); err != nil {
 		return nil, fmt.Errorf("state: create locks directory: %w", err)
