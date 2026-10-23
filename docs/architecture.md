@@ -81,11 +81,12 @@ beyond system ssh: it speaks the SFTP subsystem itself through
 checkpoint (JSON; source size, nanosecond mtime, destination identity, chunk
 size, completed set, unpredictable same-directory temp path) saved before any
 remote write → sequential SFTP sessions → exclusive temp create, preallocate,
-sync → per-session O_WRONLY handle pool → range copies with a per-chunk atomic
-checkpoint save → sync, source re-check, metadata (permissions via SFTP,
-exact nanosecond mtime via a controlled ssh `touch` command; SFTP v3 carries
-only whole seconds) → no-clobber hardlink publish → final size/mtime
-verification. Publish uses `hardlink@openssh.com`, never PosixRename; a final
+sync → per-session O_WRONLY handle pool → range copies where each chunk first
+crosses a remote fsync durability barrier and only then enters the checkpoint
+(so "completed" means remotely durable) → final sync, source re-check,
+metadata (permissions via SFTP, exact nanosecond mtime via a controlled ssh
+`touch` command; SFTP v3 carries only whole seconds) → no-clobber hardlink
+publish → final size/mtime verification. Publish uses `hardlink@openssh.com`, never PosixRename; a final
 path that exists is never overwritten.
 
 Resume validates the checkpoint strictly (version, source, destination, size,
@@ -97,8 +98,13 @@ via a controlled remote `test -ef`. Legacy external-mscp checkpoints (binary,
 relative-path format) are detected and fail closed.
 
 The backend requires an OpenSSH ≥ 9.0 sftp-server (fsync, hardlink) and GNU
-coreutils on the remote; auto mode probes the capability before any remote
-write and falls back to rsync, and a forced run fails clearly.
+coreutils on the remote. Auto mode probes the capability before any remote
+write; only a task proven never started (no checkpoint reference, no derived
+`.nativeckpt`, no legacy `.mscpckpt`) may fall back to the conservative rsync
+stage. Everything else fails closed and keeps its backend, checkpoint, temp,
+and final untouched, because rsync would bypass the no-clobber publish. A
+probe error is not an "unsupported" answer and never causes a fallback; a
+forced run fails clearly.
 
 ### rsync
 

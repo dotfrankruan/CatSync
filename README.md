@@ -264,9 +264,17 @@ cannot be proven to be the same object is a hard conflict and is never
 overwritten or deleted.
 
 The server needs OpenSSH ≥ 9.0's sftp-server (fsync and hardlink
-extensions) and GNU coreutils on the remote; auto mode probes the hardlink
-capability before any remote write and falls back to rsync when it is
-missing, while a forced `--backend mscp` run fails with a clear error.
+extensions) and GNU coreutils on the remote. Auto mode probes the hardlink
+capability before any remote write: a server that cleanly reports the
+extension missing lets **never-started** large files fall back to the
+conservative rsync stage, while a forced `--backend mscp` run fails with a
+clear error. The fallback is deliberately restricted — a task that already
+has a native or legacy checkpoint (or whose checkpoint state cannot be
+proven clean) fails closed instead: rsync would bypass the no-clobber
+publish and could overwrite a final created while the run was interrupted,
+so the backend, checkpoint, temp object, and final path are all left
+untouched. A probe *error* (as opposed to a clean "unsupported" answer)
+never triggers a fallback; every task fails with the probe's cause.
 `--backend mscp` is a compatibility name: it selects this native backend
 and never executes an external mscp.
 

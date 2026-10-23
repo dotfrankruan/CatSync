@@ -5,6 +5,8 @@ package executor
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -16,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dotfrankruan/CatSync/internal/backend/multistream"
 	"github.com/dotfrankruan/CatSync/internal/state"
 	"github.com/dotfrankruan/CatSync/internal/target"
 	"github.com/dotfrankruan/CatSync/internal/testutil/mockexec"
@@ -2682,5 +2685,225 @@ func TestRemoteTempCleanupFailureKeepsFinal(t *testing.T) {
 	}
 	if string(got) != string(want) {
 		t.Error("final content changed after a cleanup failure")
+	}
+}
+
+// craftNativeRun persists an interrupted run with one large pending task
+// bound to the given checkpoint path.
+func craftNativeRun(t *testing.T, h *harness, ckpt string) *state.Run {
+	t.Helper()
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	size, mt := h.srcMeta("big.bin")
+	id, err := state.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &state.Run{
+		ID:        id,
+		Status:    state.StatusFailed,
+		CreatedAt: time.Now().UTC(),
+		Config: state.Config{
+			Backend:        state.BackendAuto,
+			Verify:         state.VerifyNone,
+			Jobs:           1,
+			Streams:        2,
+			LargeThreshold: 1024,
+		},
+		Source:      state.Source{Path: h.src},
+		Destination: state.Destination{User: "u", Host: "h", Path: h.remoteDir},
+		WorkDir:     h.src,
+		Tasks: []state.Task{{
+			Path:       "big.bin",
+			Size:       size,
+			ModTime:    mt,
+			Backend:    state.BackendMSCP,
+			Status:     state.StatusPending,
+			Checkpoint: ckpt,
+		}},
+	}
+	if err := store.Save(run); err != nil {
+		t.Fatal(err)
+	}
+	return run
+}
+
+// TestNativeResumeWithCheckpointFailsClosedWithoutHardlink: a task with an
+// existing native checkpoint must never fall back to rsync when the server
+// lacks hardlink support — rsync would bypass the no-clobber publish.
+func TestNativeResumeWithCheckpointFailsClosedWithoutHardlink(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("big.bin", 2048)
+	remoteFinal := filepath.Join(h.remoteDir, "big.bin")
+	tempPath := filepath.Join(h.remoteDir, ".catsync-tmp-big.bin")
+	// A partial temp object and a real native checkpoint, as an interrupted
+	// transfer leaves them.
+	if err := os.WriteFile(tempPath, make([]byte, 2048), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ckptPath := filepath.Join(h.stateDir, "checkpoints", "crafted", "abc.nativeckpt")
+	if err := os.MkdirAll(filepath.Dir(ckptPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ckpt, err := multistream.NewCheckpoint("big.bin", 2048, time.Unix(1_700_000_000, 0),
+		"u@h:"+remoteFinal, tempPath, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ckpt.Save(ckptPath); err != nil {
+		t.Fatal(err)
+	}
+	run := craftNativeRun(t, h, ckptPath)
+
+	cfg := h.nativeEnv(mockexec.EnvSFTPNoExt + "=1")
+	_, rerr := Resume(context.Background(), Config{
+		StateDir: h.stateDir,
+		Programs: h.config().Programs,
+		Env:      cfg,
+	}, run.ID)
+	if rerr == nil {
+		t.Fatal("Resume = nil, want a fail-closed error")
+	}
+	// No rsync may run, and the backend must not change.
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 0 {
+		t.Errorf("rsync invocations = %d, want 0 (fail closed, no fallback)", got)
+	}
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Load(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := loaded.Tasks[0]
+	if task.Backend != state.BackendMSCP {
+		t.Errorf("backend = %s, want mscp unchanged (no fallback)", task.Backend)
+	}
+	if task.Status != state.StatusFailed || !strings.Contains(task.Error, "already started") {
+		t.Errorf("task = %s (%q), want failed with the already-started message", task.Status, task.Error)
+	}
+	// Checkpoint, temp, and final are untouched.
+	if _, err := os.Stat(ckptPath); err != nil {
+		t.Errorf("native checkpoint removed: %v", err)
+	}
+	if _, err := os.Stat(tempPath); err != nil {
+		t.Errorf("remote temp removed: %v", err)
+	}
+	if _, err := os.Lstat(remoteFinal); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("final path was touched: %v", err)
+	}
+}
+
+// TestNativeResumePublishedCrashWindowProbeFailure: when the hardlink probe
+// itself errors (not "unsupported"), a published crash-window transfer must
+// not fall back and must not overwrite the live final.
+func TestNativeResumePublishedCrashWindowProbeFailure(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("big.bin", 2048)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("big.bin")))
+	h.scriptSSHFreshDest(post)
+
+	// A completed, published native transfer: final + temp + full checkpoint.
+	cfg := h.configNative()
+	cfg.Verify = state.VerifyNone
+	if _, err := Sync(context.Background(), cfg); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	final := filepath.Join(h.remoteDir, "big.bin")
+	want, err := os.ReadFile(final)
+	if err != nil {
+		t.Fatalf("published final missing: %v", err)
+	}
+	// Find the checkpoint the run recorded.
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Latest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	crafted := craftNativeRun(t, h, first.Tasks[0].Checkpoint)
+	_ = first.Tasks[0].Checkpoint
+
+	// The probe session now fails: not "unsupported", a real error.
+	env := h.nativeEnv("MOCKEXEC_SFTP_FAILNTH=1")
+	_, rerr := Resume(context.Background(), Config{
+		StateDir: h.stateDir,
+		Programs: h.config().Programs,
+		Env:      env,
+	}, crafted.ID)
+	if rerr == nil {
+		t.Fatal("Resume = nil, want the probe failure")
+	}
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 0 {
+		t.Errorf("rsync invocations = %d, want 0 (a probe error never falls back)", got)
+	}
+	got, err := os.ReadFile(final)
+	if err != nil {
+		t.Fatalf("published final disappeared: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Error("published final was modified by the failed resume")
+	}
+}
+
+// TestNativeResumeLegacyCheckpointWithoutHardlink: a legacy checkpoint with
+// no hardlink support still reports the actionable legacy message and never
+// falls back.
+func TestNativeResumeLegacyCheckpointWithoutHardlink(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("big.bin", 2048)
+	legacy := filepath.Join(h.stateDir, "checkpoints", "crafted", "legacy.mscpckpt")
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacy, []byte("binary legacy state"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run := craftNativeRun(t, h, "")
+	// The derived legacy path is what the stage looks for; place the file
+	// where the executor derives it.
+	ckptDir, err := filepath.Abs(filepath.Join(h.stateDir, "checkpoints", run.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(ckptDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte("big.bin"))
+	derived := filepath.Join(ckptDir, hex.EncodeToString(sum[:])+".mscpckpt")
+	if err := os.WriteFile(derived, []byte("binary legacy state"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	env := h.nativeEnv(mockexec.EnvSFTPNoExt + "=1")
+	_, rerr := Resume(context.Background(), Config{
+		StateDir: h.stateDir,
+		Programs: h.config().Programs,
+		Env:      env,
+	}, run.ID)
+	if rerr == nil {
+		t.Fatal("Resume = nil, want the legacy fail-closed error")
+	}
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 0 {
+		t.Errorf("rsync invocations = %d, want 0 (legacy checkpoint must fail closed)", got)
+	}
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Load(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(loaded.Tasks[0].Error, "legacy external-mscp") {
+		t.Errorf("task error = %q, want the legacy checkpoint message", loaded.Tasks[0].Error)
+	}
+	if _, err := os.Stat(derived); err != nil {
+		t.Errorf("legacy checkpoint removed: %v", err)
 	}
 }

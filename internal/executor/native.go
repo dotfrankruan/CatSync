@@ -100,9 +100,12 @@ func (e *Executor) nativeLargeStage(ctx context.Context) error {
 	e.logf("stage native-large: %d large file(s), up to %d job(s) × %d SFTP session(s)",
 		len(idxs), e.run.Config.Jobs, e.run.Config.Streams)
 
-	// Probe the hardlink capability once, before any temp write. Auto mode
-	// re-routes the whole stage's tasks to the conservative rsync path when
-	// the server cannot publish without clobbering.
+	ckptDir, err := e.checkpointDir()
+	if err != nil {
+		return err
+	}
+
+	// Probe the hardlink capability once, before any temp write.
 	hardlinkOK, probeErr := e.probeHardlink(ctx)
 	if probeErr != nil {
 		if ctx.Err() != nil {
@@ -110,15 +113,13 @@ func (e *Executor) nativeLargeStage(ctx context.Context) error {
 			// while the run is being torn down.
 			return ctx.Err()
 		}
-		e.warnf("native-large: hardlink capability probe failed: %v (tasks keep their checkpoints and stay resumable)", probeErr)
+		// A probe error is not "the extension is unsupported": we cannot
+		// know, so nothing may fall back. Every task fails with the real
+		// cause and keeps its checkpoint and remote objects.
+		return e.failStageWithProbeError(idxs, probeErr)
 	}
 	if !hardlinkOK {
-		return e.routeWithoutHardlink(ctx, idxs, probeErr)
-	}
-
-	ckptDir, err := e.checkpointDir()
-	if err != nil {
-		return err
+		return e.routeWithoutHardlink(idxs, ckptDir)
 	}
 	sem := make(chan struct{}, e.run.Config.Jobs)
 	var wg sync.WaitGroup
@@ -168,41 +169,121 @@ func (e *Executor) probeHardlink(ctx context.Context) (bool, error) {
 	return ok, nil
 }
 
-// routeWithoutHardlink handles a server without hardlink support: auto mode
-// re-routes the stage's tasks to the conservative rsync path (no temp was
-// ever created); a forced mscp/native run fails every task with a clear
-// error.
-func (e *Executor) routeWithoutHardlink(ctx context.Context, idxs []int, probeErr error) error {
-	auto := e.run.Config.Backend == state.BackendAuto
+// nativeStartState classifies whether a task may still be treated as never
+// started (and therefore safe to hand to the conservative rsync fallback).
+type nativeStartState int
+
+const (
+	// nativeNotStarted: no checkpoint reference and neither checkpoint file
+	// exists — the transfer has never begun.
+	nativeNotStarted nativeStartState = iota
+	// nativeStarted: this task already has native transfer state.
+	nativeStarted
+	// nativeStartedLegacy: a legacy external-mscp checkpoint exists.
+	nativeStartedLegacy
+	// nativeStateUnknown: the checkpoint state cannot be determined
+	// reliably, which must be treated as started.
+	nativeStateUnknown
+)
+
+// classifyNativeStart decides whether the task has already entered the
+// native transfer (or cannot be proven not to have).
+func (e *Executor) classifyNativeStart(t *state.Task, ckptDir string) (nativeStartState, string) {
+	if t.Checkpoint != "" {
+		return nativeStarted, "task already references a checkpoint"
+	}
+	if exists, err := fileExistsChecked(nativeCheckpointName(ckptDir, t.Path)); err != nil {
+		return nativeStateUnknown, fmt.Sprintf("cannot determine native checkpoint state: %v", err)
+	} else if exists {
+		return nativeStarted, "a native checkpoint exists"
+	}
+	if exists, err := fileExistsChecked(legacyCheckpointName(ckptDir, t.Path)); err != nil {
+		return nativeStateUnknown, fmt.Sprintf("cannot determine legacy checkpoint state: %v", err)
+	} else if exists {
+		return nativeStartedLegacy, "a legacy external-mscp checkpoint exists"
+	}
+	return nativeNotStarted, ""
+}
+
+// fileExistsChecked reports whether the path exists, distinguishing "does
+// not exist" from an unreadable state that must not be guessed.
+func fileExistsChecked(p string) (bool, error) {
+	_, err := os.Stat(p)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
+}
+
+// failStageWithProbeError fails every task of the stage with the real probe
+// cause. A failed capability probe says nothing about the server's
+// extensions, so no task — fresh or resumed — may fall back to rsync.
+func (e *Executor) failStageWithProbeError(idxs []int, probeErr error) error {
 	for _, i := range idxs {
 		t := &e.run.Tasks[i]
-		if auto {
-			// Re-route to rsync: the conservative stage picks the task up.
-			e.runMu.Lock()
-			prev := t.Backend
-			t.Backend = state.BackendRsync
-			e.runMu.Unlock()
-			if err := e.saveRun(); err != nil {
-				e.runMu.Lock()
-				t.Backend = prev
-				e.runMu.Unlock()
-				return err
-			}
-			e.logf("native-large: %s: server lacks hardlink@openssh.com; falling back to conservative rsync", t.Path)
-			continue
-		}
-		msg := "server lacks the hardlink@openssh.com extension required for no-clobber publish"
-		if probeErr != nil {
-			msg = fmt.Sprintf("hardlink capability probe failed: %v", probeErr)
-		}
-		if err := e.failTask(t, "native multistream: "+msg); err != nil {
+		if err := e.failTask(t, fmt.Sprintf("native multistream: cannot verify hardlink publish support: %v (checkpoint and remote state preserved)", probeErr)); err != nil {
 			return err
 		}
 	}
-	if auto {
-		return nil
+	return fmt.Errorf("native multistream: hardlink capability probe failed: %w", probeErr)
+}
+
+// routeWithoutHardlink handles a server that cleanly reports the missing
+// hardlink@openssh.com extension. Only tasks proven never started may fall
+// back to the conservative rsync path in auto mode. A task that already has
+// any native or legacy checkpoint — or whose state cannot be proven clean —
+// fails closed: rsync would bypass the no-clobber publish and could write
+// over a final created meanwhile, so the backend, checkpoint, temp, and
+// final are all left untouched.
+func (e *Executor) routeWithoutHardlink(idxs []int, ckptDir string) error {
+	auto := e.run.Config.Backend == state.BackendAuto
+	failed := 0
+	for _, i := range idxs {
+		t := &e.run.Tasks[i]
+		stateKind, reason := e.classifyNativeStart(t, ckptDir)
+		switch stateKind {
+		case nativeStartedLegacy:
+			// The legacy checkpoint is an actionable, distinct failure.
+			if err := e.failTask(t, legacyMSCPMessage); err != nil {
+				return err
+			}
+			failed++
+			continue
+		case nativeStarted, nativeStateUnknown:
+			msg := fmt.Sprintf("native multistream: cannot publish safely without the hardlink@openssh.com extension and this transfer has already started (%s); refusing to fall back to rsync — resolve the server's hardlink support, or inspect the destination manually before removing the checkpoint", reason)
+			if err := e.failTask(t, msg); err != nil {
+				return err
+			}
+			failed++
+			continue
+		}
+		if !auto {
+			if err := e.failTask(t, "native multistream: server lacks the hardlink@openssh.com extension required for no-clobber publish"); err != nil {
+				return err
+			}
+			failed++
+			continue
+		}
+		// Proven never started: safe to hand to the conservative stage.
+		e.runMu.Lock()
+		prev := t.Backend
+		t.Backend = state.BackendRsync
+		e.runMu.Unlock()
+		if err := e.saveRun(); err != nil {
+			e.runMu.Lock()
+			t.Backend = prev
+			e.runMu.Unlock()
+			return err
+		}
+		e.logf("native-large: %s: server lacks hardlink@openssh.com; falling back to conservative rsync (transfer never started)", t.Path)
 	}
-	return errors.New("native multistream: server lacks hardlink@openssh.com")
+	if failed > 0 {
+		return fmt.Errorf("native multistream: %d task(s) failed: hardlink@openssh.com unsupported", failed)
+	}
+	return nil
 }
 
 // nativeLargeTask transfers or resumes one large file natively.
