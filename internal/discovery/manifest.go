@@ -186,8 +186,18 @@ func parseManifestTime(s string) (time.Time, error) {
 	if s == "" {
 		return time.Time{}, errors.New("empty mtime")
 	}
-	if dot := strings.IndexByte(s, '.'); dot >= 0 && len(s)-dot-1 > 9 {
-		s = s[:dot+1+9]
+	if dot := strings.IndexByte(s, '.'); dot >= 0 {
+		frac := s[dot+1:]
+		if len(frac) > 9 {
+			// GNU find may print a tenth decimal digit. Validate the complete
+			// field before dropping that sub-nanosecond digit; truncating first
+			// would incorrectly accept a valid nine-digit prefix followed by
+			// garbage. Anything beyond GNU find's one extra digit is malformed.
+			if len(frac) != 10 || !isDigits(frac) {
+				return time.Time{}, fmt.Errorf("invalid mtime fraction %q", s)
+			}
+			s = s[:dot+1+9]
+		}
 	}
 	t, err := epochtime.Parse(s)
 	if err != nil {

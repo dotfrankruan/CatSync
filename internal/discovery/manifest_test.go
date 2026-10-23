@@ -96,6 +96,8 @@ func TestParseManifestMalformed(t *testing.T) {
 		{"mtime bare dot", manifestRecord("a", "1", "1."), "fraction"},
 		{"mtime leading dot", manifestRecord("a", "1", ".5"), "invalid mtime"},
 		{"mtime non-digit fraction", manifestRecord("a", "1", "1.123x"), "fraction"},
+		{"mtime garbage after nanoseconds", manifestRecord("a", "1", "1.123456789garbage"), "fraction"},
+		{"mtime eleven fractional digits", manifestRecord("a", "1", "1.12345678901"), "fraction"},
 		{"mtime overflow", manifestRecord("a", "1", "99999999999999999999999"), "invalid mtime"},
 		{"path absolute", manifestRecord("/abs", "1", "1"), "path"},
 		{"path escapes root", manifestRecord("../x", "1", "1"), "path"},
