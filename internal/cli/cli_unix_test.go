@@ -656,3 +656,31 @@ func TestResumeInvalidSSHOverrideIsUsageError(t *testing.T) {
 		t.Errorf("attempts changed to %d, want %d", after.Tasks[0].Attempts, attemptsBefore)
 	}
 }
+
+// TestCATSYNCMSCPIgnored: the legacy CATSYNC_MSCP override no longer
+// affects execution — a large file still transfers natively.
+func TestCATSYNCMSCPIgnored(t *testing.T) {
+	h := newCLIHarness(t)
+	h.armNative()
+	h.writeSrc("big.bin", 2048)
+	post := h.writeManifest("post", h.record("big.bin"))
+	h.scriptFreshDestSSH(post)
+	t.Setenv("CATSYNC_MSCP", "/nonexistent/mscp-should-never-run")
+
+	code, _, stderr := run(t, "sync", "--state-dir", h.stateDir,
+		"--large-threshold", "1KiB", h.src, "user@host:"+h.remoteDir)
+	if code != ExitOK {
+		t.Fatalf("sync exit = %d, stderr:\n%s", code, stderr)
+	}
+	got, err := os.ReadFile(filepath.Join(h.remoteDir, "big.bin"))
+	if err != nil {
+		t.Fatalf("published final missing: %v", err)
+	}
+	want, err := os.ReadFile(filepath.Join(h.src, "big.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Error("final content mismatch")
+	}
+}

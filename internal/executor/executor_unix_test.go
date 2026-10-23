@@ -3,6 +3,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -635,6 +636,13 @@ func TestSyncDryRunTransfersNothing(t *testing.T) {
 	}
 	if len(toolInvocations(invs, "ssh")) != 1 {
 		t.Errorf("ssh invocations = %d, want 1 (plan manifest only)", len(toolInvocations(invs, "ssh")))
+	}
+	// A dry run opens no SFTP session and creates no checkpoint or temp.
+	if got := len(sftpSessionInvocations(invs)); got != 0 {
+		t.Errorf("sftp sessions = %d, want 0 during a dry run", got)
+	}
+	if _, err := os.Stat(filepath.Join(h.stateDir, "checkpoints")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("dry run created a checkpoint directory: %v", err)
 	}
 }
 
@@ -1279,6 +1287,37 @@ func TestCompletedPersistedBeforeCheckpointRemoval(t *testing.T) {
 	}
 	if loaded.Tasks[0].Checkpoint != cp {
 		t.Errorf("durable checkpoint ref = %q, want %q", loaded.Tasks[0].Checkpoint, cp)
+	}
+
+	// The published final is already live; a later resume must converge:
+	// it recognizes the same-inode publish, persists completion, and only
+	// then retires the checkpoint and the remote temp.
+	final := filepath.Join(h.remoteDir, "big.bin")
+	if _, err := os.Stat(final); err != nil {
+		t.Fatalf("published final missing after the failed completion save: %v", err)
+	}
+	run2, err := Resume(context.Background(), Config{
+		StateDir: h.stateDir,
+		Programs: h.config().Programs,
+		Env:      h.nativeEnv(),
+	}, run.ID)
+	if err != nil {
+		t.Fatalf("Resume after a published-but-unrecorded completion: %v", err)
+	}
+	if run2.Status != state.StatusCompleted {
+		t.Errorf("resumed run = %s (%q), want completed", run2.Status, run2.Error)
+	}
+	if _, err := os.Stat(cp); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("checkpoint must be retired after convergence: %v", err)
+	}
+	entries, err := os.ReadDir(h.remoteDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".catsync-tmp-") {
+			t.Errorf("remote temp left behind after convergence: %s", e.Name())
+		}
 	}
 }
 
@@ -2602,5 +2641,46 @@ func TestNativeHardlinkUnsupportedForcedFails(t *testing.T) {
 	// No rsync fallback for a forced run.
 	if got := len(toolInvocations(h.invocations(), "rsync")); got != 0 {
 		t.Errorf("rsync invocations = %d, want 0 (forced native)", got)
+	}
+}
+
+// TestRemoteTempCleanupFailureKeepsFinal: a failing remote temp removal is
+// a warning only — the published final stays intact and the run is already
+// complete.
+func TestRemoteTempCleanupFailureKeepsFinal(t *testing.T) {
+	h, cfg := mscpOnlyHarness(t)
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	final := filepath.Join(h.remoteDir, "big.bin")
+	want, err := os.ReadFile(final)
+	if err != nil {
+		t.Fatalf("published final missing: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	e, err := newExecutor(Config{
+		StateDir: h.stateDir,
+		Programs: cfg.Programs,
+		Env:      h.nativeEnv(),
+		Stderr:   &stderr,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.run = run
+	// A path that cannot be removed: the helper reports failure, the
+	// cleanup logs and returns, and the final is untouched.
+	e.removeRemoteTemp(context.Background(), filepath.Join(h.remoteDir, "no-such-dir", "no-such-temp"))
+	if !strings.Contains(stderr.String(), "remove remote temp") {
+		t.Errorf("stderr = %q, want a cleanup warning", stderr.String())
+	}
+	got, err := os.ReadFile(final)
+	if err != nil {
+		t.Fatalf("final disappeared after a cleanup failure: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Error("final content changed after a cleanup failure")
 	}
 }
