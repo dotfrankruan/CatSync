@@ -284,8 +284,12 @@ func (c SFTPConfig) WithClients(ctx context.Context, streams int, fn func([]*sft
 // WithClient starts one ssh process running the remote SFTP subsystem and
 // invokes fn with a live SFTP client over its stdin/stdout. The client is
 // callback-scoped: fn must not retain or use it after returning. It is the
-// single-session form of WithClients.
+// single-session form of WithClients. A nil callback is rejected before
+// any process starts, because the wrapper would otherwise defeat the check.
 func (c SFTPConfig) WithClient(ctx context.Context, fn func(*sftp.Client) error) error {
+	if fn == nil {
+		return errors.New("multistream: nil callback")
+	}
 	return c.WithClients(ctx, 1, func(clients []*sftp.Client) error {
 		return fn(clients[0])
 	})
