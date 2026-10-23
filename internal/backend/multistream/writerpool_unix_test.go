@@ -171,6 +171,7 @@ func TestWriterPoolShortWriteRetryAndZeroProgress(t *testing.T) {
 
 	// Zero progress without error is its own error, not an infinite loop.
 	zeroOps := []remoteOps{&fakeOps{
+		lstatFn: defaultTempLstat,
 		openFileFn: func(string, int) (remoteFile, error) {
 			return &fakeFile{
 				statFn:    func() (os.FileInfo, error) { return fakeInfo{name: "t", size: 256, mode: 0o600}, nil },
@@ -202,7 +203,12 @@ func TestWriterPoolCopySpreadsSessions(t *testing.T) {
 	for i := range ops {
 		idx := i
 		ops[i] = &fakeOps{
-			lstatFn: defaultTempLstat,
+			lstatFn: func(p string) (os.FileInfo, error) {
+				if p == spec.TempPath {
+					return shared.statInfo(), nil
+				}
+				return nil, os.ErrNotExist
+			},
 			openFileFn: func(p string, flags int) (remoteFile, error) {
 				if flags != os.O_WRONLY {
 					t.Errorf("pool open flags = %#x, want O_WRONLY", flags)
