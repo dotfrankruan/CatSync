@@ -2,11 +2,14 @@
 
 CatSync is a local orchestration CLI. It discovers a local source tree, obtains
 remote metadata in batches, assigns every path exactly one backend in an
-immutable plan, and drives external `rsync`, `ssh`, and `mscp` processes.
-The small-file stage is native: CatSync partitions small files in pure Go
-and runs concurrent rsync batches itself; no external fpsync/fpart is used.
-The remote host needs only SSH/SFTP and rsync; it does not run a CatSync
-daemon.
+immutable plan, and drives external `rsync` and `ssh` processes plus its own
+native large-file backend. The small-file stage is native: CatSync partitions
+small files in pure Go and runs concurrent rsync batches itself; no external
+fpsync/fpart is used. The large-file stage is native multistream: sequential
+system-ssh SFTP sessions write disjoint byte ranges into a same-directory
+temp object with per-chunk atomic checkpoints and a no-clobber hardlink
+publish; no external mscp is used. The remote host needs only SSH/SFTP and
+rsync; it does not run a CatSync daemon.
 
 ## Safety model
 
@@ -16,7 +19,7 @@ Planning produces one owner for every relative path:
 | --- | --- |
 | unchanged size and mtime | skip |
 | new file below threshold | native parallel-rsync batches (backend name `fpsync` for compatibility) |
-| new file at or above threshold | mscp when compatible, otherwise rsync |
+| new file at or above threshold | native multistream (backend name `mscp` for compatibility); rsync if the server lacks the hardlink extension |
 | existing or uncertain file | rsync |
 | symlink, special file, or scan error | unsupported (distinct task status) |
 
@@ -46,7 +49,8 @@ temporary-file plus rename and a destination lock prevents overlapping runs.
    threshold in logical bytes per batch), create all remote parent
    directories with one batched ssh mkdir, then run up to `jobs` concurrent
    rsync processes with `--no-implied-dirs` and per-batch NUL-delimited
-   `--files-from` lists. Then run mscp new-large-file tasks, then the rsync
+   `--files-from` lists. Then run native multistream new-large-file tasks
+   (checkpoint per chunk, exclusive temp, hardlink publish), then the rsync
    conservative/delta stage.
 5. Verify successful tasks and atomically save their terminal state.
 
@@ -69,18 +73,32 @@ rebuilds equivalent batches from pending tasks without any fpsync run ID or
 state directory. rsync's per-file partial files live next to the
 destination file, so partial progress survives re-batching.
 
-### mscp
+### Native multistream large-file backend
 
-mscp 0.2.4 supports parallel SSH connections (`-n`), in-flight SFTP requests
-(`-a`), minimum chunks (`-s`), bitrate limits (`-L`), IPv6-only resolution
-(`-6`), checkpoint writing (`-W`), and resume (`-R`). It does not support
-remote-to-remote copying or block-level delta updates. Auto mode therefore
-uses it only for large regular files confirmed absent at the destination.
+The native backend (`internal/backend/multistream`) needs no external tool
+beyond system ssh: it speaks the SFTP subsystem itself through
+`github.com/pkg/sftp`. One transfer: deterministic chunk plan → atomic local
+checkpoint (JSON; source size, nanosecond mtime, destination identity, chunk
+size, completed set, unpredictable same-directory temp path) saved before any
+remote write → sequential SFTP sessions → exclusive temp create, preallocate,
+sync → per-session O_WRONLY handle pool → range copies with a per-chunk atomic
+checkpoint save → sync, source re-check, metadata (permissions via SFTP,
+exact nanosecond mtime via a controlled ssh `touch` command; SFTP v3 carries
+only whole seconds) → no-clobber hardlink publish → final size/mtime
+verification. Publish uses `hardlink@openssh.com`, never PosixRename; a final
+path that exists is never overwritten.
 
-Checkpoints contain relative paths. Resume must execute with the same working
-directory as the failed command and repeat any SSH options. A checkpoint is
-not deleted by mscp after success; CatSync retains it until its own verification
-gate passes.
+Resume validates the checkpoint strictly (version, source, destination, size,
+mtime, chunk size) and the existing temp (regular file, exact size, checked
+again through the open handle), skips completed chunks, and copies only the
+pending ranges. The crash window between a successful hardlink and the
+recorded completion is recovered by proving final and temp are the same inode
+via a controlled remote `test -ef`. Legacy external-mscp checkpoints (binary,
+relative-path format) are detected and fail closed.
+
+The backend requires an OpenSSH ≥ 9.0 sftp-server (fsync, hardlink) and GNU
+coreutils on the remote; auto mode probes the capability before any remote
+write and falls back to rsync, and a forced run fails clearly.
 
 ### rsync
 
@@ -116,7 +134,7 @@ failed save leaves every task pending and no batch process starts.
 Cancellation is checked at every batch boundary — before work, during
 pre-checks, before the intent save, and between save and launch — so a
 cancelled batch never lingers as running and never starts a process. Completion is saved
-before an mscp checkpoint is retired; the checkpoint reference is cleared
+before a native checkpoint is retired; the checkpoint reference is cleared
 and persisted before the file is removed, so a crash leaves either a
 referenced checkpoint or a harmless orphan file, never a completed task
 whose only copy state vanished. A resume-time recovery pass retires
@@ -125,19 +143,20 @@ removes its per-run checkpoint directory.
 
 ## Compatibility and limitations
 
-Program overrides (diagnostics and tests): `CATSYNC_SSH`, `CATSYNC_RSYNC`,
-and `CATSYNC_MSCP` replace executables CatSync itself spawns; `CATSYNC_SSH`
-also becomes rsync's `-e` transport and must be a whitespace-free token.
-`CATSYNC_FPSYNC`/`CATSYNC_FPART` no longer exist: CatSync never runs or
-probes those tools. Processes spawned by external tools (mscp's libssh)
-inherit their own resolution and are outside CatSync's control.
+Program overrides (diagnostics and tests): `CATSYNC_SSH` and `CATSYNC_RSYNC`
+replace executables CatSync itself spawns; `CATSYNC_SSH` also becomes rsync's
+`-e` transport and must be a whitespace-free token. `CATSYNC_FPSYNC`,
+`CATSYNC_FPART`, and `CATSYNC_MSCP` no longer exist: CatSync never runs or
+probes those tools. The native large-file backend uses the system ssh for
+every connection, so ssh_config, agents, known_hosts, ProxyJump, and hardware
+keys apply unchanged.
 
-CatSync checks installed help/version output at runtime. A missing mscp
-narrows auto mode (large files fall back to rsync); a missing rsync is
-fatal. The MVP excludes symlinks and special files, does not delete remote
-files, and does not promise a consistent snapshot of a mutating source tree.
+CatSync checks installed help/version output at runtime. A missing rsync or
+ssh is fatal. The MVP excludes symlinks and special files, does not delete
+remote files, and does not promise a consistent snapshot of a mutating source
+tree.
 
 Primary references:
 
-- <https://github.com/upa/mscp/blob/main/doc/mscp.rst>
+- <https://github.com/pkg/sftp>
 - <https://github.com/RsyncProject/rsync/blob/master/rsync.1.md>

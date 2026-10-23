@@ -285,7 +285,8 @@ func TestValidateRejectsUnexpressibleSSHOverride(t *testing.T) {
 	if err := cfg.validateFull(); err != nil {
 		t.Fatalf("valid ssh override rejected: %v", err)
 	}
-	cfg.Programs.MSCP = "/tmp/a\x00b"
+	// A NUL-bearing override is rejected as a configuration error.
+	cfg.Programs.SSH = "/tmp/a" + string(rune(0)) + "b"
 	if err := cfg.validateFull(); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("NUL program override = %v, want ErrInvalidConfig", err)
 	}

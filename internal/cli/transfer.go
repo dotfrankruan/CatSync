@@ -40,14 +40,14 @@ func (o *Options) executorConfig(src string, dst target.Destination, stdout, std
 }
 
 // programsFromEnv reads the CATSYNC_<TOOL> program overrides for the
-// programs CatSync itself starts (ssh, rsync, mscp). They exist for
+// programs CatSync itself starts (ssh and rsync). They exist for
 // diagnostics and tests; values are paths or program names and are never
-// printed.
+// printed. There is no mscp override: the large-file backend is the native
+// multistream implementation over system ssh.
 func programsFromEnv() executor.Programs {
 	return executor.Programs{
 		SSH:   os.Getenv("CATSYNC_SSH"),
 		Rsync: os.Getenv("CATSYNC_RSYNC"),
-		MSCP:  os.Getenv("CATSYNC_MSCP"),
 	}
 }
 
@@ -86,7 +86,7 @@ func printPlan(w io.Writer, out *executor.PlanOutcome, opts *Options) {
 	fmt.Fprintf(w, "to transfer: %d file(s), %d logical source bytes (not a network-traffic estimate)\n",
 		counts[planner.StatusPending], out.LogicalBytes)
 	fmt.Fprintf(w, "  native small-file (parallel rsync): %d\n", byBackend[state.BackendFPSync])
-	fmt.Fprintf(w, "  mscp (large new):     %d\n", byBackend[state.BackendMSCP])
+	fmt.Fprintf(w, "  mscp (large new, native multistream): %d\n", byBackend[state.BackendMSCP])
 	fmt.Fprintf(w, "  rsync (conservative): %d\n", byBackend[state.BackendRsync])
 	fmt.Fprintf(w, "skipped (unchanged): %d\n", counts[planner.StatusSkipped])
 	fmt.Fprintf(w, "unsupported (symlink/special/scan error): %d\n", counts[planner.StatusUnsupported])

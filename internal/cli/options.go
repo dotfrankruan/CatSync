@@ -70,7 +70,7 @@ func defaultStateDir() string {
 // defaultOptions for help text to render correct defaults.
 func (o *Options) bindSharedFlags(fs *flag.FlagSet) {
 	fs.StringVar(&o.Backend, "backend", o.Backend,
-		"transfer backend: auto, fpsync (native parallel-rsync; does not invoke fpsync/fpart), mscp, or rsync")
+		"transfer backend: auto, fpsync (native parallel-rsync; does not invoke fpsync/fpart), mscp (native multistream over system ssh; does not invoke external mscp), or rsync")
 	fs.BoolVar(&o.DryRun, "dry-run", o.DryRun, "plan and report without transferring data")
 	fs.BoolVar(&o.Verbose, "verbose", o.Verbose, "increase output detail")
 	fs.BoolVar(&o.Quiet, "quiet", o.Quiet, "suppress non-error output")

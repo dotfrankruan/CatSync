@@ -47,22 +47,22 @@ func runDoctorCmd(t *testing.T, timeout time.Duration, opts Options) (code int, 
 }
 
 func TestDoctorAllToolsPresent(t *testing.T) {
-	// fpsync and fpart may be installed on the host; doctor must not probe
-	// them at all.
+	// fpsync, fpart, and mscp may be installed on the host; doctor must not
+	// probe them at all: only rsync and ssh matter.
 	fakePath(t, map[string]string{
 		"rsync":  "echo 'rsync  version 3.2.7  protocol version 31'",
 		"ssh":    "echo 'OpenSSH_9.7p1, LibreSSL 3.3.6' >&2", // real ssh -V prints to stderr
 		"fpsync": "echo SHOULD-NOT-BE-PROBED",
 		"fpart":  "echo SHOULD-NOT-BE-PROBED",
-		"mscp":   "echo 'mscp 0.2.4'",
+		"mscp":   "echo SHOULD-NOT-BE-PROBED",
 	})
 	code, stdout, stderr := runDoctorCmd(t, 2*time.Second, Options{})
 	if code != ExitOK {
 		t.Errorf("exit = %d, want %d (stderr %q)", code, ExitOK, stderr)
 	}
 	for _, want := range []string{
-		"rsync", "ssh", "mscp",
-		"rsync  version 3.2.7", "OpenSSH_9.7p1", "mscp 0.2.4",
+		"rsync", "ssh",
+		"rsync  version 3.2.7", "OpenSSH_9.7p1",
 		"all required tools are available",
 	} {
 		if !strings.Contains(stdout, want) {
@@ -72,14 +72,16 @@ func TestDoctorAllToolsPresent(t *testing.T) {
 	if strings.Contains(stdout, "missing") {
 		t.Errorf("no tool should be reported missing:\n%s", stdout)
 	}
-	for _, bad := range []string{"fpsync", "fpart", "SHOULD-NOT-BE-PROBED"} {
+	for _, bad := range []string{"fpsync", "fpart", "mscp", "SHOULD-NOT-BE-PROBED"} {
 		if strings.Contains(stdout, bad) {
 			t.Errorf("doctor probed or listed %q:\n%s", bad, stdout)
 		}
 	}
 }
 
-func TestDoctorMissingOptionalToolsStillSucceeds(t *testing.T) {
+// TestDoctorOnlyRequiredToolsProbed: with rsync and ssh present, the
+// report is complete; no optional tool (fpsync, fpart, mscp) is probed.
+func TestDoctorOnlyRequiredToolsProbed(t *testing.T) {
 	fakePath(t, map[string]string{
 		"rsync": "echo 'rsync  version 3.2.7'",
 		"ssh":   "echo 'OpenSSH_9.7p1'",
@@ -88,10 +90,8 @@ func TestDoctorMissingOptionalToolsStillSucceeds(t *testing.T) {
 	if code != ExitOK {
 		t.Errorf("exit = %d, want %d (stderr %q)", code, ExitOK, stderr)
 	}
-	for _, want := range []string{"mscp    missing", "optional"} {
-		if !strings.Contains(stdout, want) {
-			t.Errorf("stdout missing %q:\n%s", want, stdout)
-		}
+	if strings.Contains(stdout, "mscp") || strings.Contains(stdout, "fpsync") || strings.Contains(stdout, "fpart") {
+		t.Errorf("an optional tool was probed:\n%s", stdout)
 	}
 }
 
@@ -167,9 +167,9 @@ func TestDoctorQuietHidesHealthyTools(t *testing.T) {
 	if strings.Contains(stdout, "rsync") || strings.Contains(stdout, "ssh") {
 		t.Errorf("quiet output should hide found tools:\n%s", stdout)
 	}
-	// Missing optional tools are problems worth showing even when quiet.
-	if !strings.Contains(stdout, "missing") {
-		t.Errorf("quiet output should still list missing tools:\n%s", stdout)
+	// With no optional tools left, quiet output lists nothing missing.
+	if strings.Contains(stdout, "missing") {
+		t.Errorf("quiet output should list nothing missing:\n%s", stdout)
 	}
 }
 

@@ -73,7 +73,6 @@ func (h *harness) config() Config {
 		Programs: Programs{
 			SSH:   h.progs["ssh"],
 			Rsync: h.progs["rsync"],
-			MSCP:  h.progs["mscp"],
 		},
 		Env: mockexec.EnvScript(h.scriptDir, h.logPath),
 	}
@@ -563,7 +562,6 @@ func TestSyncForcedMSCPWithoutExternalTool(t *testing.T) {
 	cfg := h.configNative()
 	cfg.Verify = state.VerifyNone
 	cfg.Backend = state.BackendMSCP
-	cfg.Programs.MSCP = filepath.Join(t.TempDir(), "no-mscp")
 
 	run, err := Sync(context.Background(), cfg)
 	if err != nil {

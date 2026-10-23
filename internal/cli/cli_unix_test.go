@@ -215,7 +215,7 @@ func TestCLIPlanPrintsSummary(t *testing.T) {
 	}
 	for _, want := range []string{
 		"destination metadata: authoritative",
-		"mscp (large new):     1",
+		"mscp (large new, native multistream): 1",
 		"logical source bytes",
 		"no data was transferred",
 	} {

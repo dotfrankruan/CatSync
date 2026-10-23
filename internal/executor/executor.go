@@ -2,7 +2,8 @@
 // the configuration, locks the destination, discovers the source, collects
 // the remote manifest in one batched SSH call, plans disjoint backend sets,
 // persists the run before any transfer, executes the native parallel-rsync
-// small-file stage, mscp, and rsync stages sequentially (so no destination
+// small-file stage, the native multistream large-file stage (persisted
+// backend name "mscp"), and the rsync stage sequentially (so no destination
 // path ever has concurrent writers), verifies, and only then marks tasks
 // completed.
 //
@@ -10,15 +11,15 @@
 // destination lock, revalidates source metadata, and continues pending and
 // failed tasks with the run's recorded immutable configuration: small-file
 // batches are rebuilt deterministically from pending tasks (legacy
-// fpsync-run fields are ignored and retired on completion), mscp resumes
-// from its retained checkpoint with the recorded working directory, and
-// rsync resumes through its partial directory.
+// fpsync-run fields are ignored and retired on completion), large files
+// resume from their native multistream checkpoints, and rsync resumes
+// through its partial directory.
 //
 // State transitions are persisted atomically before and after every
 // meaningful operation: a task is marked running before its subprocess
 // launches, a subprocess failure marks it failed (never completed),
 // cancellation returns running tasks to pending with an interruption note,
-// and mscp checkpoints are removed only after the verification gate passes.
+// and native checkpoints are removed only after completion is durable.
 package executor
 
 import (
@@ -53,13 +54,6 @@ const (
 	// exceeding the cap are rejected so a typo cannot open hundreds of
 	// connections to a host.
 	MaxSSHConnections = 64
-
-	// mscpInflight is the fixed -a value (in-flight SFTP requests per
-	// connection), mscp's own default.
-	mscpInflight = 32
-	// mscpMinChunk is the fixed -s value (minimum chunk size), mscp's own
-	// default of 16 MiB.
-	mscpMinChunk = 16 << 20
 )
 
 // Sentinel errors; test them with errors.Is.
@@ -79,7 +73,6 @@ var (
 type Programs struct {
 	SSH   string
 	Rsync string
-	MSCP  string
 }
 
 func (p Programs) ssh() string { return orDefault(p.SSH, "ssh") }
@@ -89,7 +82,6 @@ func (p Programs) ssh() string { return orDefault(p.SSH, "ssh") }
 func (p Programs) sshProgram() string { return p.SSH }
 
 func (p Programs) rsync() string { return orDefault(p.Rsync, "rsync") }
-func (p Programs) mscp() string  { return orDefault(p.MSCP, "mscp") }
 
 func orDefault(v, def string) string {
 	if v == "" {
@@ -171,7 +163,6 @@ func (c *Config) validateFull() error {
 	for _, p := range []struct{ name, value string }{
 		{"CATSYNC_SSH", c.Programs.SSH},
 		{"CATSYNC_RSYNC", c.Programs.Rsync},
-		{"CATSYNC_MSCP", c.Programs.MSCP},
 	} {
 		if strings.ContainsRune(p.value, 0) {
 			return fmt.Errorf("%w: %s contains a NUL byte", ErrInvalidConfig, p.name)

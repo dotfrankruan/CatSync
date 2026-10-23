@@ -23,15 +23,13 @@ type toolSpec struct {
 }
 
 // doctorTools lists the tools CatSync shells out to, in display order.
-// rsync and ssh are required; mscp enables the optional large-file
-// backend, and its absence only narrows auto mode. The small-file stage is
-// native (parallel rsync) and needs no external tools beyond rsync and ssh.
+// Both rsync and ssh are required: rsync covers the conservative and native
+// small-file stages; ssh drives the native multistream large-file backend
+// (system OpenSSH SFTP subsystem) and remote metadata commands. No other
+// external tool is needed.
 var doctorTools = []toolSpec{
 	{name: "rsync", required: true, versionArgs: []string{"--version"}, purpose: "required transfer backend (conservative and native small-file batches)"},
-	{name: "ssh", required: true, versionArgs: []string{"-V"}, purpose: "required remote transport"},
-	// mscp has no --version flag; its -h help banner carries the version on
-	// the first line and exits zero.
-	{name: "mscp", required: false, versionArgs: []string{"-h"}, purpose: "optional parallel large-file backend"},
+	{name: "ssh", required: true, versionArgs: []string{"-V"}, purpose: "required remote transport (native multistream large-file backend runs over its SFTP subsystem)"},
 }
 
 // toolReport records the outcome of probing one tool.
@@ -49,8 +47,8 @@ func runDoctorCommand(args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("doctor", `Usage: catsync doctor [options]
 
 Check that the external tools catsync relies on are installed and report
-their versions. Missing optional tools (mscp) only narrow what auto mode
-can use; missing required tools (rsync, ssh) fail the check.
+their versions. Both tools are required: missing rsync or ssh fails the
+check.
 
 Options:
 `, stderr)

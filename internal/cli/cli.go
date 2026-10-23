@@ -29,7 +29,7 @@ const (
 const usageText = `Usage: catsync <command> [options]
 
 Commands:
-  doctor    check external tools (rsync, ssh, mscp)
+  doctor    check external tools (rsync, ssh)
   plan      build a transfer plan for SOURCE [user@]host:/absolute/path
   sync      transfer SOURCE to [user@]host:/absolute/path
   resume    resume an interrupted run

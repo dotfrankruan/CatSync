@@ -9,7 +9,7 @@
 //   - new file below the threshold:    BackendFPSync, the native parallel
 //     rsync small-file stage (the backend name is kept for compatibility
 //     with existing runs; no external fpsync or fpart process is used)
-//   - new file at or above threshold:  mscp when available, otherwise rsync
+//   - new file at or above threshold:  native multistream (backend name "mscp")
 //   - existing/modified/unknown file:  rsync
 //   - symlink, special, or scan error: unsupported (explicit)
 //
@@ -61,10 +61,9 @@ const (
 type Tools struct {
 	// Rsync is the required correctness fallback; planning fails without
 	// it, as every fallback path lands on rsync and the native parallel
-	// small-file stage drives rsync directly.
+	// small-file stage drives rsync directly. The native multistream
+	// large-file backend needs no external tool beyond ssh.
 	Rsync bool
-	// MSCP is the optional parallel large-file backend.
-	MSCP bool
 }
 
 // Config is one planning request.

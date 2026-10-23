@@ -17,7 +17,7 @@ func file(path string, size int64) discovery.Entry {
 }
 
 func allTools() Tools {
-	return Tools{Rsync: true, MSCP: true}
+	return Tools{Rsync: true}
 }
 
 func rsyncOnly() Tools {
@@ -237,7 +237,7 @@ func TestForcedFPSyncRejectsLarge(t *testing.T) {
 }
 
 func TestForcedMSCP(t *testing.T) {
-	cfg := Config{Backend: state.BackendMSCP, Threshold: 1024, Tools: Tools{Rsync: true, MSCP: true}}
+	cfg := Config{Backend: state.BackendMSCP, Threshold: 1024, Tools: Tools{Rsync: true}}
 	// New files transfer with mscp at any size; unchanged files skip.
 	dest := map[string]discovery.RemoteEntry{
 		"same.txt": {Path: "same.txt", Size: 5, ModTime: testMtime},
@@ -261,7 +261,7 @@ func TestForcedMSCP(t *testing.T) {
 }
 
 func TestForcedMSCPRejectsExistingAndUnknown(t *testing.T) {
-	cfg := Config{Backend: state.BackendMSCP, Threshold: 1024, Tools: Tools{Rsync: true, MSCP: true}}
+	cfg := Config{Backend: state.BackendMSCP, Threshold: 1024, Tools: Tools{Rsync: true}}
 	// Existing but changed.
 	dest := map[string]discovery.RemoteEntry{
 		"changed.txt": {Path: "changed.txt", Size: 1, ModTime: testMtime},

@@ -6,8 +6,8 @@
 //     transfers a disjoint set of relative paths with archive semantics and
 //     never deletes. The native small-file stage also drives this package,
 //     once per disjoint batch with --no-implied-dirs.
-//   - internal/backend/mscp: the parallel single-large-file stage with
-//     checkpoint/resume.
+//   - internal/backend/multistream: the native large-file backend over
+//     system-SSH SFTP sessions with checkpoint/resume (no external tool).
 //
 // Every backend executes through internal/process with argument arrays —
 // no shell is involved locally — and honors context cancellation.
@@ -22,11 +22,9 @@ import (
 	"github.com/frankruan/catsync/internal/target"
 )
 
-// SSH carries the SSH transport options honored by the backends; they apply
-// to the rsync and mscp backends.
+// SSH carries the SSH transport options honored by the backends.
 type SSH struct {
-	// IPv6 restricts connections to IPv6 (rsync transport "ssh -6",
-	// mscp -6).
+	// IPv6 restricts connections to IPv6 (rsync transport "ssh -6").
 	IPv6 bool
 	// Program overrides the ssh executable used as rsync's remote shell
 	// (-e). Empty means the default "ssh". The value becomes the first
@@ -72,15 +70,6 @@ func (s SSH) ValidateTransport() error {
 		return unicode.IsSpace(r) || unicode.IsControl(r)
 	}) {
 		return fmt.Errorf("backend: ssh program %q contains whitespace or control characters, which rsync's -e value cannot represent", prog)
-	}
-	return nil
-}
-
-// MSCPArgs returns the mscp argument tokens carrying the SSH options.
-// Resume invocations must repeat them, matching the failed run's options.
-func (s SSH) MSCPArgs() []string {
-	if s.IPv6 {
-		return []string{"-6"}
 	}
 	return nil
 }

@@ -16,16 +16,6 @@ func TestRsyncTransport(t *testing.T) {
 	}
 }
 
-func TestMSCPArgs(t *testing.T) {
-	if got := (SSH{}).MSCPArgs(); len(got) != 0 {
-		t.Errorf("default mscp args = %v, want none", got)
-	}
-	got := (SSH{IPv6: true}).MSCPArgs()
-	if len(got) != 1 || got[0] != "-6" {
-		t.Errorf("IPv6 mscp args = %v, want [-6]", got)
-	}
-}
-
 func TestValidateDestination(t *testing.T) {
 	good := target.Destination{User: "alice", Host: "example.com", Path: "/data"}
 	if err := ValidateDestination(good); err != nil {
