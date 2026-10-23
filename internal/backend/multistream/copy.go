@@ -36,9 +36,12 @@ type CopyOptions struct {
 	// checkpoint). Those chunks are never read, written, or reported.
 	Completed map[int]struct{}
 	// OnComplete is called exactly once per newly completed chunk, after
-	// its full range has been written. A callback error stops the copy;
-	// because the error means the completion was not recorded, a later
-	// resume may safely rewrite the chunk. Nil is allowed.
+	// its full range has been written. It is the durability barrier: the
+	// callback must establish durability (e.g. fsync via the writer) before
+	// recording completion, so a checkpoint may only claim chunks whose
+	// data is durably stored. A callback error stops the copy; because the
+	// error means the completion was not recorded, a later resume may
+	// safely rewrite the chunk. Nil is allowed.
 	OnComplete func(Chunk) error
 }
 

@@ -280,8 +280,16 @@ func Resume(ctx context.Context, sourceAbs, checkpointPath, remoteFinal string, 
 
 // copyAndPublish runs the shared fresh/resume engine inside an established
 // session pool: resume-target validation, writer pool, chunked Copy with
-// per-chunk atomic checkpoint persistence, SyncAll, CloseAll, final source
-// re-check, temp metadata, and the no-clobber publish with verification.
+// per-chunk remote durability + atomic checkpoint persistence, SyncAll,
+// CloseAll, final source re-check, temp metadata, and the no-clobber
+// publish with verification.
+//
+// Durability ordering is the core invariant: a chunk's data must be fsync'd
+// on the server (SyncAny, one borrowed handle — server fsync covers the
+// whole file) BEFORE its index is recorded in the checkpoint. A sync or
+// save failure cancels the copy immediately and the unrecorded chunk is
+// re-copied on resume, so the checkpoint never claims work the server has
+// not durably persisted.
 func copyAndPublish(ctx context.Context, sourceAbs string, size uint64, mtime time.Time, mode os.FileMode, chunks []Chunk, ckpt *Checkpoint, spec RemoteTempSpec, opts *TransferOptions, clients []*sftp.Client) error {
 	pool, err := OpenRemoteWriterPool(spec, clients)
 	if err != nil {
@@ -296,6 +304,11 @@ func copyAndPublish(ctx context.Context, sourceAbs string, size uint64, mtime ti
 		Workers:   opts.Workers,
 		Completed: ckpt.CompletedSet(),
 		OnComplete: func(chunk Chunk) error {
+			// Durability first: the chunk's bytes must be fsync'd on the
+			// server before the checkpoint may claim them.
+			if err := pool.SyncAny(); err != nil {
+				return fmt.Errorf("multistream: sync chunk %d: %w", chunk.Index, err)
+			}
 			if err := ckpt.MarkComplete(chunk.Index); err != nil {
 				return err
 			}

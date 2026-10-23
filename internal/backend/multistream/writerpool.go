@@ -151,6 +151,29 @@ func writeFully(w io.WriterAt, b []byte, off int64) (int, error) {
 	return written, nil
 }
 
+// SyncAny fsyncs the shared remote object through one borrowed handle. The
+// server's fsync covers the file, not the handle, so one is sufficient.
+// This is the durability barrier for chunk completion: a chunk must not be
+// recorded as complete until SyncAny has succeeded after its writes.
+func (p *RemoteWriterPool) SyncAny() error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return ErrWriterPoolClosed
+	}
+	p.outstanding.Add(1)
+	p.mu.Unlock()
+	defer p.outstanding.Done()
+	select {
+	case w := <-p.writers:
+		err := w.file.Sync()
+		p.writers <- w // always room
+		return err
+	case <-p.done:
+		return ErrWriterPoolClosed
+	}
+}
+
 // SyncAll syncs every handle after waiting for in-flight writes to return.
 // The first data error wins; teardown never masks it.
 func (p *RemoteWriterPool) SyncAll() error {
