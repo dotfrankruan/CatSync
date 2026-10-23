@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dotfrankruan/CatSync/internal/epochtime"
 	"github.com/dotfrankruan/CatSync/internal/target"
 )
 
@@ -175,37 +176,24 @@ func parseManifestSize(s string) (int64, error) {
 	return int64(n), nil
 }
 
-// parseManifestTime parses "SECONDS[.FRACTION]" (epoch seconds with up to 9
-// fractional digits) into a UTC time. Signs and other non-digit characters
-// are rejected.
+// parseManifestTime parses a signed decimal epoch timestamp
+// ("SECONDS[.FRACTION]") into a UTC time, as GNU find's %T@ prints it.
+// Negative values are pre-epoch instants and are parsed as true signed
+// decimals: "-0.5" is half a second before the epoch. GNU find emits up to
+// ten fractional digits, one more than nanosecond precision, so anything
+// beyond nine is truncated (not rounded) as before.
 func parseManifestTime(s string) (time.Time, error) {
 	if s == "" {
 		return time.Time{}, errors.New("empty mtime")
 	}
-	secPart, fracPart, hasFrac := strings.Cut(s, ".")
-	if !isDigits(secPart) {
-		return time.Time{}, fmt.Errorf("invalid mtime %q", s)
+	if dot := strings.IndexByte(s, '.'); dot >= 0 && len(s)-dot-1 > 9 {
+		s = s[:dot+1+9]
 	}
-	sec, err := strconv.ParseInt(secPart, 10, 64)
+	t, err := epochtime.Parse(s)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("invalid mtime %q", s)
+		return time.Time{}, fmt.Errorf("invalid mtime %q: %v", s, err)
 	}
-	var nsec int64
-	if hasFrac {
-		if !isDigits(fracPart) {
-			return time.Time{}, fmt.Errorf("invalid mtime fraction %q", s)
-		}
-		if len(fracPart) > 9 {
-			fracPart = fracPart[:9]
-		}
-		// Right-pad to nanosecond precision: ".5" means 500ms.
-		fracPart += strings.Repeat("0", 9-len(fracPart))
-		nsec, err = strconv.ParseInt(fracPart, 10, 64)
-		if err != nil {
-			return time.Time{}, fmt.Errorf("invalid mtime %q", s)
-		}
-	}
-	return time.Unix(sec, nsec).UTC(), nil
+	return t, nil
 }
 
 func isDigits(s string) bool {

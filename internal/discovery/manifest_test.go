@@ -22,6 +22,9 @@ func TestParseManifestRoundTrip(t *testing.T) {
 	in.WriteString(manifestRecord("line1\nline2", "7", "9999999999.000000001"))
 	in.WriteString(manifestRecord("-leading/dash", "88", "0"))
 	in.WriteString(manifestRecord("quote'and\"double", "9", "1700000002.999999999"))
+	// Pre-epoch instants are signed decimals: GNU find prints them this way.
+	in.WriteString(manifestRecord("pre-epoch.txt", "3", "-625776832.109876544"))
+	in.WriteString(manifestRecord("pre-epoch-whole.txt", "3", "-5"))
 
 	var got []RemoteEntry
 	err := ParseManifest(strings.NewReader(in.String()), func(e RemoteEntry) error {
@@ -31,8 +34,8 @@ func TestParseManifestRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseManifest error: %v", err)
 	}
-	if len(got) != 6 {
-		t.Fatalf("got %d records, want 6", len(got))
+	if len(got) != 8 {
+		t.Fatalf("got %d records, want 8", len(got))
 	}
 
 	want := []RemoteEntry{
@@ -42,6 +45,8 @@ func TestParseManifestRoundTrip(t *testing.T) {
 		{"line1\nline2", 7, time.Unix(9999999999, 1).UTC()},
 		{"-leading/dash", 88, time.Unix(0, 0).UTC()},
 		{"quote'and\"double", 9, time.Unix(1700000002, 999999999).UTC()},
+		{"pre-epoch.txt", 3, time.Unix(-625776833, 890123456).UTC()},
+		{"pre-epoch-whole.txt", 3, time.Unix(-5, 0).UTC()},
 	}
 	for i := range want {
 		if got[i].Path != want[i].Path || got[i].Size != want[i].Size {
@@ -87,7 +92,6 @@ func TestParseManifestMalformed(t *testing.T) {
 		{"size overflows int64", manifestRecord("a", "9223372036854775808", "1"), "overflows int64"},
 		{"mtime not numeric", manifestRecord("a", "1", "now"), "invalid mtime"},
 		{"mtime empty", manifestRecord("a", "1", ""), "mtime"},
-		{"mtime negative", manifestRecord("a", "1", "-5"), "invalid mtime"},
 		{"mtime signed", manifestRecord("a", "1", "+5"), "invalid mtime"},
 		{"mtime bare dot", manifestRecord("a", "1", "1."), "fraction"},
 		{"mtime leading dot", manifestRecord("a", "1", ".5"), "invalid mtime"},

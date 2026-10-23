@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/dotfrankruan/CatSync/internal/backend/multistream"
+	"github.com/dotfrankruan/CatSync/internal/epochtime"
 	"github.com/dotfrankruan/CatSync/internal/state"
 	"github.com/dotfrankruan/CatSync/internal/target"
 	"github.com/dotfrankruan/CatSync/internal/testutil/mockexec"
@@ -166,7 +167,7 @@ func manifestContent(recs ...string) string {
 }
 
 func manifestRecord(path string, size int64, mt time.Time) string {
-	return fmt.Sprintf("%s\x00%d\x00%d.%09d\x00", path, size, mt.Unix(), int64(mt.Nanosecond()))
+	return fmt.Sprintf("%s\x00%d\x00%s\x00", path, size, epochtime.Format(mt))
 }
 
 // newFileRecord renders the manifest record for a current source file.

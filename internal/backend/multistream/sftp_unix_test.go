@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -19,6 +18,7 @@ import (
 
 	"github.com/pkg/sftp"
 
+	"github.com/dotfrankruan/CatSync/internal/epochtime"
 	"github.com/dotfrankruan/CatSync/internal/target"
 )
 
@@ -117,7 +117,7 @@ func runRemoteCommand(args []string) int {
 			fmt.Fprintln(os.Stderr, "fake ssh: touch needs @epoch")
 			return 2
 		}
-		sec, nsec, err := parseEpochNanos(cmd[3][1:])
+		mt, err := parseEpochNanos(cmd[3][1:])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "fake ssh: %v\n", err)
 			return 2
@@ -129,9 +129,7 @@ func runRemoteCommand(args []string) int {
 			return 1
 		}
 		// -m changes only mtime; atime is preserved.
-		atime := fi.ModTime()
-		mt := time.Unix(sec, nsec)
-		if err := os.Chtimes(path, atime, mt); err != nil {
+		if err := os.Chtimes(path, fi.ModTime(), mt); err != nil {
 			fmt.Fprintf(os.Stderr, "fake ssh: touch: %v\n", err)
 			return 1
 		}
@@ -159,28 +157,10 @@ func runRemoteCommand(args []string) int {
 	return 2
 }
 
-// parseEpochNanos parses "<sec>[.<frac>]" with the fraction padded to
-// nanoseconds; negative seconds are pre-epoch.
-func parseEpochNanos(s string) (int64, int64, error) {
-	secPart, fracPart, hasFrac := strings.Cut(s, ".")
-	sec, err := strconv.ParseInt(secPart, 10, 64)
-	if err != nil {
-		return 0, 0, fmt.Errorf("bad epoch seconds %q", s)
-	}
-	if !hasFrac {
-		return sec, 0, nil
-	}
-	if len(fracPart) > 9 {
-		return 0, 0, fmt.Errorf("epoch fraction too precise %q", s)
-	}
-	frac, err := strconv.ParseInt(fracPart, 10, 64)
-	if err != nil {
-		return 0, 0, fmt.Errorf("bad epoch fraction %q", s)
-	}
-	for i := len(fracPart); i < 9; i++ {
-		frac *= 10
-	}
-	return sec, frac, nil
+// parseEpochNanos parses GNU touch's "@SECONDS" operand as a true signed
+// decimal ("@-0.5" is half a second before the epoch).
+func parseEpochNanos(s string) (time.Time, error) {
+	return epochtime.Parse(s)
 }
 
 // runFakeSSH is the fake-ssh body. It records its argv and PID, optionally

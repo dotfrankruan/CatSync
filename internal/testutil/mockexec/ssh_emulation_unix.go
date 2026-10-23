@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/pkg/sftp"
+
+	"github.com/dotfrankruan/CatSync/internal/epochtime"
 )
 
 // sftpServerBin is the real OpenSSH sftp-server used to emulate the remote
@@ -214,7 +216,7 @@ func emulateTouch(cmd []string) int {
 		fmt.Fprintln(os.Stderr, "mockexec: touch needs @epoch")
 		return 2
 	}
-	sec, nsec, err := parseEpochNanos(cmd[3][1:])
+	mt, err := parseEpochNanos(cmd[3][1:])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mockexec: %v\n", err)
 		return 2
@@ -225,7 +227,7 @@ func emulateTouch(cmd []string) int {
 		fmt.Fprintf(os.Stderr, "mockexec: touch: %v\n", err)
 		return 1
 	}
-	if err := os.Chtimes(p, fi.ModTime(), time.Unix(sec, nsec)); err != nil {
+	if err := os.Chtimes(p, fi.ModTime(), mt); err != nil {
 		fmt.Fprintf(os.Stderr, "mockexec: touch: %v\n", err)
 		return 1
 	}
@@ -267,26 +269,13 @@ func emulateMkdir(cmd []string) int {
 	return 0
 }
 
-// parseEpochNanos parses "<sec>[.<frac>]" with the fraction padded to
-// nanoseconds; negative seconds are pre-epoch.
-func parseEpochNanos(s string) (int64, int64, error) {
-	secPart, fracPart, hasFrac := strings.Cut(s, ".")
-	sec, err := strconv.ParseInt(secPart, 10, 64)
+// parseEpochNanos parses GNU touch's "@SECONDS" operand as a true signed
+// decimal: "@-0.5" is half a second before the epoch. It returns the instant
+// so the caller can set exactly that mtime.
+func parseEpochNanos(s string) (time.Time, error) {
+	t, err := epochtime.Parse(s)
 	if err != nil {
-		return 0, 0, fmt.Errorf("bad epoch seconds %q", s)
+		return time.Time{}, err
 	}
-	if !hasFrac {
-		return sec, 0, nil
-	}
-	if len(fracPart) > 9 {
-		return 0, 0, fmt.Errorf("epoch fraction too precise %q", s)
-	}
-	frac, err := strconv.ParseInt(fracPart, 10, 64)
-	if err != nil {
-		return 0, 0, fmt.Errorf("bad epoch fraction %q", s)
-	}
-	for i := len(fracPart); i < 9; i++ {
-		frac *= 10
-	}
-	return sec, frac, nil
+	return t, nil
 }

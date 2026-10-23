@@ -12,6 +12,7 @@ import (
 
 	"github.com/dotfrankruan/CatSync/internal/backend"
 	"github.com/dotfrankruan/CatSync/internal/discovery"
+	"github.com/dotfrankruan/CatSync/internal/epochtime"
 	"github.com/dotfrankruan/CatSync/internal/process"
 )
 
@@ -61,7 +62,9 @@ func sshCommandArgv(cfg SFTPConfig, remoteCmd []string) ([]string, error) {
 // The decimal is built from floor-seconds plus a non-negative nanosecond
 // fraction, which is correct for pre-epoch times too.
 func setRemoteMtime(ctx context.Context, cfg SFTPConfig, p string, mtime time.Time) error {
-	dec := fmt.Sprintf("%d.%09d", mtime.Unix(), mtime.Nanosecond())
+	// A signed decimal epoch timestamp: "-0.5" is half a second before the
+	// epoch (time.Unix(-1, 500000000)), never "-1.5".
+	dec := epochtime.Format(mtime)
 	argv, err := sshCommandArgv(cfg, []string{"touch", "-m", "-d", "@" + dec, discovery.ShellQuote(p)})
 	if err != nil {
 		return err

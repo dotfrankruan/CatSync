@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dotfrankruan/CatSync/internal/epochtime"
 	"github.com/dotfrankruan/CatSync/internal/state"
 	"github.com/dotfrankruan/CatSync/internal/testutil/mockexec"
 )
@@ -112,7 +113,7 @@ func (h *cliHarness) record(rel string) string {
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	return fmt.Sprintf("%s\x00%d\x00%d.%09d\x00", rel, fi.Size(), fi.ModTime().Unix(), int64(fi.ModTime().Nanosecond()))
+	return fmt.Sprintf("%s\x00%d\x00%s\x00", rel, fi.Size(), epochtime.Format(fi.ModTime()))
 }
 
 func (h *cliHarness) invocations(tool string) []mockexec.Invocation {
@@ -682,5 +683,49 @@ func TestCATSYNCMSCPIgnored(t *testing.T) {
 	}
 	if string(got) != string(want) {
 		t.Error("final content mismatch")
+	}
+}
+
+// TestCLIPreEpochMtimeWithSizeVerify: a pre-epoch nanosecond mtime must
+// survive the whole pipeline — manifest record parsing, the native metadata
+// command, and the final verification — with the default verify=size.
+func TestCLIPreEpochMtimeWithSizeVerify(t *testing.T) {
+	h := newCLIHarness(t)
+	h.armNative()
+	h.writeSrc("big.bin", 2048)
+	preEpoch := time.Date(1950, 3, 4, 5, 6, 7, 890123456, time.UTC)
+	srcPath := filepath.Join(h.src, "big.bin")
+	if err := os.Chtimes(srcPath, preEpoch, preEpoch); err != nil {
+		t.Fatal(err)
+	}
+	// The destination manifest is collected AFTER the transfer for
+	// verification: it reports the published final's own metadata.
+	post := h.writeManifest("post", h.record("big.bin"))
+	h.scriptFreshDestSSH(post)
+
+	// No --verify flag: the default is size.
+	code, _, stderr := run(t, "sync", "--state-dir", h.stateDir,
+		"--large-threshold", "1KiB", h.src, "user@host:"+h.remoteDir)
+	if code != ExitOK {
+		t.Fatalf("sync exit = %d, stderr:\n%s", code, stderr)
+	}
+	final := filepath.Join(h.remoteDir, "big.bin")
+	got, err := os.ReadFile(final)
+	if err != nil {
+		t.Fatalf("published final missing: %v", err)
+	}
+	want, err := os.ReadFile(srcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Error("final content mismatch")
+	}
+	fi, err := os.Lstat(final)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.ModTime().Equal(preEpoch) {
+		t.Errorf("final mtime = %v, want %v (pre-epoch nanosecond exact)", fi.ModTime(), preEpoch)
 	}
 }
