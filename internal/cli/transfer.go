@@ -7,10 +7,10 @@ import (
 	"os"
 	"strings"
 
-	"github.com/frankruan/catsync/internal/executor"
-	"github.com/frankruan/catsync/internal/planner"
-	"github.com/frankruan/catsync/internal/state"
-	"github.com/frankruan/catsync/internal/target"
+	"github.com/dotfrankruan/CatSync/internal/executor"
+	"github.com/dotfrankruan/CatSync/internal/planner"
+	"github.com/dotfrankruan/CatSync/internal/state"
+	"github.com/dotfrankruan/CatSync/internal/target"
 )
 
 // executorConfig maps the shared options and operands to an executor

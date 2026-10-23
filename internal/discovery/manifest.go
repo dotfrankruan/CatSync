@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/frankruan/catsync/internal/target"
+	"github.com/dotfrankruan/CatSync/internal/target"
 )
 
 // Remote manifest format.

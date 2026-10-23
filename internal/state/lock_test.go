@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/frankruan/catsync/internal/state"
+	"github.com/dotfrankruan/CatSync/internal/state"
 )
 
 func destA() state.Destination {

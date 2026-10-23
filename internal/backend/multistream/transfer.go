@@ -12,8 +12,8 @@ import (
 
 	"github.com/pkg/sftp"
 
-	"github.com/frankruan/catsync/internal/discovery"
-	"github.com/frankruan/catsync/internal/target"
+	"github.com/dotfrankruan/CatSync/internal/discovery"
+	"github.com/dotfrankruan/CatSync/internal/target"
 )
 
 // Sentinel errors of the transfer orchestration; test with errors.Is.

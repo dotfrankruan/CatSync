@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/frankruan/catsync/internal/discovery"
+	"github.com/dotfrankruan/CatSync/internal/discovery"
 )
 
 // CheckpointVersion is the only checkpoint schema version this build reads

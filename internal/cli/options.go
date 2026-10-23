@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/frankruan/catsync/internal/bytesize"
-	"github.com/frankruan/catsync/internal/executor"
+	"github.com/dotfrankruan/CatSync/internal/bytesize"
+	"github.com/dotfrankruan/CatSync/internal/executor"
 )
 
 // Options carries the configuration shared by the transfer commands. Later

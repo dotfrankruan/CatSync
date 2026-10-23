@@ -26,10 +26,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/frankruan/catsync/internal/backend"
-	"github.com/frankruan/catsync/internal/discovery"
-	"github.com/frankruan/catsync/internal/process"
-	"github.com/frankruan/catsync/internal/target"
+	"github.com/dotfrankruan/CatSync/internal/backend"
+	"github.com/dotfrankruan/CatSync/internal/discovery"
+	"github.com/dotfrankruan/CatSync/internal/process"
+	"github.com/dotfrankruan/CatSync/internal/target"
 )
 
 // DefaultPartialDir is the relative --partial-dir used when

@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/frankruan/catsync/internal/state"
-	"github.com/frankruan/catsync/internal/target"
-	"github.com/frankruan/catsync/internal/testutil/mockexec"
+	"github.com/dotfrankruan/CatSync/internal/state"
+	"github.com/dotfrankruan/CatSync/internal/target"
+	"github.com/dotfrankruan/CatSync/internal/testutil/mockexec"
 )
 
 func TestMain(m *testing.M) {

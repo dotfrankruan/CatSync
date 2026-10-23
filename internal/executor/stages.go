@@ -11,11 +11,11 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/frankruan/catsync/internal/backend"
-	"github.com/frankruan/catsync/internal/backend/rsync"
-	"github.com/frankruan/catsync/internal/partition"
-	"github.com/frankruan/catsync/internal/state"
-	"github.com/frankruan/catsync/internal/target"
+	"github.com/dotfrankruan/CatSync/internal/backend"
+	"github.com/dotfrankruan/CatSync/internal/backend/rsync"
+	"github.com/dotfrankruan/CatSync/internal/partition"
+	"github.com/dotfrankruan/CatSync/internal/state"
+	"github.com/dotfrankruan/CatSync/internal/target"
 )
 
 // destTarget converts the run's recorded destination for backend use.

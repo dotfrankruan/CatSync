@@ -11,9 +11,9 @@ import (
 
 	"github.com/pkg/sftp"
 
-	"github.com/frankruan/catsync/internal/backend"
-	"github.com/frankruan/catsync/internal/process"
-	"github.com/frankruan/catsync/internal/target"
+	"github.com/dotfrankruan/CatSync/internal/backend"
+	"github.com/dotfrankruan/CatSync/internal/process"
+	"github.com/dotfrankruan/CatSync/internal/target"
 )
 
 // SFTPConfig describes one system-SSH SFTP session: ssh is executed with

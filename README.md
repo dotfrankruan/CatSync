@@ -84,7 +84,7 @@ make cross     # dist/ binaries: linux/amd64, linux/arm64, darwin/arm64
 make clean     # remove bin/ and dist/
 ```
 
-Install with `go install github.com/frankruan/catsync/cmd/catsync@latest`
+Install with `go install github.com/dotfrankruan/CatSync/cmd/catsync@latest`
 or copy `bin/catsync` into your `PATH`.
 
 ## Commands

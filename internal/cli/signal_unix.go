@@ -8,7 +8,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/frankruan/catsync/internal/process"
+	"github.com/dotfrankruan/CatSync/internal/process"
 )
 
 // signalContext returns a context cancelled on SIGINT or SIGTERM, so an

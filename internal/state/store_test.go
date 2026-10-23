@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/frankruan/catsync/internal/state"
+	"github.com/dotfrankruan/CatSync/internal/state"
 )
 
 // sameJSON fails the test unless want and got encode to identical JSON,

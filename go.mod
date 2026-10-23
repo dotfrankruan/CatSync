@@ -1,4 +1,4 @@
-module github.com/frankruan/catsync
+module github.com/dotfrankruan/CatSync
 
 go 1.23.0
 

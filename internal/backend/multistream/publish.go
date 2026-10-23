@@ -10,9 +10,9 @@ import (
 
 	"github.com/pkg/sftp"
 
-	"github.com/frankruan/catsync/internal/backend"
-	"github.com/frankruan/catsync/internal/discovery"
-	"github.com/frankruan/catsync/internal/process"
+	"github.com/dotfrankruan/CatSync/internal/backend"
+	"github.com/dotfrankruan/CatSync/internal/discovery"
+	"github.com/dotfrankruan/CatSync/internal/process"
 )
 
 // Sentinel errors of the publish layer; test with errors.Is.

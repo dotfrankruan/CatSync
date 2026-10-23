@@ -19,7 +19,7 @@ import (
 
 	"github.com/pkg/sftp"
 
-	"github.com/frankruan/catsync/internal/target"
+	"github.com/dotfrankruan/CatSync/internal/target"
 )
 
 // The fake ssh helper is the test binary itself, re-executed with the

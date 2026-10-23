@@ -36,8 +36,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/frankruan/catsync/internal/discovery"
-	"github.com/frankruan/catsync/internal/state"
+	"github.com/dotfrankruan/CatSync/internal/discovery"
+	"github.com/dotfrankruan/CatSync/internal/state"
 )
 
 // Status is the planning outcome for one path. It mirrors the state's

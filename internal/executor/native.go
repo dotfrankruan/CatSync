@@ -14,9 +14,9 @@ import (
 
 	"github.com/pkg/sftp"
 
-	"github.com/frankruan/catsync/internal/backend"
-	"github.com/frankruan/catsync/internal/backend/multistream"
-	"github.com/frankruan/catsync/internal/state"
+	"github.com/dotfrankruan/CatSync/internal/backend"
+	"github.com/dotfrankruan/CatSync/internal/backend/multistream"
+	"github.com/dotfrankruan/CatSync/internal/state"
 )
 
 // nativeChunkSize is the fixed chunk size for native multistream transfers.

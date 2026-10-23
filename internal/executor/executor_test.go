@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/frankruan/catsync/internal/planner"
-	"github.com/frankruan/catsync/internal/state"
-	"github.com/frankruan/catsync/internal/target"
+	"github.com/dotfrankruan/CatSync/internal/planner"
+	"github.com/dotfrankruan/CatSync/internal/state"
+	"github.com/dotfrankruan/CatSync/internal/target"
 )
 
 func validTestConfig(t *testing.T) Config {

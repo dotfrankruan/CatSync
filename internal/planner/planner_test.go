@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/frankruan/catsync/internal/discovery"
-	"github.com/frankruan/catsync/internal/state"
+	"github.com/dotfrankruan/CatSync/internal/discovery"
+	"github.com/dotfrankruan/CatSync/internal/state"
 )
 
 var testMtime = time.Unix(1700000000, 123456789).UTC()

@@ -19,7 +19,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/frankruan/catsync/internal/target"
+	"github.com/dotfrankruan/CatSync/internal/target"
 )
 
 // SSH carries the SSH transport options honored by the backends.

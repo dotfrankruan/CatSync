@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/frankruan/catsync/internal/backend"
-	"github.com/frankruan/catsync/internal/target"
+	"github.com/dotfrankruan/CatSync/internal/backend"
+	"github.com/dotfrankruan/CatSync/internal/target"
 )
 
 func testDest() target.Destination {

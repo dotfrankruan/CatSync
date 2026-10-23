@@ -11,8 +11,8 @@ import (
 	"io"
 	"strings"
 
-	"github.com/frankruan/catsync/internal/executor"
-	"github.com/frankruan/catsync/internal/target"
+	"github.com/dotfrankruan/CatSync/internal/executor"
+	"github.com/dotfrankruan/CatSync/internal/target"
 )
 
 // Process exit codes returned by Run.

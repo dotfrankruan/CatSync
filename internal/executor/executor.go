@@ -34,12 +34,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/frankruan/catsync/internal/backend"
-	"github.com/frankruan/catsync/internal/discovery"
-	"github.com/frankruan/catsync/internal/planner"
-	"github.com/frankruan/catsync/internal/process"
-	"github.com/frankruan/catsync/internal/state"
-	"github.com/frankruan/catsync/internal/target"
+	"github.com/dotfrankruan/CatSync/internal/backend"
+	"github.com/dotfrankruan/CatSync/internal/discovery"
+	"github.com/dotfrankruan/CatSync/internal/planner"
+	"github.com/dotfrankruan/CatSync/internal/process"
+	"github.com/dotfrankruan/CatSync/internal/state"
+	"github.com/dotfrankruan/CatSync/internal/target"
 )
 
 // Tuning constants of the MVP orchestration.

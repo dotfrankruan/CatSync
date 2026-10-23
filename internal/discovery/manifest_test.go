@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/frankruan/catsync/internal/target"
+	"github.com/dotfrankruan/CatSync/internal/target"
 )
 
 // manifestRecord renders one record in the wire format.

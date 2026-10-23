@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/frankruan/catsync/internal/state"
+	"github.com/dotfrankruan/CatSync/internal/state"
 )
 
 // fixedTime has no monotonic clock reading, so JSON round trips compare
