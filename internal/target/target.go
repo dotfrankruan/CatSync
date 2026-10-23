@@ -1,10 +1,4 @@
-// Package target validates the source and remote destination operands of a
-// CatSync transfer.
-//
-// The source must be an existing, readable local directory. The destination
-// must be a remote rsync/SSH-style target of the form [user@]host:path with
-// an absolute path; bracketed IPv6 literals such as
-// "user@[2001:db8::1]:/data" are supported.
+// Package target validates local and remote CatSync transfer operands.
 package target
 
 import (
@@ -13,6 +7,101 @@ import (
 	"path/filepath"
 	"strings"
 )
+
+// Direction identifies which endpoint owns the source data.
+type Direction string
+
+const (
+	LocalToRemote Direction = "local-to-remote"
+	RemoteToLocal Direction = "remote-to-local"
+)
+
+// Transfer is a validated pair containing exactly one local endpoint and
+// one remote endpoint. LocalPath is the local source root for LocalToRemote
+// and the local destination root for RemoteToLocal.
+type Transfer struct {
+	Direction Direction
+	LocalPath string
+	Remote    Destination
+}
+
+// ParseTransfer validates a SOURCE/DESTINATION operand pair. Exactly one
+// operand must use the remote [user@]host:/absolute/path syntax.
+func ParseTransfer(source, destination string) (Transfer, error) {
+	sourceRemote := looksRemote(source)
+	destinationRemote := looksRemote(destination)
+	if sourceRemote == destinationRemote {
+		if sourceRemote {
+			return Transfer{}, fmt.Errorf("remote-to-remote transfers are not supported; exactly one endpoint must be local")
+		}
+		return Transfer{}, fmt.Errorf("local-to-local transfers are not supported; exactly one endpoint must be remote")
+	}
+	if sourceRemote {
+		remote, err := ParseDestination(source)
+		if err != nil {
+			return Transfer{}, fmt.Errorf("remote source: %w", err)
+		}
+		local, err := ValidateLocalDestination(destination)
+		if err != nil {
+			return Transfer{}, err
+		}
+		return Transfer{Direction: RemoteToLocal, LocalPath: local, Remote: remote}, nil
+	}
+	local, err := ValidateSource(source)
+	if err != nil {
+		return Transfer{}, err
+	}
+	remote, err := ParseDestination(destination)
+	if err != nil {
+		return Transfer{}, err
+	}
+	return Transfer{Direction: LocalToRemote, LocalPath: local, Remote: remote}, nil
+}
+
+// looksRemote recognizes an intended rsync/SSH operand without treating an
+// ordinary absolute local path as remote. Validation remains ParseDestination's
+// responsibility so malformed remote operands produce a useful error.
+func looksRemote(s string) bool {
+	if s == "" || filepath.IsAbs(s) {
+		return false
+	}
+	return separatorColon(s) >= 0
+}
+
+// ValidateLocalDestination returns an absolute local destination directory.
+// An absent path is allowed because sync creates it later; an existing path
+// must be a readable directory. Symlinked directory roots are accepted just
+// like local source roots.
+func ValidateLocalDestination(p string) (string, error) {
+	if p == "" {
+		return "", fmt.Errorf("local destination path is empty")
+	}
+	if strings.ContainsRune(p, 0) {
+		return "", fmt.Errorf("local destination path %q: NUL bytes are not allowed", p)
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", fmt.Errorf("local destination %q: resolve absolute path: %w", p, err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return abs, nil
+		}
+		return "", fmt.Errorf("local destination %q: %w", p, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("local destination %q is not a directory", p)
+	}
+	f, err := os.Open(abs)
+	if err != nil {
+		return "", fmt.Errorf("local destination %q is not readable: %w", p, err)
+	}
+	if err := f.Close(); err != nil {
+		return "", fmt.Errorf("local destination %q: close: %w", p, err)
+	}
+	return abs, nil
+}
 
 // Destination is a validated remote destination.
 type Destination struct {

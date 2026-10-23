@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -148,5 +149,70 @@ func TestValidateSourceUnreadable(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 	if _, err := ValidateSource(dir); err == nil {
 		t.Fatal("unreadable source: want error")
+	}
+}
+
+func TestParseTransferDirections(t *testing.T) {
+	localSource := t.TempDir()
+	localDest := filepath.Join(t.TempDir(), "new-destination")
+
+	upload, err := ParseTransfer(localSource, "user@host:/srv/upload")
+	if err != nil {
+		t.Fatalf("ParseTransfer upload: %v", err)
+	}
+	if upload.Direction != LocalToRemote || upload.LocalPath != localSource || upload.Remote.String() != "user@host:/srv/upload" {
+		t.Fatalf("upload = %+v", upload)
+	}
+
+	download, err := ParseTransfer("user@[2001:db8::1]:/srv/source", localDest)
+	if err != nil {
+		t.Fatalf("ParseTransfer download: %v", err)
+	}
+	if download.Direction != RemoteToLocal || download.LocalPath != localDest || download.Remote.String() != "user@[2001:db8::1]:/srv/source" {
+		t.Fatalf("download = %+v", download)
+	}
+}
+
+func TestParseTransferRejectsSameSideAndMalformedRemote(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct {
+		name string
+		src  string
+		dst  string
+		want string
+	}{
+		{"local to local", dir, filepath.Join(dir, "dest"), "local-to-local"},
+		{"remote to remote", "a:/src", "b:/dst", "remote-to-remote"},
+		{"relative remote path", "host:relative", dir, "not absolute"},
+		{"malformed remote host", "bad host:/src", dir, "disallowed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseTransfer(tc.src, tc.dst)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ParseTransfer(%q, %q) error = %v, want substring %q", tc.src, tc.dst, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateLocalDestination(t *testing.T) {
+	existing := t.TempDir()
+	got, err := ValidateLocalDestination(existing)
+	if err != nil || got != existing {
+		t.Fatalf("ValidateLocalDestination(existing) = %q, %v", got, err)
+	}
+
+	missing := filepath.Join(t.TempDir(), "missing")
+	got, err = ValidateLocalDestination(missing)
+	if err != nil || got != missing {
+		t.Fatalf("ValidateLocalDestination(missing) = %q, %v", got, err)
+	}
+
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateLocalDestination(file); err == nil {
+		t.Fatal("regular-file destination accepted")
 	}
 }
