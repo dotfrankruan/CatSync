@@ -170,7 +170,7 @@ func TestTransferCancelAndResume(t *testing.T) {
 
 	// Resume completes the pending chunks.
 	env.opts.OnChunkComplete = nil
-	if _, err := Resume(context.Background(), env.sourceAbs, env.ckptPath, env.final(), env.opts); err != nil {
+	if _, err := Resume(context.Background(), env.sourceAbs, env.sourceRel, env.ckptPath, env.final(), env.opts); err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
 	ckpt, err = LoadCheckpoint(env.ckptPath)
@@ -239,7 +239,7 @@ func TestResumeDestinationMismatch(t *testing.T) {
 	}
 	env.opts.OnChunkComplete = nil
 	other := path.Join(env.remoteDir, "other.bin")
-	if _, err := Resume(context.Background(), env.sourceAbs, env.ckptPath, other, env.opts); !errors.Is(err, ErrDestinationMismatch) {
+	if _, err := Resume(context.Background(), env.sourceAbs, env.sourceRel, env.ckptPath, other, env.opts); !errors.Is(err, ErrDestinationMismatch) {
 		t.Fatalf("Resume with wrong destination = %v, want ErrDestinationMismatch", err)
 	}
 }
@@ -257,8 +257,41 @@ func TestResumeSourceMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	env.opts.OnChunkComplete = nil
-	if _, err := Resume(context.Background(), env.sourceAbs, env.ckptPath, env.final(), env.opts); !errors.Is(err, ErrSourceMismatch) {
+	if _, err := Resume(context.Background(), env.sourceAbs, env.sourceRel, env.ckptPath, env.final(), env.opts); !errors.Is(err, ErrSourceMismatch) {
 		t.Fatalf("Resume with changed size = %v, want ErrSourceMismatch", err)
+	}
+}
+
+// TestResumeSourceBindingBeforeSSH proves the Resume API itself validates
+// the expected relative source path and its checkpoint binding before it can
+// start the configured ssh program. The executor's duplicate check is only
+// defense in depth, not part of the library's correctness.
+func TestResumeSourceBindingBeforeSSH(t *testing.T) {
+	env := newTransferEnv(t, 16<<10, 8<<10)
+	env.opts.CheckpointPath = env.ckptPath
+	fi, err := os.Stat(env.sourceAbs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tempPath := path.Join(env.remoteDir, ".catsync-tmp-binding")
+	ckpt, err := NewCheckpoint(env.sourceRel, uint64(fi.Size()), fi.ModTime(),
+		destinationIdentity(env.opts.SFTP.Dest, env.final()), tempPath, 8<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ckpt.Save(env.ckptPath); err != nil {
+		t.Fatal(err)
+	}
+	// If validation regresses and SSH is attempted, this nonexistent program
+	// produces an unrelated start error and the ErrSourceMismatch assertion
+	// below fails.
+	env.opts.SFTP.Program = filepath.Join(t.TempDir(), "ssh-must-not-start")
+
+	for _, sourceRel := range []string{"../escape.bin", "other.bin"} {
+		_, err := Resume(context.Background(), env.sourceAbs, sourceRel, env.ckptPath, env.final(), env.opts)
+		if !errors.Is(err, ErrSourceMismatch) {
+			t.Errorf("Resume source %q = %v, want ErrSourceMismatch before SSH", sourceRel, err)
+		}
 	}
 }
 

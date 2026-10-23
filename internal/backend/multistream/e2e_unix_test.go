@@ -83,7 +83,7 @@ func TestNativeTransferEndToEnd(t *testing.T) {
 
 	// 3. Resume: same temp, only pending chunks, byte-exact publish.
 	opts.OnChunkComplete = nil
-	res, err := Resume(context.Background(), src, ckptPath, final, opts)
+	res, err := Resume(context.Background(), src, "src/big.bin", ckptPath, final, opts)
 	if err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestNativeTransferEndToEnd(t *testing.T) {
 	// 4. A second Resume against the already-published state is the
 	// crash-window recovery: it recognizes final and temp as the same
 	// inode, reports Recovered, and copies nothing. It never overwrites.
-	again, err := Resume(context.Background(), src, ckptPath, final, opts)
+	again, err := Resume(context.Background(), src, "src/big.bin", ckptPath, final, opts)
 	if err != nil {
 		t.Fatalf("recovery resume: %v", err)
 	}

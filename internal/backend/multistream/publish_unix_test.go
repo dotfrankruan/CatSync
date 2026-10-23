@@ -217,7 +217,7 @@ func TestTransferCrashWindowRecovery(t *testing.T) {
 	// retired. Resume must recover without copying.
 	copies := 0
 	env.opts.OnChunkComplete = func(done, total int) { copies++ }
-	res2, err := Resume(context.Background(), env.sourceAbs, env.ckptPath, env.final(), env.opts)
+	res2, err := Resume(context.Background(), env.sourceAbs, env.sourceRel, env.ckptPath, env.final(), env.opts)
 	if err != nil {
 		t.Fatalf("Resume: %v", err)
 	}

@@ -338,7 +338,7 @@ func (e *Executor) nativeLargeTask(ctx context.Context, t *state.Task, ckptDir s
 		if ck.Source != t.Path {
 			return e.failTask(t, fmt.Sprintf("native checkpoint is bound to source %q, not %q; refusing to resume", ck.Source, t.Path))
 		}
-		result, err = multistream.Resume(ctx, sourceAbs, checkpoint, remoteFinal, opts)
+		result, err = multistream.Resume(ctx, sourceAbs, t.Path, checkpoint, remoteFinal, opts)
 		if errors.Is(err, multistream.ErrRemoteTempMissing) {
 			// The recorded transfer never created its temp (it failed
 			// before the first remote write). Nothing was transferred, so

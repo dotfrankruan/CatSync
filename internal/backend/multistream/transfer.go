@@ -212,16 +212,25 @@ func Transfer(ctx context.Context, sourceAbs, sourceRel, remoteFinal string, opt
 // identity, source relative path, size, nanosecond mtime, chunk size, and
 // temp path must all match; the temp is validated (not re-created, not
 // re-truncated) and only the pending chunks are transferred.
-func Resume(ctx context.Context, sourceAbs, checkpointPath, remoteFinal string, opts TransferOptions) (*TransferResult, error) {
+func Resume(ctx context.Context, sourceAbs, sourceRel, checkpointPath, remoteFinal string, opts TransferOptions) (*TransferResult, error) {
 	if ctx == nil {
 		return nil, errors.New("multistream: nil context")
 	}
 	if err := opts.normalize(); err != nil {
 		return nil, err
 	}
+	// The library enforces the source binding itself rather than relying on
+	// an executor caller to do so. Both validation and comparison happen
+	// before any SSH/SFTP session can start.
+	if err := discovery.ValidateRelPath(sourceRel); err != nil {
+		return nil, fmt.Errorf("%w: invalid expected source path %q: %v", ErrSourceMismatch, sourceRel, err)
+	}
 	ckpt, err := LoadCheckpoint(checkpointPath)
 	if err != nil {
 		return nil, err
+	}
+	if ckpt.Source != sourceRel {
+		return nil, fmt.Errorf("%w: checkpoint is bound to source %q, not %q", ErrSourceMismatch, ckpt.Source, sourceRel)
 	}
 	if ckpt.Destination != destinationIdentity(opts.SFTP.Dest, remoteFinal) {
 		return nil, fmt.Errorf("%w: checkpoint is bound to %q, not %q", ErrDestinationMismatch, ckpt.Destination, destinationIdentity(opts.SFTP.Dest, remoteFinal))
