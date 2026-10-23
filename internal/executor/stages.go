@@ -13,6 +13,7 @@ import (
 
 	"github.com/dotfrankruan/CatSync/internal/backend"
 	"github.com/dotfrankruan/CatSync/internal/backend/rsync"
+	"github.com/dotfrankruan/CatSync/internal/discovery"
 	"github.com/dotfrankruan/CatSync/internal/partition"
 	"github.com/dotfrankruan/CatSync/internal/state"
 	"github.com/dotfrankruan/CatSync/internal/target"
@@ -20,11 +21,25 @@ import (
 
 // destTarget converts the run's recorded destination for backend use.
 func (e *Executor) destTarget() target.Destination {
+	if e.run.Config.Direction.Effective() == state.DirectionRemoteToLocal {
+		return target.Destination{User: e.run.Source.User, Host: e.run.Source.Host, Path: e.run.Source.Path}
+	}
 	return target.Destination{
 		User: e.run.Destination.User,
 		Host: e.run.Destination.Host,
 		Path: e.run.Destination.Path,
 	}
+}
+
+func (e *Executor) transferDirection() target.Direction {
+	return target.Direction(e.run.Config.Direction.Effective())
+}
+
+func (e *Executor) localRoot() string {
+	if e.run.Config.Direction.Effective() == state.DirectionRemoteToLocal {
+		return e.run.Destination.Path
+	}
+	return e.run.Source.Path
 }
 
 // stageVerifyNone reports whether tasks complete immediately after their
@@ -268,7 +283,8 @@ func (e *Executor) runSmallBatch(ctx, stageCtx context.Context, batch partition.
 	var stdout, stderr bytes.Buffer
 	cfg := rsync.Config{
 		Program:       e.progs.rsync(),
-		SourceDir:     e.run.Source.Path,
+		Direction:     e.transferDirection(),
+		SourceDir:     e.localRoot(),
 		Dest:          e.destTarget(),
 		SSH:           e.sshOpts(e.run.Config.IPv6),
 		Paths:         paths,
@@ -404,15 +420,29 @@ func (e *Executor) rsyncStage(ctx context.Context) error {
 		return errors.New("rsync unavailable")
 	}
 
+	requested := e.tasksAt(idxs)
 	var active []*state.Task
-	for _, i := range idxs {
-		t := &e.run.Tasks[i]
-		ok, rerr := e.recheckBefore(t)
-		if rerr != nil {
-			return rerr
+	if e.run.Config.Direction.Effective() == state.DirectionRemoteToLocal {
+		var err error
+		active, err = e.recheckRemoteSource(ctx, requested, "before transfer")
+		if err != nil {
+			return err
 		}
-		if ok {
-			active = append(active, t)
+		if err := ensureLocalParents(e.run.Destination.Path, active); err != nil {
+			if ferr := e.failBatch(active, fmt.Sprintf("prepare local destination parents: %v", err)); ferr != nil {
+				return ferr
+			}
+			return err
+		}
+	} else {
+		for _, t := range requested {
+			ok, rerr := e.recheckBefore(t)
+			if rerr != nil {
+				return rerr
+			}
+			if ok {
+				active = append(active, t)
+			}
 		}
 	}
 	if len(active) == 0 {
@@ -430,13 +460,17 @@ func (e *Executor) rsyncStage(ctx context.Context) error {
 	e.logf("stage rsync: %d file(s)", len(active))
 	cfg := rsync.Config{
 		Program:   e.progs.rsync(),
-		SourceDir: e.run.Source.Path,
+		Direction: e.transferDirection(),
+		SourceDir: e.localRoot(),
 		Dest:      e.destTarget(),
 		SSH:       e.sshOpts(e.run.Config.IPv6),
 		Paths:     paths,
 		Env:       e.cfg.Env,
 		Stdout:    e.stdout,
 		Stderr:    e.stderr,
+	}
+	if e.run.Config.Direction.Effective() == state.DirectionRemoteToLocal {
+		cfg.NoImpliedDirs = true
 	}
 	if err := cfg.Run(ctx); err != nil {
 		if ctx.Err() == nil {
@@ -448,17 +482,91 @@ func (e *Executor) rsyncStage(ctx context.Context) error {
 		}
 		return err
 	}
-	for _, t := range active {
-		ok, rerr := e.recheckAfter(t)
-		if rerr != nil {
-			return rerr
+	if e.run.Config.Direction.Effective() == state.DirectionRemoteToLocal {
+		var err error
+		active, err = e.recheckRemoteSource(ctx, active, "after transfer")
+		if err != nil {
+			return err
 		}
-		if !ok {
-			continue
+	}
+	for _, t := range active {
+		if e.run.Config.Direction.Effective() != state.DirectionRemoteToLocal {
+			ok, rerr := e.recheckAfter(t)
+			if rerr != nil {
+				return rerr
+			}
+			if !ok {
+				continue
+			}
 		}
 		if e.stageVerifyNone() {
 			if cerr := e.completeTask(t); cerr != nil {
 				return cerr
+			}
+		}
+	}
+	return nil
+}
+
+// recheckRemoteSource performs one batched remote source scan and retains
+// only tasks whose regular-file size and nanosecond mtime still match the
+// immutable plan.
+func (e *Executor) recheckRemoteSource(ctx context.Context, tasks []*state.Task, phase string) ([]*state.Task, error) {
+	entries, err := e.collectRemoteSource(ctx, e.destTarget(), e.run.Config.IPv6)
+	if err != nil {
+		return nil, fmt.Errorf("remote source revalidation %s: %w", phase, err)
+	}
+	byPath := make(map[string]discovery.Entry, len(entries))
+	for _, entry := range entries {
+		byPath[entry.Path] = entry
+	}
+	active := make([]*state.Task, 0, len(tasks))
+	for _, t := range tasks {
+		entry, ok := byPath[t.Path]
+		if !ok || entry.Kind != discovery.KindFile || entry.Size != t.Size || !entry.ModTime.Equal(t.ModTime) {
+			if ferr := e.failTask(t, "remote source changed "+phase+"; start a new run"); ferr != nil {
+				return nil, ferr
+			}
+			continue
+		}
+		active = append(active, t)
+	}
+	return active, nil
+}
+
+// ensureLocalParents creates download parent directories one component at a
+// time and refuses an existing symlink or non-directory component. Combined
+// with rsync --no-implied-dirs this prevents a remote relative path from
+// escaping through an implied local parent symlink.
+func ensureLocalParents(root string, tasks []*state.Task) error {
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return err
+	}
+	seen := map[string]struct{}{}
+	for _, t := range tasks {
+		parent := filepath.Dir(filepath.FromSlash(t.Path))
+		if parent == "." {
+			continue
+		}
+		cur := root
+		for _, elem := range strings.Split(filepath.ToSlash(parent), "/") {
+			cur = filepath.Join(cur, elem)
+			if _, done := seen[cur]; done {
+				continue
+			}
+			seen[cur] = struct{}{}
+			fi, err := os.Lstat(cur)
+			switch {
+			case err == nil && fi.IsDir():
+				continue
+			case err == nil:
+				return fmt.Errorf("%s is not a directory", cur)
+			case errors.Is(err, os.ErrNotExist):
+				if err := os.Mkdir(cur, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+					return err
+				}
+			case err != nil:
+				return err
 			}
 		}
 	}
@@ -484,7 +592,14 @@ func (e *Executor) verifyStage(ctx context.Context) error {
 		return nil
 	}
 	e.logf("verify: size check of %d file(s) (size equality is not content proof)", len(candidates))
-	manifest, known, err := e.collectManifest(ctx, e.destTarget(), e.run.Config.IPv6)
+	var manifest map[string]discovery.RemoteEntry
+	known := true
+	var err error
+	if e.run.Config.Direction.Effective() == state.DirectionRemoteToLocal {
+		manifest, err = collectLocalManifest(e.run.Destination.Path)
+	} else {
+		manifest, known, err = e.collectManifest(ctx, e.destTarget(), e.run.Config.IPv6)
+	}
 	if err != nil || !known {
 		if err == nil {
 			err = errors.New("destination state unavailable")

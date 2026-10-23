@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -197,6 +198,49 @@ func TestCLISyncEndToEnd(t *testing.T) {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("status output missing %q:\n%s", want, stdout)
 		}
+	}
+}
+
+func TestCLIRemoteToLocalRsyncRouting(t *testing.T) {
+	h := newCLIHarness(t)
+	download := filepath.Join(t.TempDir(), "download")
+	manifest := h.writeManifest("remote-source", "dir/file.txt\x00f\x0012\x001700000000.25\x00link\x00l\x003\x001700000001\x00")
+	h.writeScript("ssh", "match=-mindepth 1\nstdout_file="+manifest+"\n")
+	h.writeScript("rsync", "exit=0")
+
+	code, stdout, stderr := run(t, "sync", "--verify", "none", "--state-dir", h.stateDir,
+		"user@host:/remote/source", download)
+	if code != ExitOK {
+		t.Fatalf("download sync exit = %d, stderr:\n%s", code, stderr)
+	}
+	if !strings.Contains(stdout, "completed 1") || !strings.Contains(stdout, "unsupported 1") {
+		t.Fatalf("download summary unexpected:\n%s", stdout)
+	}
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runRec, err := store.Latest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runRec.Config.Direction != state.DirectionRemoteToLocal || runRec.Source.String() != "user@host:/remote/source" || runRec.Destination.Path != download {
+		t.Fatalf("download state endpoints: direction=%q source=%q destination=%q", runRec.Config.Direction, runRec.Source.String(), runRec.Destination.Path)
+	}
+	rs := h.invocations("rsync")
+	if len(rs) != 1 {
+		t.Fatalf("rsync invocations = %d, want 1", len(rs))
+	}
+	args := rs[0].Args
+	if len(args) < 2 || args[len(args)-2] != "user@host:/remote/source/" || args[len(args)-1] != download+"/" {
+		t.Fatalf("download rsync operands = %q", args)
+	}
+	payload, err := base64.StdEncoding.DecodeString(rs[0].Stdin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(payload); got != "dir/file.txt\x00" {
+		t.Fatalf("download rsync file list = %q", got)
 	}
 }
 

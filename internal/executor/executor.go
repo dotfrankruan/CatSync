@@ -94,9 +94,13 @@ func orDefault(v, def string) string {
 // uses only StateDir, Programs, Env, Stdout, and Stderr — the run's
 // recorded configuration is authoritative for everything else.
 type Config struct {
-	// SourceDir is the absolute local source directory.
+	// Direction selects upload or download. Empty preserves the historical
+	// local-to-remote behavior.
+	Direction target.Direction
+	// SourceDir is the absolute local endpoint: source directory for uploads
+	// and destination directory for downloads.
 	SourceDir string
-	// Dest is the validated remote destination.
+	// Dest is the remote endpoint: destination for uploads, source for downloads.
 	Dest target.Destination
 	// Backend is the requested backend selection (auto or concrete).
 	Backend state.Backend
@@ -126,6 +130,10 @@ type Config struct {
 
 // validateFull checks a Sync configuration.
 func (c *Config) validateFull() error {
+	direction := c.direction()
+	if direction != target.LocalToRemote && direction != target.RemoteToLocal {
+		return fmt.Errorf("%w: invalid direction %q", ErrInvalidConfig, c.Direction)
+	}
 	if !c.Backend.Valid() {
 		return fmt.Errorf("%w: backend %q", ErrInvalidConfig, c.Backend)
 	}
@@ -149,7 +157,7 @@ func (c *Config) validateFull() error {
 		return fmt.Errorf("%w: state directory is empty", ErrInvalidConfig)
 	}
 	if c.SourceDir == "" || !filepath.IsAbs(c.SourceDir) {
-		return fmt.Errorf("%w: source directory %q is not absolute", ErrInvalidConfig, c.SourceDir)
+		return fmt.Errorf("%w: local endpoint %q is not absolute", ErrInvalidConfig, c.SourceDir)
 	}
 	if err := backend.ValidateDestination(c.Dest); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidConfig, err)
@@ -169,6 +177,13 @@ func (c *Config) validateFull() error {
 		}
 	}
 	return nil
+}
+
+func (c *Config) direction() target.Direction {
+	if c.Direction == "" {
+		return target.LocalToRemote
+	}
+	return c.Direction
 }
 
 // validateResume checks the fields Resume consumes.
@@ -386,6 +401,59 @@ func (e *Executor) collectManifest(ctx context.Context, dest target.Destination,
 	return m, true, nil
 }
 
+// collectRemoteSource discovers every non-directory remote source entry in
+// one SSH call. A missing source is a hard error, unlike a missing upload
+// destination, which is an authoritative empty destination.
+func (e *Executor) collectRemoteSource(ctx context.Context, source target.Destination, ipv6 bool) ([]discovery.Entry, error) {
+	argv, err := discovery.SourceManifestCommandProg(e.progs.ssh(), source, ipv6)
+	if err != nil {
+		return nil, err
+	}
+	var stdout, stderr strings.Builder
+	err = process.Run(ctx, process.Spec{Name: argv[0], Args: argv[1:], Env: e.cfg.Env, Stdout: &stdout, Stderr: &stderr})
+	if err != nil {
+		var exitErr *process.ExitError
+		if errors.As(err, &exitErr) && exitErr.Code == discovery.ManifestExitNoSuchDir {
+			return nil, fmt.Errorf("executor: remote source directory %q does not exist", source.Path)
+		}
+		detail := strings.TrimSpace(stderr.String())
+		if detail != "" {
+			return nil, fmt.Errorf("executor: remote source discovery failed: %w (%s)", err, firstLine(detail))
+		}
+		return nil, fmt.Errorf("executor: remote source discovery failed: %w", err)
+	}
+	entries, err := discovery.CollectRemoteSourceManifest(strings.NewReader(stdout.String()))
+	if err != nil {
+		return nil, fmt.Errorf("executor: remote source discovery failed: %w", err)
+	}
+	return entries, nil
+}
+
+// collectLocalManifest gathers local destination metadata for download
+// planning and verification. Non-regular entries are represented as known
+// conflicts so the planner never treats their paths as safely new.
+func collectLocalManifest(root string) (map[string]discovery.RemoteEntry, error) {
+	if _, err := os.Stat(root); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return map[string]discovery.RemoteEntry{}, nil
+		}
+		return nil, err
+	}
+	out := make(map[string]discovery.RemoteEntry)
+	err := discovery.Walk(root, func(entry discovery.Entry) error {
+		if entry.Err != nil {
+			return entry.Err
+		}
+		if entry.Kind == discovery.KindFile {
+			out[entry.Path] = discovery.RemoteEntry{Path: entry.Path, Size: entry.Size, ModTime: entry.ModTime}
+		} else {
+			out[entry.Path] = discovery.RemoteEntry{Path: entry.Path, Size: -1}
+		}
+		return nil
+	})
+	return out, err
+}
+
 // mkdirRemoteParents creates the given absolute remote directories with one
 // batched ssh mkdir -p call.
 func (e *Executor) mkdirRemoteParents(ctx context.Context, dest target.Destination, ipv6 bool, dirs []string) error {
@@ -421,6 +489,8 @@ func firstLine(s string) string {
 
 // PlanOutcome is the result of a plan-only invocation.
 type PlanOutcome struct {
+	// Direction identifies upload or download for accurate reporting.
+	Direction target.Direction
 	// Result is the planner assignment.
 	Result *planner.Result
 	// ManifestKnown reports whether the destination metadata is
@@ -458,6 +528,33 @@ func (e *Executor) planPhase(ctx context.Context) (*PlanOutcome, error) {
 	}
 	tools := e.detectTools()
 	var entries []discovery.Entry
+	if e.cfg.direction() == target.RemoteToLocal {
+		var err error
+		entries, err = e.collectRemoteSource(ctx, e.cfg.Dest, e.cfg.IPv6)
+		if err != nil {
+			return nil, err
+		}
+		dest, err := collectLocalManifest(e.cfg.SourceDir)
+		if err != nil {
+			return nil, fmt.Errorf("executor: scan local destination: %w", err)
+		}
+		// The first production download slice uses rsync for every regular
+		// file. Native reverse multistream is wired in a later slice.
+		if e.cfg.Backend != state.BackendAuto && e.cfg.Backend != state.BackendRsync {
+			return nil, fmt.Errorf("%w: backend %q is not yet available for remote-to-local transfers; use auto or rsync", ErrInvalidConfig, e.cfg.Backend)
+		}
+		result, err := planner.Plan(entries, dest, planner.Config{Backend: state.BackendRsync, Threshold: e.cfg.LargeThreshold, Tools: tools})
+		if err != nil {
+			return nil, err
+		}
+		out := &PlanOutcome{Direction: e.cfg.direction(), Result: result, ManifestKnown: true, Tools: tools}
+		for _, d := range result.Decisions {
+			if d.Status == planner.StatusPending {
+				out.LogicalBytes += d.Size
+			}
+		}
+		return out, nil
+	}
 	if err := discovery.Walk(e.cfg.SourceDir, func(en discovery.Entry) error {
 		entries = append(entries, en)
 		return nil
@@ -485,7 +582,7 @@ func (e *Executor) planPhase(ctx context.Context) (*PlanOutcome, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := &PlanOutcome{Result: result, ManifestKnown: known, ManifestErr: merr, Tools: tools}
+	out := &PlanOutcome{Direction: e.cfg.direction(), Result: result, ManifestKnown: known, ManifestErr: merr, Tools: tools}
 	for _, d := range result.Decisions {
 		if d.Status == planner.StatusPending {
 			out.LogicalBytes += d.Size
@@ -504,18 +601,12 @@ func (e *Executor) buildRun(out *PlanOutcome) (*state.Run, error) {
 	if err != nil {
 		return nil, fmt.Errorf("executor: resolve source path: %w", err)
 	}
+	direction := e.cfg.direction()
 	run := &state.Run{
-		ID: id,
-		Source: state.Source{
-			Path: srcAbs,
-		},
-		Destination: state.Destination{
-			User: e.cfg.Dest.User,
-			Host: e.cfg.Dest.Host,
-			Path: e.cfg.Dest.Path,
-		},
+		ID:      id,
 		WorkDir: srcAbs,
 		Config: state.Config{
+			Direction:      state.Direction(direction),
 			Backend:        e.cfg.Backend,
 			DryRun:         e.cfg.DryRun,
 			IPv6:           e.cfg.IPv6,
@@ -526,6 +617,13 @@ func (e *Executor) buildRun(out *PlanOutcome) (*state.Run, error) {
 		},
 		Status:    state.StatusPending,
 		CreatedAt: time.Now().UTC(),
+	}
+	if direction == target.RemoteToLocal {
+		run.Source = state.Source{User: e.cfg.Dest.User, Host: e.cfg.Dest.Host, Path: e.cfg.Dest.Path}
+		run.Destination = state.Destination{Path: srcAbs}
+	} else {
+		run.Source = state.Source{Path: srcAbs}
+		run.Destination = state.Destination{User: e.cfg.Dest.User, Host: e.cfg.Dest.Host, Path: e.cfg.Dest.Path}
 	}
 	for _, d := range out.Result.Decisions {
 		t := state.Task{
@@ -569,7 +667,11 @@ func syncWith(ctx context.Context, cfg Config, prepare func(*Executor)) (*state.
 	if prepare != nil {
 		prepare(e)
 	}
-	lock, err := e.lockDestination(state.Destination{User: cfg.Dest.User, Host: cfg.Dest.Host, Path: cfg.Dest.Path})
+	lockDest := state.Destination{User: cfg.Dest.User, Host: cfg.Dest.Host, Path: cfg.Dest.Path}
+	if cfg.direction() == target.RemoteToLocal {
+		lockDest = state.Destination{Path: cfg.SourceDir}
+	}
+	lock, err := e.lockDestination(lockDest)
 	if err != nil {
 		return nil, err
 	}
@@ -598,6 +700,11 @@ func syncWith(ctx context.Context, cfg Config, prepare func(*Executor)) (*state.
 		}
 		e.logf("run %s: dry run complete; no data was transferred", run.ID)
 		return run, nil
+	}
+	if cfg.direction() == target.RemoteToLocal {
+		if err := os.MkdirAll(cfg.SourceDir, 0o755); err != nil {
+			return run, fmt.Errorf("executor: create local destination: %w", err)
+		}
 	}
 	err = e.execute(ctx)
 	return run, err
@@ -637,9 +744,17 @@ func resumeWith(ctx context.Context, cfg Config, id string, prepare func(*Execut
 	// strategy, but the current invocation's program overrides are what
 	// Resume will actually execute, so they must pass the same validation
 	// a fresh sync applies (notably the rsync -e transport check).
+	direction := target.Direction(run.Config.Direction.Effective())
+	localDir := run.Source.Path
+	remote := target.Destination{User: run.Destination.User, Host: run.Destination.Host, Path: run.Destination.Path}
+	if direction == target.RemoteToLocal {
+		localDir = run.Destination.Path
+		remote = target.Destination{User: run.Source.User, Host: run.Source.Host, Path: run.Source.Path}
+	}
 	rc := Config{
-		SourceDir:      run.Source.Path,
-		Dest:           target.Destination{User: run.Destination.User, Host: run.Destination.Host, Path: run.Destination.Path},
+		Direction:      direction,
+		SourceDir:      localDir,
+		Dest:           remote,
 		Backend:        run.Config.Backend,
 		Verify:         run.Config.Verify,
 		Jobs:           run.Config.Jobs,
@@ -652,8 +767,12 @@ func resumeWith(ctx context.Context, cfg Config, id string, prepare func(*Execut
 	if err := rc.validateFull(); err != nil {
 		return run, fmt.Errorf("executor: run %s configuration no longer valid: %w", run.ID, err)
 	}
-	if _, err := target.ValidateSource(run.Source.Path); err != nil {
-		return run, fmt.Errorf("executor: run %s source: %w", run.ID, err)
+	if direction == target.LocalToRemote {
+		if _, err := target.ValidateSource(run.Source.Path); err != nil {
+			return run, fmt.Errorf("executor: run %s source: %w", run.ID, err)
+		}
+	} else if _, err := target.ValidateLocalDestination(run.Destination.Path); err != nil {
+		return run, fmt.Errorf("executor: run %s destination: %w", run.ID, err)
 	}
 	e.run = run
 	lock, err := e.lockDestination(run.Destination)
@@ -661,6 +780,11 @@ func resumeWith(ctx context.Context, cfg Config, id string, prepare func(*Execut
 		return run, err
 	}
 	defer func() { _ = lock.Unlock() }()
+	if direction == target.RemoteToLocal {
+		if err := os.MkdirAll(run.Destination.Path, 0o755); err != nil {
+			return run, fmt.Errorf("executor: create local destination: %w", err)
+		}
+	}
 
 	// A crash between persisting completion and checkpoint cleanup leaves a
 	// completed task referencing a file. Retire those now; this cannot lose

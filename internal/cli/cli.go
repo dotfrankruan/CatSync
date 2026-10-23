@@ -30,8 +30,8 @@ const usageText = `Usage: catsync <command> [options]
 
 Commands:
   doctor    check external tools (rsync, ssh)
-  plan      build a transfer plan for SOURCE [user@]host:/absolute/path
-  sync      transfer SOURCE to [user@]host:/absolute/path
+  plan      build a transfer plan between one local and one remote endpoint
+  sync      transfer between one local and one remote endpoint
   resume    resume an interrupted run
   status    show the status of a run
   version   print the catsync version
@@ -186,21 +186,16 @@ func runTransferCommand(name string, args []string, stdout, stderr io.Writer) in
 		return ExitUsage
 	}
 	if len(operands) != 2 {
-		fmt.Fprintf(stderr, "catsync: %s: want SOURCE and [user@]host:/absolute/path, got %d operands\n", name, len(operands))
+		fmt.Fprintf(stderr, "catsync: %s: want SOURCE and DESTINATION with exactly one remote endpoint, got %d operands\n", name, len(operands))
 		fs.Usage()
 		return ExitUsage
 	}
-	src, err := target.ValidateSource(operands[0])
+	transfer, err := target.ParseTransfer(operands[0], operands[1])
 	if err != nil {
 		fmt.Fprintf(stderr, "catsync: %s: %v\n", name, err)
 		return ExitUsage
 	}
-	dst, err := target.ParseDestination(operands[1])
-	if err != nil {
-		fmt.Fprintf(stderr, "catsync: %s: %v\n", name, err)
-		return ExitUsage
-	}
-	cfg := opts.executorConfig(src, dst, stdout, stderr)
+	cfg := opts.executorConfig(transfer, stdout, stderr)
 	ctx, stop := signalContext()
 	defer stop()
 	if name == "plan" {
@@ -257,12 +252,13 @@ func exitForError(err error) int {
 }
 
 func transferUsage(name string) string {
-	return fmt.Sprintf(`Usage: catsync %s [options] SOURCE [user@]host:/absolute/path
+	return fmt.Sprintf(`Usage: catsync %s [options] SOURCE DESTINATION
 
-SOURCE must be an existing, readable local directory. The destination must
-name an absolute path on a remote host; bracketed IPv6 literals such as
-user@[2001:db8::1]:/data are accepted. CatSync never deletes destination
-files; --delete is rejected.
+Exactly one endpoint must be local and one remote. Upload uses
+LOCAL_SOURCE [user@]host:/absolute/path; download uses
+[user@]host:/absolute/path LOCAL_DESTINATION. Remote paths must be absolute;
+bracketed IPv6 literals are accepted. CatSync never deletes destination files;
+--delete is rejected.
 
 Options may appear before, between, or after the operands: for example
 "catsync %s --jobs 8 SRC DEST" and "catsync %s SRC DEST --jobs 8" are

@@ -17,14 +17,15 @@ import (
 // configuration. Program overrides come from the CATSYNC_* environment
 // (diagnostics and tests); they are never printed. With --quiet the
 // executor's progress output is discarded; errors always reach stderr.
-func (o *Options) executorConfig(src string, dst target.Destination, stdout, stderr io.Writer) executor.Config {
+func (o *Options) executorConfig(transfer target.Transfer, stdout, stderr io.Writer) executor.Config {
 	execOut := stdout
 	if o.Quiet {
 		execOut = nil
 	}
 	return executor.Config{
-		SourceDir:      src,
-		Dest:           dst,
+		Direction:      transfer.Direction,
+		SourceDir:      transfer.LocalPath,
+		Dest:           transfer.Remote,
 		Backend:        state.Backend(o.Backend),
 		DryRun:         o.DryRun,
 		IPv6:           o.IPv6,
@@ -79,7 +80,11 @@ func printPlan(w io.Writer, out *executor.PlanOutcome, opts *Options) {
 	}
 	fmt.Fprintf(w, "plan: %d source entry(ies)\n", len(out.Result.Decisions))
 	if out.ManifestKnown {
-		fmt.Fprintln(w, "destination metadata: authoritative (remote manifest collected)")
+		if out.Direction == target.RemoteToLocal {
+			fmt.Fprintln(w, "destination metadata: authoritative (local destination scanned)")
+		} else {
+			fmt.Fprintln(w, "destination metadata: authoritative (remote manifest collected)")
+		}
 	} else {
 		fmt.Fprintln(w, "destination metadata: UNKNOWN — conservative fallback, every transferable file routes to rsync")
 	}
@@ -220,15 +225,15 @@ func warnUnsupported(w io.Writer, command string, run *state.Run) {
 // statusView renders a run for the status command without mutating it.
 func printRunStatus(w io.Writer, run *state.Run, verbose bool) {
 	fmt.Fprintf(w, "run %s: %s\n", run.ID, run.Status)
-	fmt.Fprintf(w, "  source:      %s\n", run.Source.Path)
+	fmt.Fprintf(w, "  source:      %s\n", run.Source.String())
 	fmt.Fprintf(w, "  destination: %s\n", run.Destination.String())
 	fmt.Fprintf(w, "  created:     %s\n", run.CreatedAt.Format("2006-01-02 15:04:05 UTC"))
 	fmt.Fprintf(w, "  updated:     %s\n", run.UpdatedAt.Format("2006-01-02 15:04:05 UTC"))
 	if run.FinishedAt != nil {
 		fmt.Fprintf(w, "  finished:    %s\n", run.FinishedAt.Format("2006-01-02 15:04:05 UTC"))
 	}
-	fmt.Fprintf(w, "  config:      backend=%s verify=%s jobs=%d streams=%d threshold=%d ipv6=%v dry_run=%v\n",
-		run.Config.Backend, run.Config.Verify, run.Config.Jobs, run.Config.Streams,
+	fmt.Fprintf(w, "  config:      direction=%s backend=%s verify=%s jobs=%d streams=%d threshold=%d ipv6=%v dry_run=%v\n",
+		run.Config.Direction.Effective(), run.Config.Backend, run.Config.Verify, run.Config.Jobs, run.Config.Streams,
 		run.Config.LargeThreshold, run.Config.IPv6, run.Config.DryRun)
 	counts := map[state.Status]int{}
 	byBackend := map[state.Backend]int{}

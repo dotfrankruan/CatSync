@@ -34,7 +34,7 @@ func ParseTransfer(source, destination string) (Transfer, error) {
 		if sourceRemote {
 			return Transfer{}, fmt.Errorf("remote-to-remote transfers are not supported; exactly one endpoint must be local")
 		}
-		return Transfer{}, fmt.Errorf("local-to-local transfers are not supported; exactly one endpoint must be remote")
+		return Transfer{}, fmt.Errorf("destination is local; local-to-local transfers are not supported and exactly one endpoint must be remote")
 	}
 	if sourceRemote {
 		remote, err := ParseDestination(source)
