@@ -80,60 +80,43 @@ func (c *idempotentWriteCloser) Close() error {
 	return c.err
 }
 
-// WithClient starts one ssh process running the remote SFTP subsystem and
-// invokes fn with a live SFTP client over its stdin/stdout. The client is
-// callback-scoped: fn must not retain or use it after returning.
-//
-// Lifecycle guarantees:
-//
-//   - Invalid configuration, nil ctx/callback, and pre-cancelled contexts
-//     fail before ssh is started.
-//   - On callback error the callback's error is preserved and ssh is
-//     cancelled and reaped.
-//   - On context cancellation the SFTP pipes are closed (unblocking any
-//     in-flight SFTP call), the process group is signalled and reaped, and
-//     the returned error wraps ctx.Err().
-//   - If ssh fails to start, dies before the handshake, or exits non-zero,
-//     the handshake never blocks forever and the process error is
-//     preserved.
-//   - Every helper goroutine and the ssh process are gone before return.
-func (c SFTPConfig) WithClient(ctx context.Context, fn func(*sftp.Client) error) error {
-	if ctx == nil {
-		return errors.New("multistream: nil context")
-	}
-	if fn == nil {
-		return errors.New("multistream: nil callback")
-	}
-	argv, err := c.Command()
-	if err != nil {
-		return err
-	}
-	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("multistream: sftp session cancelled before starting: %w", err)
-	}
+// sftpSession is one live system-SSH SFTP session: a client plus the ssh
+// process underneath it.
+type sftpSession struct {
+	client  *sftp.Client
+	handle  *process.Handle
+	closeRx func() // closes the client's read end, exactly once
+}
 
-	// Two OS pipe pairs join the SFTP client to ssh's stdin/stdout:
-	// clientTx → ssh stdin, ssh stdout → clientRx. OS pipes (not io.Pipe)
-	// are used so exec hands the FDs to the child directly: no copy
-	// goroutines, and closing our ends is exact — a closed transport can
-	// never surface as a fake process failure.
-	//
-	// Descriptor ownership:
-	//   - clientTx_r and sshRx_w are the child's ends; the parent's copies
-	//     are closed right after Start so EOF propagation is exact.
-	//   - clientTx_w is owned by the sftp client; client.Close() closes it.
-	//     Before a client exists (handshake failure or cancellation) we
-	//     close it ourselves.
-	//   - sshRx_r is owned by us and closed exactly once (guarded).
+// close tears the session down: the client's read end closes first so its
+// recv goroutine unblocks, then client.Close() joins its goroutines and
+// closes the write end, the remote sftp server sees stdin EOF and exits,
+// and Wait reaps ssh. A lingering ssh is bounded by the caller's context
+// through the process-group teardown.
+func (s *sftpSession) close() error {
+	s.closeRx()
+	clientErr := s.client.Close()
+	waitErr := s.handle.Wait()
+	if clientErr != nil {
+		return clientErr
+	}
+	return waitErr
+}
+
+// startSession starts one ssh process and completes the SFTP handshake. On
+// any failure the process is torn down and no pipe leaks. The handshake
+// runs in a goroutine so cancellation and early process death can
+// interrupt it.
+func (c SFTPConfig) startSession(ctx context.Context, argv []string) (*sftpSession, error) {
 	clientTx_r, clientTx_w, err := os.Pipe()
 	if err != nil {
-		return fmt.Errorf("multistream: sftp transport pipe: %w", err)
+		return nil, fmt.Errorf("multistream: sftp transport pipe: %w", err)
 	}
 	sshRx_r, sshRx_w, err := os.Pipe()
 	if err != nil {
 		clientTx_r.Close()
 		clientTx_w.Close()
-		return fmt.Errorf("multistream: sftp transport pipe: %w", err)
+		return nil, fmt.Errorf("multistream: sftp transport pipe: %w", err)
 	}
 	var rxOnce sync.Once
 	closeClientRx := func() { rxOnce.Do(func() { _ = sshRx_r.Close() }) }
@@ -151,16 +134,13 @@ func (c SFTPConfig) WithClient(ctx context.Context, fn func(*sftp.Client) error)
 		clientTx_w.Close()
 		sshRx_r.Close()
 		sshRx_w.Close()
-		return err
+		return nil, err
 	}
 	// The child owns its copies of these ends now; closing ours means the
 	// child sees EOF exactly when the client side closes.
 	clientTx_r.Close()
 	sshRx_w.Close()
 
-	// The handshake runs in a goroutine so context cancellation and early
-	// process death can interrupt it (NewClientPipe reads the server
-	// version, which never arrives if ssh died or was cancelled).
 	type hsResult struct {
 		client *sftp.Client
 		err    error
@@ -177,15 +157,14 @@ func (c SFTPConfig) WithClient(ctx context.Context, fn func(*sftp.Client) error)
 	case res := <-hsCh:
 		client, hsErr = res.client, res.err
 	case <-ctx.Done():
-		// Close the client-side pipe ends so the handshake unblocks.
 		clientTx_w.Close()
 		closeClientRx()
-		<-hsCh // returns a pipe error; the ctx error is what matters
+		<-hsCh
 	case <-h.Exited():
 		// ssh died before the handshake (auth failure, bad host, ...).
 		clientTx_w.Close()
 		closeClientRx()
-		res := <-hsCh // unblocked by the closed pipes
+		res := <-hsCh
 		if res.err != nil {
 			hsErr = res.err
 		}
@@ -195,56 +174,119 @@ func (c SFTPConfig) WithClient(ctx context.Context, fn func(*sftp.Client) error)
 		closeClientRx()
 		waitErr := h.Wait()
 		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("multistream: sftp session interrupted: %w", err)
+			return nil, fmt.Errorf("multistream: sftp session interrupted: %w", err)
 		}
 		if hsErr != nil && waitErr != nil {
-			return fmt.Errorf("multistream: sftp handshake failed: %w; ssh: %v", hsErr, waitErr)
+			return nil, fmt.Errorf("multistream: sftp handshake failed: %w; ssh: %v", hsErr, waitErr)
 		}
 		if hsErr != nil {
-			return fmt.Errorf("multistream: sftp handshake failed: %w", hsErr)
+			return nil, fmt.Errorf("multistream: sftp handshake failed: %w", hsErr)
 		}
 		if waitErr != nil {
-			return fmt.Errorf("multistream: sftp transport: %w", waitErr)
+			return nil, fmt.Errorf("multistream: sftp transport: %w", waitErr)
 		}
-		return errors.New("multistream: sftp handshake produced no client")
+		return nil, errors.New("multistream: sftp handshake produced no client")
+	}
+	return &sftpSession{client: client, handle: h, closeRx: closeClientRx}, nil
+}
+
+// MaxSFTPStreams caps one pool: the number of concurrent SFTP sessions over
+// one destination. It keeps a configuration mistake from opening hundreds
+// of ssh processes.
+const MaxSFTPStreams = 64
+
+// WithClients establishes streams SFTP sessions, one after another — never
+// concurrently, so interactive password/PIN/host-key prompts never pile up
+// — and invokes fn with all of them once every handshake has succeeded. If
+// session N fails, the previous N-1 sessions are closed and reaped first.
+// Clients are callback-scoped: fn must not retain or use them after
+// returning, and every ssh process is reaped before return.
+//
+// Error precedence: context cancellation, then the callback's error, then
+// the session/teardown failure that is the real cause.
+func (c SFTPConfig) WithClients(ctx context.Context, streams int, fn func([]*sftp.Client) error) error {
+	if ctx == nil {
+		return errors.New("multistream: nil context")
+	}
+	if fn == nil {
+		return errors.New("multistream: nil callback")
+	}
+	if streams < 1 || streams > MaxSFTPStreams {
+		return fmt.Errorf("multistream: streams must be between 1 and %d, got %d", MaxSFTPStreams, streams)
+	}
+	argv, err := c.Command()
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("multistream: sftp sessions cancelled before starting: %w", err)
 	}
 
-	// Session watcher: on cancellation, close the client's read end so
-	// in-flight SFTP calls unblock. (A client blocked writing unblocks when
-	// the process-group teardown kills ssh, breaking the pipe.)
+	var sessions []*sftpSession
+	for i := 0; i < streams; i++ {
+		s, err := c.startSession(ctx, argv)
+		if err != nil {
+			var teardownErr error
+			for _, prev := range sessions {
+				if cerr := prev.close(); cerr != nil && teardownErr == nil {
+					teardownErr = cerr
+				}
+			}
+			if ctx.Err() != nil {
+				return fmt.Errorf("multistream: sftp session %d interrupted: %w", i, ctx.Err())
+			}
+			if teardownErr != nil {
+				return errors.Join(fmt.Errorf("multistream: sftp session %d: %w", i, err),
+					fmt.Errorf("multistream: teardown of earlier sessions: %w", teardownErr))
+			}
+			return fmt.Errorf("multistream: sftp session %d: %w", i, err)
+		}
+		sessions = append(sessions, s)
+	}
+
+	clients := make([]*sftp.Client, len(sessions))
+	for i, s := range sessions {
+		clients[i] = s.client
+	}
+
+	// Pool watcher: on cancellation, close every client's read end so
+	// in-flight SFTP calls unblock.
 	sessDone := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
-			closeClientRx()
+			for _, s := range sessions {
+				s.closeRx()
+			}
 		case <-sessDone:
 		}
 	}()
 
-	cbErr := fn(client)
+	cbErr := fn(clients)
 	close(sessDone)
 
-	// Teardown order matters: the client's recv goroutine reads from the
-	// protocol pipe, so closing the client's read end first unblocks it;
-	// only then can client.Close() join its goroutines and close the write
-	// end. The remote sftp server then sees stdin EOF and exits, and Wait
-	// reaps ssh. A lingering ssh is still bounded by the caller's ctx via
-	// the process-group teardown.
-	closeClientRx()
-	clientCloseErr := client.Close()
-	waitErr := h.Wait()
-
+	var teardownErr error
+	for _, s := range sessions {
+		if err := s.close(); err != nil && teardownErr == nil {
+			teardownErr = err
+		}
+	}
 	switch {
 	case ctx.Err() != nil:
-		// Cancellation dominates: a callback error produced by the
-		// teardown is an effect, not the cause.
-		return fmt.Errorf("multistream: sftp session interrupted: %w", ctx.Err())
+		return fmt.Errorf("multistream: sftp sessions interrupted: %w", ctx.Err())
 	case cbErr != nil:
-		// The callback's error is causal; transport teardown cannot mask it.
 		return cbErr
-	case clientCloseErr != nil:
-		return fmt.Errorf("multistream: sftp client close: %w", clientCloseErr)
 	default:
-		return waitErr
+		return teardownErr
 	}
+}
+
+// WithClient starts one ssh process running the remote SFTP subsystem and
+// invokes fn with a live SFTP client over its stdin/stdout. The client is
+// callback-scoped: fn must not retain or use it after returning. It is the
+// single-session form of WithClients.
+func (c SFTPConfig) WithClient(ctx context.Context, fn func(*sftp.Client) error) error {
+	return c.WithClients(ctx, 1, func(clients []*sftp.Client) error {
+		return fn(clients[0])
+	})
 }

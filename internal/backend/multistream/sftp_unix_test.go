@@ -28,6 +28,7 @@ const (
 	envRecord     = "CATSYNC_TEST_SFTP_RECORD"     // dir receiving argv/pid records
 	envEchoEnv    = "CATSYNC_TEST_SFTP_ECHOENV"    // env var name echoed to stderr
 	envFailExit   = "CATSYNC_TEST_SFTP_FAILEXIT"   // exit immediately with this code
+	envFailNth    = "CATSYNC_TEST_SFTP_FAILNTH"    // the Nth invocation exits 42
 	envRealServer = "CATSYNC_TEST_SFTP_REALSERVER" // run the real sftp-server
 )
 
@@ -67,6 +68,13 @@ func runFakeSSH() int {
 	if dir := os.Getenv(envRecord); dir != "" {
 		_ = os.WriteFile(filepath.Join(dir, "argv"), []byte(strings.Join(os.Args[1:], "\x00")), 0o600)
 		_ = os.WriteFile(filepath.Join(dir, "pid"), []byte(fmt.Sprint(os.Getpid())), 0o600)
+		// Append to the per-pool pid log; sessions start sequentially, so
+		// appends never race.
+		f, err := os.OpenFile(filepath.Join(dir, "pids"), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+		if err == nil {
+			fmt.Fprintln(f, os.Getpid())
+			f.Close()
+		}
 	}
 	if name := os.Getenv(envEchoEnv); name != "" {
 		fmt.Fprintln(os.Stderr, os.Getenv(name))
@@ -77,6 +85,25 @@ func runFakeSSH() int {
 			n = 2
 		}
 		return n
+	}
+	if nth := os.Getenv(envFailNth); nth != "" {
+		// Sequential startups make the counter file race-free.
+		dir := os.Getenv(envRecord)
+		var n, count int
+		if _, err := fmt.Sscanf(nth, "%d", &n); err != nil {
+			n = 0
+		}
+		if dir != "" {
+			path := filepath.Join(dir, "count")
+			if data, err := os.ReadFile(path); err == nil {
+				fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &count)
+			}
+			count++
+			_ = os.WriteFile(path, []byte(fmt.Sprint(count)), 0o600)
+		}
+		if n > 0 && count == n {
+			return 42
+		}
 	}
 	if os.Getenv(envRealServer) != "" && realServerAvailable() {
 		// The real server inherits our stdio exactly; no copying, no shell.
