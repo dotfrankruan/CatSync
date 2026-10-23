@@ -54,6 +54,79 @@ type RemoteEntry struct {
 	ModTime time.Time
 }
 
+// ParseRemoteSourceManifest streams NUL-delimited remote source records:
+// path, GNU find %y type byte, size, and mtime. Directories are omitted by
+// the producer. Regular files, symlinks, and other special entries map to
+// the same Entry model used by local discovery, so planning is symmetric.
+func ParseRemoteSourceManifest(r io.Reader, emit func(Entry) error) error {
+	if emit == nil {
+		return errors.New("discovery: emit callback is nil")
+	}
+	br := bufio.NewReader(r)
+	seen := make(map[string]struct{})
+	for rec := 1; ; rec++ {
+		path, eof, err := readManifestField(br, MaxManifestPathBytes)
+		if err != nil {
+			return malformedf(rec, "path: %v", err)
+		}
+		if eof {
+			return nil
+		}
+		typeField, eof, err := readManifestField(br, 1)
+		if err != nil || eof {
+			return malformedf(rec, "type: invalid or truncated field")
+		}
+		sizeField, eof, err := readManifestField(br, maxManifestNumBytes)
+		if err != nil || eof {
+			return malformedf(rec, "size: invalid or truncated field")
+		}
+		mtimeField, eof, err := readManifestField(br, maxManifestNumBytes)
+		if err != nil || eof {
+			return malformedf(rec, "mtime: invalid or truncated field")
+		}
+		if err := ValidateRelPath(path); err != nil {
+			return malformedf(rec, "path: %v", err)
+		}
+		if _, dup := seen[path]; dup {
+			return malformedf(rec, "duplicate record for path %q", path)
+		}
+		seen[path] = struct{}{}
+		size, err := parseManifestSize(sizeField)
+		if err != nil {
+			return malformedf(rec, "size: %v", err)
+		}
+		mtime, err := parseManifestTime(mtimeField)
+		if err != nil {
+			return malformedf(rec, "mtime: %v", err)
+		}
+		entry := Entry{Path: path, Size: size, ModTime: mtime}
+		switch typeField {
+		case "f":
+			entry.Kind = KindFile
+		case "l":
+			entry.Kind = KindSymlink
+		default:
+			if len(typeField) != 1 {
+				return malformedf(rec, "invalid type %q", typeField)
+			}
+			entry.Kind = KindSpecial
+		}
+		if err := emit(entry); err != nil {
+			return err
+		}
+	}
+}
+
+// CollectRemoteSourceManifest collects the source records in producer order.
+func CollectRemoteSourceManifest(r io.Reader) ([]Entry, error) {
+	var entries []Entry
+	err := ParseRemoteSourceManifest(r, func(entry Entry) error {
+		entries = append(entries, entry)
+		return nil
+	})
+	return entries, err
+}
+
 // ParseManifest streams manifest records from r, delivering each to emit.
 // It stops and returns the first emit error. Malformed input produces a
 // record-numbered error wrapping ErrMalformedManifest. An empty stream is a
@@ -253,6 +326,21 @@ func ManifestCommandProg(prog string, dest target.Destination, ipv6 bool) ([]str
 	}
 	q := shellQuote(dest.Path)
 	script := "if [ -d " + q + " ]; then find " + q + " -type f -printf '%P\\0%s\\0%T@\\0'; else exit " +
+		strconv.Itoa(ManifestExitNoSuchDir) + "; fi"
+	return append(argv, script), nil
+}
+
+// SourceManifestCommandProg builds the single SSH invocation used to
+// discover a remote source tree. GNU find emits every non-directory entry,
+// including a type byte, so unsupported symlinks and special files are not
+// silently omitted. find does not follow symlinks.
+func SourceManifestCommandProg(prog string, source target.Destination, ipv6 bool) ([]string, error) {
+	argv, err := sshArgv(prog, source, ipv6)
+	if err != nil {
+		return nil, err
+	}
+	q := shellQuote(source.Path)
+	script := "if [ -d " + q + " ]; then find " + q + " -mindepth 1 ! -type d -printf '%P\\0%y\\0%s\\0%T@\\0'; else exit " +
 		strconv.Itoa(ManifestExitNoSuchDir) + "; fi"
 	return append(argv, script), nil
 }

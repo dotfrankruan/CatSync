@@ -14,6 +14,59 @@ func manifestRecord(path, size, mtime string) string {
 	return path + "\x00" + size + "\x00" + mtime + "\x00"
 }
 
+func sourceManifestRecord(path, kind, size, mtime string) string {
+	return path + "\x00" + kind + "\x00" + size + "\x00" + mtime + "\x00"
+}
+
+func TestParseRemoteSourceManifest(t *testing.T) {
+	in := sourceManifestRecord("plain.txt", "f", "10", "1700000000.25") +
+		sourceManifestRecord("link", "l", "3", "1700000001") +
+		sourceManifestRecord("fifo", "p", "0", "1700000002") +
+		sourceManifestRecord("line\nbreak", "f", "7", "-0.5")
+	entries, err := CollectRemoteSourceManifest(strings.NewReader(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 4 {
+		t.Fatalf("entries = %d, want 4", len(entries))
+	}
+	if entries[0].Kind != KindFile || entries[1].Kind != KindSymlink || entries[2].Kind != KindSpecial || entries[3].Kind != KindFile {
+		t.Fatalf("kinds = %v %v %v %v", entries[0].Kind, entries[1].Kind, entries[2].Kind, entries[3].Kind)
+	}
+	if !entries[3].ModTime.Equal(time.Unix(-1, 500000000).UTC()) {
+		t.Fatalf("negative mtime = %v", entries[3].ModTime)
+	}
+}
+
+func TestParseRemoteSourceManifestRejectsMalformed(t *testing.T) {
+	for _, in := range []string{
+		sourceManifestRecord("dup", "f", "1", "1") + sourceManifestRecord("dup", "f", "1", "1"),
+		sourceManifestRecord("../escape", "f", "1", "1"),
+		sourceManifestRecord("file", "ff", "1", "1"),
+		"file\x00f\x001\x00",
+	} {
+		if _, err := CollectRemoteSourceManifest(strings.NewReader(in)); err == nil || !errors.Is(err, ErrMalformedManifest) {
+			t.Fatalf("manifest %q error = %v, want ErrMalformedManifest", in, err)
+		}
+	}
+}
+
+func TestSourceManifestCommandProg(t *testing.T) {
+	got, err := SourceManifestCommandProg("/opt/ssh", target.Destination{User: "u", Host: "h", Path: "/source tree"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"/opt/ssh", "-6", "u@h", "if [ -d '/source tree' ]; then find '/source tree' -mindepth 1 ! -type d -printf '%P\\0%y\\0%s\\0%T@\\0'; else exit 42; fi"}
+	if len(got) != len(want) {
+		t.Fatalf("argv = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("argv[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 func TestParseManifestRoundTrip(t *testing.T) {
 	var in strings.Builder
 	in.WriteString(manifestRecord("plain.txt", "10", "1700000000.1234567890"))
