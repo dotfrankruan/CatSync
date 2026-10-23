@@ -80,21 +80,21 @@ func (o *TransferOptions) normalize() error {
 }
 
 // statSource stats the local source; it must be a regular file.
-func statSource(abs string) (size uint64, mtime time.Time, err error) {
+func statSource(abs string) (size uint64, mtime time.Time, mode os.FileMode, err error) {
 	fi, err := os.Stat(abs)
 	if err != nil {
-		return 0, time.Time{}, fmt.Errorf("multistream: stat source: %w", err)
+		return 0, time.Time{}, 0, fmt.Errorf("multistream: stat source: %w", err)
 	}
 	if !fi.Mode().IsRegular() {
-		return 0, time.Time{}, fmt.Errorf("multistream: source %q is not a regular file", abs)
+		return 0, time.Time{}, 0, fmt.Errorf("multistream: source %q is not a regular file", abs)
 	}
-	return uint64(fi.Size()), fi.ModTime(), nil
+	return uint64(fi.Size()), fi.ModTime(), fi.Mode().Perm(), nil
 }
 
 // verifySourceUnchanged confirms the source still has the exact identity
 // the transfer was planned against.
 func verifySourceUnchanged(abs string, size uint64, mtime time.Time) error {
-	s2, m2, err := statSource(abs)
+	s2, m2, _, err := statSource(abs)
 	if err != nil {
 		return err
 	}
@@ -126,152 +126,220 @@ func randomTempPath(finalPath string) (string, error) {
 	return path.Join(dir, ".catsync-tmp-"+base+"-"+hex.EncodeToString(b[:])), nil
 }
 
+// TransferResult is the outcome of a completed Transfer/Resume.
+type TransferResult struct {
+	// Published: the final path is now live (hardlink published, or an
+	// earlier crashed run's publish recovered via the same-inode probe).
+	Published bool
+	// Recovered: Published was reached by recovering an earlier run's
+	// completed-but-unrecorded publish (the crash window).
+	Recovered bool
+	// TempPath still exists after publish; removing it is cleanup that
+	// must happen only after the run state is durably recorded.
+	TempPath string
+	// CheckpointPath must be retired only after the run state is durably
+	// recorded.
+	CheckpointPath string
+}
+
 // Transfer performs a fresh native large-file transfer: deterministic plan,
 // atomic local checkpoint, sequential SFTP session pool, exclusive
 // same-directory remote temp creation, range writes through the writer
-// pool, per-chunk atomic checkpoint persistence, a final source re-check.
-// The final path is NOT published here — publishing is a separate step.
+// pool, per-chunk atomic checkpoint persistence, a final source re-check,
+// metadata, and a no-clobber hardlink publish.
 //
 // A checkpoint must not already exist; otherwise the caller must Resume.
 // Any failure preserves the temp and checkpoint for a safe resume.
-func Transfer(ctx context.Context, sourceAbs, sourceRel, remoteFinal string, opts TransferOptions) error {
+func Transfer(ctx context.Context, sourceAbs, sourceRel, remoteFinal string, opts TransferOptions) (*TransferResult, error) {
 	if ctx == nil {
-		return errors.New("multistream: nil context")
+		return nil, errors.New("multistream: nil context")
 	}
 	if err := opts.normalize(); err != nil {
-		return err
+		return nil, err
 	}
 	if err := discovery.ValidateRelPath(sourceRel); err != nil {
-		return fmt.Errorf("multistream: source relative path: %w", err)
+		return nil, fmt.Errorf("multistream: source relative path: %w", err)
 	}
-	if err := backend2ValidateFinal(remoteFinal); err != nil {
-		return err
+	if err := validateFinalPath(remoteFinal); err != nil {
+		return nil, err
 	}
-	size, mtime, err := statSource(sourceAbs)
+	size, mtime, mode, err := statSource(sourceAbs)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := os.Stat(opts.CheckpointPath); err == nil {
-		return fmt.Errorf("%w: %s", ErrCheckpointConflict, opts.CheckpointPath)
+		return nil, fmt.Errorf("%w: %s", ErrCheckpointConflict, opts.CheckpointPath)
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("multistream: stat checkpoint: %w", err)
+		return nil, fmt.Errorf("multistream: stat checkpoint: %w", err)
 	}
 	chunks, err := Plan(size, opts.ChunkSize)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	tempPath, err := randomTempPath(remoteFinal)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	ckpt, err := NewCheckpoint(sourceRel, size, mtime, destinationIdentity(opts.SFTP.Dest, remoteFinal), tempPath, opts.ChunkSize)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// The checkpoint exists before any remote write.
 	if err := ckpt.Save(opts.CheckpointPath); err != nil {
-		return fmt.Errorf("multistream: save initial checkpoint: %w", err)
+		return nil, fmt.Errorf("multistream: save initial checkpoint: %w", err)
 	}
-	return copyWithPool(ctx, sourceAbs, size, mtime, chunks, ckpt, remoteFinal, tempPath, true, &opts)
+	err = opts.SFTP.WithClients(ctx, opts.Streams, func(clients []*sftp.Client) error {
+		spec := RemoteTempSpec{FinalPath: remoteFinal, TempPath: tempPath, Size: size}
+		// Capability probe before any remote write: without the hardlink
+		// extension we could never publish without clobbering, so fail
+		// here — the checkpoint stays for diagnosis and nothing remote is
+		// created.
+		if !supportsHardlink(clients[0]) {
+			return ErrHardlinkUnsupported
+		}
+		if err := PrepareFreshTemp(clients[0], spec); err != nil {
+			return err
+		}
+		return copyAndPublish(ctx, sourceAbs, size, mtime, mode, chunks, ckpt, spec, &opts, clients)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &TransferResult{Published: true, TempPath: tempPath, CheckpointPath: opts.CheckpointPath}, nil
 }
 
 // Resume continues a transfer from a strict checkpoint. The destination
 // identity, source relative path, size, nanosecond mtime, chunk size, and
 // temp path must all match; the temp is validated (not re-created, not
 // re-truncated) and only the pending chunks are transferred.
-func Resume(ctx context.Context, sourceAbs, checkpointPath, remoteFinal string, opts TransferOptions) error {
+func Resume(ctx context.Context, sourceAbs, checkpointPath, remoteFinal string, opts TransferOptions) (*TransferResult, error) {
 	if ctx == nil {
-		return errors.New("multistream: nil context")
+		return nil, errors.New("multistream: nil context")
 	}
 	if err := opts.normalize(); err != nil {
-		return err
+		return nil, err
 	}
 	ckpt, err := LoadCheckpoint(checkpointPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if ckpt.Destination != destinationIdentity(opts.SFTP.Dest, remoteFinal) {
-		return fmt.Errorf("%w: checkpoint is bound to %q, not %q", ErrDestinationMismatch, ckpt.Destination, destinationIdentity(opts.SFTP.Dest, remoteFinal))
+		return nil, fmt.Errorf("%w: checkpoint is bound to %q, not %q", ErrDestinationMismatch, ckpt.Destination, destinationIdentity(opts.SFTP.Dest, remoteFinal))
 	}
-	size, mtime, err := statSource(sourceAbs)
+	size, mtime, mode, err := statSource(sourceAbs)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if size != ckpt.Size || !mtime.Equal(ckpt.ModTime) {
-		return fmt.Errorf("%w: checkpoint expects size %d mtime %s; source has size %d mtime %s",
+		return nil, fmt.Errorf("%w: checkpoint expects size %d mtime %s; source has size %d mtime %s",
 			ErrSourceMismatch, ckpt.Size, ckpt.ModTime, size, mtime)
 	}
 	chunks, err := Plan(ckpt.Size, ckpt.ChunkSize)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	opts.CheckpointPath = checkpointPath
-	return copyWithPool(ctx, sourceAbs, ckpt.Size, ckpt.ModTime, chunks, ckpt, remoteFinal, ckpt.TempPath, false, &opts)
+	var result *TransferResult
+	err = opts.SFTP.WithClients(ctx, opts.Streams, func(clients []*sftp.Client) error {
+		spec := RemoteTempSpec{FinalPath: remoteFinal, TempPath: ckpt.TempPath, Size: ckpt.Size}
+		// Crash-window recovery: a previous run may have published the
+		// final via hardlink but crashed before the run state was recorded.
+		// If final and temp are provably the same object, the publish is
+		// already done.
+		published, err := ProbePublishState(ctx, opts.SFTP, clients[0], spec)
+		if err != nil {
+			return err
+		}
+		if published {
+			if len(ckpt.Completed) != len(chunks) {
+				return fmt.Errorf("multistream: final %s is published but the checkpoint is incomplete (%d/%d chunks) — refusing to trust the state", remoteFinal, len(ckpt.Completed), len(chunks))
+			}
+			fi, err := clients[0].Lstat(remoteFinal)
+			if err != nil {
+				return fmt.Errorf("multistream: verify recovered final: %w", err)
+			}
+			if fi.Size() != int64(ckpt.Size) {
+				return fmt.Errorf("%w: recovered final is %d bytes, want %d", ErrRemoteTempMismatch, fi.Size(), ckpt.Size)
+			}
+			result = &TransferResult{Published: true, Recovered: true, TempPath: ckpt.TempPath, CheckpointPath: checkpointPath}
+			return nil
+		}
+		if !supportsHardlink(clients[0]) {
+			return ErrHardlinkUnsupported
+		}
+		return copyAndPublish(ctx, sourceAbs, ckpt.Size, ckpt.ModTime, mode, chunks, ckpt, spec, &opts, clients)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if result != nil {
+		return result, nil
+	}
+	return &TransferResult{Published: true, TempPath: ckpt.TempPath, CheckpointPath: checkpointPath}, nil
 }
 
-// copyWithPool is the shared fresh/resume copy engine: sequential session
-// pool, resume-target validation, writer pool, chunked Copy with per-chunk
-// atomic checkpoint persistence, final source re-check.
-func copyWithPool(ctx context.Context, sourceAbs string, size uint64, mtime time.Time, chunks []Chunk, ckpt *Checkpoint, remoteFinal, tempPath string, fresh bool, opts *TransferOptions) error {
-	return opts.SFTP.WithClients(ctx, opts.Streams, func(clients []*sftp.Client) error {
-		spec := RemoteTempSpec{FinalPath: remoteFinal, TempPath: tempPath, Size: size}
-		// Fresh: exclusive create. Resume: the pool validates the existing
-		// temp (regular file, exact size, final not yet published).
-		if fresh {
-			if err := PrepareFreshTemp(clients[0], spec); err != nil {
+// copyAndPublish runs the shared fresh/resume engine inside an established
+// session pool: resume-target validation, writer pool, chunked Copy with
+// per-chunk atomic checkpoint persistence, SyncAll, CloseAll, final source
+// re-check, temp metadata, and the no-clobber publish with verification.
+func copyAndPublish(ctx context.Context, sourceAbs string, size uint64, mtime time.Time, mode os.FileMode, chunks []Chunk, ckpt *Checkpoint, spec RemoteTempSpec, opts *TransferOptions, clients []*sftp.Client) error {
+	pool, err := OpenRemoteWriterPool(spec, clients)
+	if err != nil {
+		return err
+	}
+	src, err := os.Open(sourceAbs)
+	if err != nil {
+		pool.CloseAll()
+		return fmt.Errorf("multistream: open source: %w", err)
+	}
+	copyErr := Copy(ctx, src, pool, size, chunks, CopyOptions{
+		Workers:   opts.Workers,
+		Completed: ckpt.CompletedSet(),
+		OnComplete: func(chunk Chunk) error {
+			if err := ckpt.MarkComplete(chunk.Index); err != nil {
 				return err
 			}
-		}
-		pool, err := OpenRemoteWriterPool(spec, clients)
-		if err != nil {
-			return err
-		}
-		src, err := os.Open(sourceAbs)
-		if err != nil {
-			pool.CloseAll()
-			return fmt.Errorf("multistream: open source: %w", err)
-		}
-		copyErr := Copy(ctx, src, pool, size, chunks, CopyOptions{
-			Workers:   opts.Workers,
-			Completed: ckpt.CompletedSet(),
-			OnComplete: func(chunk Chunk) error {
-				if err := ckpt.MarkComplete(chunk.Index); err != nil {
-					return err
-				}
-				if err := ckpt.Save(opts.CheckpointPath); err != nil {
-					// The checkpoint is the resume contract: a save failure
-					// stops the copy immediately rather than claiming work
-					// that is not durably recorded.
-					return err
-				}
-				if opts.OnChunkComplete != nil {
-					opts.OnChunkComplete(len(ckpt.Completed), len(chunks))
-				}
-				return nil
-			},
-		})
-		src.Close()
-		if copyErr != nil {
-			pool.CloseAll()
-			return copyErr
-		}
-		if err := pool.SyncAll(); err != nil {
-			pool.CloseAll()
-			return fmt.Errorf("multistream: sync temp: %w", err)
-		}
-		if err := pool.CloseAll(); err != nil {
-			return fmt.Errorf("multistream: close writer pool: %w", err)
-		}
-		// The source must not have changed while we copied it.
-		if err := verifySourceUnchanged(sourceAbs, size, mtime); err != nil {
-			return err
-		}
-		return nil
+			if err := ckpt.Save(opts.CheckpointPath); err != nil {
+				// The checkpoint is the resume contract: a save failure
+				// stops the copy immediately rather than claiming work
+				// that is not durably recorded.
+				return err
+			}
+			if opts.OnChunkComplete != nil {
+				opts.OnChunkComplete(len(ckpt.Completed), len(chunks))
+			}
+			return nil
+		},
 	})
+	src.Close()
+	if copyErr != nil {
+		pool.CloseAll()
+		return copyErr
+	}
+	if err := pool.SyncAll(); err != nil {
+		pool.CloseAll()
+		return fmt.Errorf("multistream: sync temp: %w", err)
+	}
+	if err := pool.CloseAll(); err != nil {
+		return fmt.Errorf("multistream: close writer pool: %w", err)
+	}
+	// The source must not have changed while we copied it.
+	if err := verifySourceUnchanged(sourceAbs, size, mtime); err != nil {
+		return err
+	}
+	// Metadata on the still-unpublished temp: permission bits and the exact
+	// nanosecond mtime. Metadata failure prevents the publish.
+	if err := SetRemoteMeta(ctx, opts.SFTP, clients[0], spec.TempPath, mode, mtime); err != nil {
+		return err
+	}
+	if err := PublishFinal(ctx, opts.SFTP, clients[0], spec, mtime); err != nil {
+		return err
+	}
+	return nil
 }
 
-// backend2ValidateFinal validates the remote final path locally.
-func backend2ValidateFinal(finalPath string) error {
+// validateFinalPath validates the remote final path locally.
+func validateFinalPath(finalPath string) error {
 	if finalPath == "" {
 		return fmt.Errorf("%w: final path is empty", ErrInvalidRemoteTemp)
 	}

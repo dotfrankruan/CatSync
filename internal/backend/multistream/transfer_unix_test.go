@@ -60,8 +60,8 @@ func newTransferEnv(t *testing.T, size uint64, chunkSize uint64) *transferEnv {
 func (e *transferEnv) final() string { return path.Join(e.remoteDir, "big.bin") }
 
 // TestTransferFreshRealServer: a fresh transfer writes the temp through
-// multiple sessions, checkpoints every chunk, and never publishes the
-// final path.
+// multiple sessions, checkpoints every chunk, and publishes the final path
+// via no-clobber hardlink with exact content, mode, and mtime.
 func TestTransferFreshRealServer(t *testing.T) {
 	env := newTransferEnv(t, 40<<10, 8<<10) // 5 chunks
 	var progresses [][2]int
@@ -69,8 +69,15 @@ func TestTransferFreshRealServer(t *testing.T) {
 		progresses = append(progresses, [2]int{done, total})
 	}
 	env.opts.CheckpointPath = env.ckptPath
-	if err := Transfer(context.Background(), env.sourceAbs, env.sourceRel, env.final(), env.opts); err != nil {
+	result, err := Transfer(context.Background(), env.sourceAbs, env.sourceRel, env.final(), env.opts)
+	if err != nil {
 		t.Fatalf("Transfer: %v", err)
+	}
+	if !result.Published || result.Recovered {
+		t.Errorf("result = %+v, want published and not recovered", result)
+	}
+	if result.TempPath == "" {
+		t.Error("result must record the temp path for later cleanup")
 	}
 	// Checkpoint: all 5 chunks completed.
 	ckpt, err := LoadCheckpoint(env.ckptPath)
@@ -83,24 +90,43 @@ func TestTransferFreshRealServer(t *testing.T) {
 	if got := len(progresses); got != 5 {
 		t.Errorf("progress calls = %d, want 5", got)
 	}
-	// Temp content is exact; final was never published.
-	cfg := helperConfig(t, t.TempDir(), envRealServer+"=1")
-	err = cfg.WithClient(context.Background(), func(client *sftp.Client) error {
-		got, err := readAllRemote(client, ckpt.TempPath)
-		if err != nil {
-			return err
-		}
-		if string(got) != string(patternBytes(40<<10)) {
-			return errors.New("temp content mismatch")
-		}
-		if _, err := client.Lstat(env.final()); !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("final published too early: %v", err)
-		}
-		return nil
-	})
+	// The final was published by hardlink: exact content, source mode, and
+	// nanosecond mtime. The temp still exists (cleanup is the caller's job
+	// after state is persisted).
+	finalData, err := os.ReadFile(env.final())
 	if err != nil {
 		t.Fatal(err)
 	}
+	if string(finalData) != string(patternBytes(40<<10)) {
+		t.Error("final content mismatch")
+	}
+	fiFinal, err := os.Lstat(env.final())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fiSrc, err := os.Lstat(env.sourceAbs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fiFinal.Mode().Perm() != fiSrc.Mode().Perm() {
+		t.Errorf("final mode = %o, want source mode %o", fiFinal.Mode().Perm(), fiSrc.Mode().Perm())
+	}
+	if !fiFinal.ModTime().Equal(fiSrc.ModTime()) {
+		t.Errorf("final mtime = %v, want source mtime %v", fiFinal.ModTime(), fiSrc.ModTime())
+	}
+	// Final and temp are the same object (hardlink): same inode.
+	if !os.SameFile(mustStat(t, env.final()), mustStat(t, ckpt.TempPath)) {
+		t.Error("final and temp are not the same object after hardlink publish")
+	}
+}
+
+func mustStat(t *testing.T, path string) os.FileInfo {
+	t.Helper()
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi
 }
 
 func TestTransferCheckpointConflict(t *testing.T) {
@@ -112,7 +138,7 @@ func TestTransferCheckpointConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	env.opts.CheckpointPath = env.ckptPath
-	if err := Transfer(context.Background(), env.sourceAbs, env.sourceRel, env.final(), env.opts); !errors.Is(err, ErrCheckpointConflict) {
+	if _, err := Transfer(context.Background(), env.sourceAbs, env.sourceRel, env.final(), env.opts); !errors.Is(err, ErrCheckpointConflict) {
 		t.Fatalf("Transfer = %v, want ErrCheckpointConflict", err)
 	}
 }
@@ -129,7 +155,7 @@ func TestTransferCancelAndResume(t *testing.T) {
 			cancel()
 		}
 	}
-	err := Transfer(ctx, env.sourceAbs, env.sourceRel, env.final(), env.opts)
+	_, err := Transfer(ctx, env.sourceAbs, env.sourceRel, env.final(), env.opts)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Transfer = %v, want wrapped context.Canceled", err)
 	}
@@ -144,7 +170,7 @@ func TestTransferCancelAndResume(t *testing.T) {
 
 	// Resume completes the pending chunks.
 	env.opts.OnChunkComplete = nil
-	if err := Resume(context.Background(), env.sourceAbs, env.ckptPath, env.final(), env.opts); err != nil {
+	if _, err := Resume(context.Background(), env.sourceAbs, env.ckptPath, env.final(), env.opts); err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
 	ckpt, err = LoadCheckpoint(env.ckptPath)
@@ -188,7 +214,7 @@ func TestTransferCheckpointSaveFailureStopsCopy(t *testing.T) {
 			close(locked)
 		}
 	}
-	err := Transfer(context.Background(), env.sourceAbs, env.sourceRel, env.final(), env.opts)
+	_, err := Transfer(context.Background(), env.sourceAbs, env.sourceRel, env.final(), env.opts)
 	<-locked
 	defer os.Chmod(dir, 0o700)
 	if err == nil {
@@ -208,12 +234,12 @@ func TestResumeDestinationMismatch(t *testing.T) {
 	env.opts.CheckpointPath = env.ckptPath
 	ctx, cancel := context.WithCancel(context.Background())
 	env.opts.OnChunkComplete = func(done, total int) { cancel() }
-	if err := Transfer(ctx, env.sourceAbs, env.sourceRel, env.final(), env.opts); err == nil {
+	if _, err := Transfer(ctx, env.sourceAbs, env.sourceRel, env.final(), env.opts); err == nil {
 		t.Fatal("Transfer = nil, want cancellation")
 	}
 	env.opts.OnChunkComplete = nil
 	other := path.Join(env.remoteDir, "other.bin")
-	if err := Resume(context.Background(), env.sourceAbs, env.ckptPath, other, env.opts); !errors.Is(err, ErrDestinationMismatch) {
+	if _, err := Resume(context.Background(), env.sourceAbs, env.ckptPath, other, env.opts); !errors.Is(err, ErrDestinationMismatch) {
 		t.Fatalf("Resume with wrong destination = %v, want ErrDestinationMismatch", err)
 	}
 }
@@ -223,7 +249,7 @@ func TestResumeSourceMismatch(t *testing.T) {
 	env.opts.CheckpointPath = env.ckptPath
 	ctx, cancel := context.WithCancel(context.Background())
 	env.opts.OnChunkComplete = func(done, total int) { cancel() }
-	if err := Transfer(ctx, env.sourceAbs, env.sourceRel, env.final(), env.opts); err == nil {
+	if _, err := Transfer(ctx, env.sourceAbs, env.sourceRel, env.final(), env.opts); err == nil {
 		t.Fatal("Transfer = nil, want cancellation")
 	}
 	// Change the source's size.
@@ -231,7 +257,7 @@ func TestResumeSourceMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	env.opts.OnChunkComplete = nil
-	if err := Resume(context.Background(), env.sourceAbs, env.ckptPath, env.final(), env.opts); !errors.Is(err, ErrSourceMismatch) {
+	if _, err := Resume(context.Background(), env.sourceAbs, env.ckptPath, env.final(), env.opts); !errors.Is(err, ErrSourceMismatch) {
 		t.Fatalf("Resume with changed size = %v, want ErrSourceMismatch", err)
 	}
 }
@@ -250,7 +276,7 @@ func TestTransferSourceMtimeChanged(t *testing.T) {
 			}
 		}
 	}
-	err := Transfer(context.Background(), env.sourceAbs, env.sourceRel, env.final(), env.opts)
+	_, err := Transfer(context.Background(), env.sourceAbs, env.sourceRel, env.final(), env.opts)
 	if !errors.Is(err, ErrSourceChanged) {
 		t.Fatalf("Transfer = %v, want ErrSourceChanged", err)
 	}

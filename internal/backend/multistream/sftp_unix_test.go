@@ -11,9 +11,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/pkg/sftp"
 
@@ -30,6 +32,7 @@ const (
 	envFailExit   = "CATSYNC_TEST_SFTP_FAILEXIT"   // exit immediately with this code
 	envFailNth    = "CATSYNC_TEST_SFTP_FAILNTH"    // the Nth invocation exits 42
 	envRealServer = "CATSYNC_TEST_SFTP_REALSERVER" // run the real sftp-server
+	envNoExt      = "CATSYNC_TEST_SFTP_NOEXT"      // advertise no SFTP extensions
 )
 
 // sftpServerBin is the real OpenSSH sftp-server used by the fake-ssh helper
@@ -59,6 +62,126 @@ type stdioConn struct {
 }
 
 func (stdioConn) Close() error { return nil }
+
+// isCommandArgv reports whether the argv asks for a remote command (not the
+// sftp subsystem): the SFTP argv contains "-s".
+func isCommandArgv(args []string) bool {
+	for _, a := range args {
+		if a == "-s" {
+			return false
+		}
+	}
+	return true
+}
+
+// unquoteShellWord reverses discovery.shellQuote's single-quote format.
+func unquoteShellWord(s string) string {
+	if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' {
+		return strings.ReplaceAll(s[1:len(s)-1], `'\''`, "'")
+	}
+	return s
+}
+
+// runRemoteCommand emulates the remote command part of the fake ssh: the
+// argv after the host token is the remote command, each element already
+// shell-quoted by the caller. We implement exactly the two GNU tools the
+// publish layer uses — touch (ns-precision mtime) and test -ef — in Go so
+// the semantics match GNU/Linux precisely regardless of the host OS.
+func runRemoteCommand(args []string) int {
+	// Skip leading flag tokens (-6, -T), then the [user@]host token.
+	i := 0
+	for i < len(args) && strings.HasPrefix(args[i], "-") {
+		i++
+	}
+	if i >= len(args) {
+		fmt.Fprintln(os.Stderr, "fake ssh: missing host")
+		return 2
+	}
+	i++ // host
+	cmd := args[i:]
+	for j := range cmd {
+		cmd[j] = unquoteShellWord(cmd[j])
+	}
+	if len(cmd) == 0 {
+		fmt.Fprintln(os.Stderr, "fake ssh: empty remote command")
+		return 2
+	}
+	switch cmd[0] {
+	case "touch":
+		// touch -m -d @<sec>.<nsec> <path>
+		if len(cmd) != 5 || cmd[1] != "-m" || cmd[2] != "-d" {
+			fmt.Fprintln(os.Stderr, "fake ssh: bad touch argv")
+			return 2
+		}
+		if !strings.HasPrefix(cmd[3], "@") {
+			fmt.Fprintln(os.Stderr, "fake ssh: touch needs @epoch")
+			return 2
+		}
+		sec, nsec, err := parseEpochNanos(cmd[3][1:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "fake ssh: %v\n", err)
+			return 2
+		}
+		path := cmd[4]
+		fi, err := os.Stat(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "fake ssh: touch: %v\n", err)
+			return 1
+		}
+		// -m changes only mtime; atime is preserved.
+		atime := fi.ModTime()
+		mt := time.Unix(sec, nsec)
+		if err := os.Chtimes(path, atime, mt); err != nil {
+			fmt.Fprintf(os.Stderr, "fake ssh: touch: %v\n", err)
+			return 1
+		}
+		return 0
+	case "test":
+		// test <a> -ef <b>
+		if len(cmd) != 4 || cmd[2] != "-ef" {
+			fmt.Fprintln(os.Stderr, "fake ssh: bad test argv")
+			return 2
+		}
+		fa, err := os.Lstat(cmd[1])
+		if err != nil {
+			return 1
+		}
+		fb, err := os.Lstat(cmd[3])
+		if err != nil {
+			return 1
+		}
+		if os.SameFile(fa, fb) {
+			return 0
+		}
+		return 1
+	}
+	fmt.Fprintf(os.Stderr, "fake ssh: unsupported remote command %q\n", cmd[0])
+	return 2
+}
+
+// parseEpochNanos parses "<sec>[.<frac>]" with the fraction padded to
+// nanoseconds; negative seconds are pre-epoch.
+func parseEpochNanos(s string) (int64, int64, error) {
+	secPart, fracPart, hasFrac := strings.Cut(s, ".")
+	sec, err := strconv.ParseInt(secPart, 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("bad epoch seconds %q", s)
+	}
+	if !hasFrac {
+		return sec, 0, nil
+	}
+	if len(fracPart) > 9 {
+		return 0, 0, fmt.Errorf("epoch fraction too precise %q", s)
+	}
+	frac, err := strconv.ParseInt(fracPart, 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("bad epoch fraction %q", s)
+	}
+	for i := len(fracPart); i < 9; i++ {
+		frac *= 10
+	}
+	return sec, frac, nil
+}
 
 // runFakeSSH is the fake-ssh body. It records its argv and PID, optionally
 // echoes an environment value to stderr (never stdout: the protocol stream
@@ -105,6 +228,9 @@ func runFakeSSH() int {
 			return 42
 		}
 	}
+	if isCommandArgv(os.Args[1:]) {
+		return runRemoteCommand(os.Args[1:])
+	}
 	if os.Getenv(envRealServer) != "" && realServerAvailable() {
 		// The real server inherits our stdio exactly; no copying, no shell.
 		cmd := exec.Command(sftpServerBin)
@@ -116,6 +242,10 @@ func runFakeSSH() int {
 			return 2
 		}
 		return 0
+	}
+	if os.Getenv(envNoExt) != "" {
+		// Advertise no extensions: the hardlink probe must fail.
+		_ = sftp.SetSFTPExtensions()
 	}
 	srv := sftp.NewRequestServer(stdioConn{os.Stdin, os.Stdout}, sftp.InMemHandler())
 	_ = srv.Serve()

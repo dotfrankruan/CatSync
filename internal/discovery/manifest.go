@@ -325,6 +325,10 @@ func sshArgv(prog string, dest target.Destination, ipv6 bool) ([]string, error) 
 // escaped-quote / reopen-quote sequence. The result carries any byte
 // except NUL — spaces, newlines, quotes, and expansions included — as
 // literal text.
+//
+// ShellQuote is the exported form for other packages.
+func ShellQuote(s string) string { return shellQuote(s) }
+
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
