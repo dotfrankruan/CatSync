@@ -1369,7 +1369,7 @@ func TestCheckpointReferenceClearFailureRetainsCheckpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	e2.run = recovered
-	if err := e2.retireCompletedCheckpoints(); err != nil {
+	if err := e2.retireCompletedCheckpoints(context.Background()); err != nil {
 		t.Fatalf("retireCompletedCheckpoints: %v", err)
 	}
 	after, err := store.Load(run.ID)
@@ -1384,6 +1384,142 @@ func TestCheckpointReferenceClearFailureRetainsCheckpoint(t *testing.T) {
 	}
 	if _, statErr := os.Stat(cp); !errors.Is(statErr, os.ErrNotExist) {
 		t.Errorf("recovery left checkpoint file behind: %v", statErr)
+	}
+}
+
+// completedCheckpointExecutor builds the resume-cleanup crash window: the
+// task is durably completed but still references its native checkpoint, which
+// in turn retains the remote temporary path needed for best-effort cleanup.
+func completedCheckpointExecutor(t *testing.T, h *harness, env []string) (*Executor, *state.Run, string) {
+	t.Helper()
+	id, err := state.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tempPath := filepath.Join(h.remoteDir, ".catsync-tmp-cleanup")
+	cp := filepath.Join(h.stateDir, "checkpoints", id, "cleanup.nativeckpt")
+	ckpt, err := multistream.NewCheckpoint("big.bin", 0, time.Unix(1, 0),
+		"u@h:"+filepath.Join(h.remoteDir, "big.bin"), tempPath, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ckpt.Save(cp); err != nil {
+		t.Fatal(err)
+	}
+	run := &state.Run{
+		ID:        id,
+		Status:    state.StatusFailed,
+		CreatedAt: time.Now().UTC(),
+		Config: state.Config{
+			Backend: state.BackendAuto, Verify: state.VerifyNone,
+			Jobs: 1, Streams: 1, LargeThreshold: 1,
+		},
+		Source:      state.Source{Path: h.src},
+		Destination: state.Destination{User: "u", Host: "h", Path: h.remoteDir},
+		WorkDir:     h.src,
+		Tasks: []state.Task{{
+			Path: "big.bin", Backend: state.BackendMSCP,
+			Status: state.StatusCompleted, Checkpoint: cp,
+		}},
+	}
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(run); err != nil {
+		t.Fatal(err)
+	}
+	e, err := newExecutor(Config{
+		StateDir: h.stateDir,
+		Programs: h.config().Programs,
+		Env:      env,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.run = run
+	return e, run, cp
+}
+
+// TestRetireCompletedCheckpointsPreCancelled proves a cancelled resume does
+// not mutate its cleanup journal or launch ssh. A later resume still has the
+// checkpoint and its remote temp path available.
+func TestRetireCompletedCheckpointsPreCancelled(t *testing.T) {
+	h := newHarness(t)
+	e, run, cp := completedCheckpointExecutor(t, h, h.nativeEnv())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := e.retireCompletedCheckpoints(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("retireCompletedCheckpoints = %v, want context.Canceled", err)
+	}
+	if got := len(toolInvocations(h.invocations(), "ssh")); got != 0 {
+		t.Fatalf("ssh invocations = %d, want 0 for pre-cancelled cleanup", got)
+	}
+	loaded, err := e.store.Load(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Tasks[0].Status != state.StatusCompleted || loaded.Tasks[0].Checkpoint != cp {
+		t.Errorf("durable task changed on pre-cancel: %+v", loaded.Tasks[0])
+	}
+	if _, err := os.Stat(cp); err != nil {
+		t.Errorf("checkpoint removed on pre-cancel: %v", err)
+	}
+}
+
+// TestRetireCompletedCheckpointsMidCancellation proves the caller's context
+// reaches the interactive ssh session: cancellation unblocks its handshake,
+// kills and reaps the process, and returns promptly without changing the
+// already-durable completed status.
+func TestRetireCompletedCheckpointsMidCancellation(t *testing.T) {
+	h := newHarness(t)
+	ready := filepath.Join(t.TempDir(), "ssh-ready")
+	env := mockexec.Env("", map[string]string{
+		mockexec.EnvInvocationLog: h.logPath,
+		mockexec.EnvReadyFile:     ready,
+		mockexec.EnvSleepMS:       "30000",
+	})
+	e, run, cp := completedCheckpointExecutor(t, h, env)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- e.retireCompletedCheckpoints(ctx) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("ssh cleanup process did not become ready")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("retireCompletedCheckpoints = %v, want context.Canceled", err)
+	}
+	invs := toolInvocations(h.invocations(), "ssh")
+	if len(invs) != 1 {
+		t.Fatalf("ssh invocations = %d, want 1", len(invs))
+	}
+	if err := mockexec.ProcessAlive(invs[0].PID); err == nil {
+		t.Errorf("cleanup ssh pid %d is still alive after return", invs[0].PID)
+	}
+	loaded, err := e.store.Load(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Tasks[0].Status != state.StatusCompleted {
+		t.Errorf("completed task changed to %s", loaded.Tasks[0].Status)
+	}
+	if loaded.Tasks[0].Checkpoint != "" {
+		t.Errorf("durably retired checkpoint reference = %q, want empty", loaded.Tasks[0].Checkpoint)
+	}
+	if _, err := os.Stat(cp); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("retired checkpoint file still exists: %v", err)
 	}
 }
 

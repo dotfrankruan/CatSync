@@ -665,7 +665,7 @@ func resumeWith(ctx context.Context, cfg Config, id string, prepare func(*Execut
 	// A crash between persisting completion and checkpoint cleanup leaves a
 	// completed task referencing a file. Retire those now; this cannot lose
 	// progress because completed is already durable.
-	if err := e.retireCompletedCheckpoints(); err != nil {
+	if err := e.retireCompletedCheckpoints(ctx); err != nil {
 		return run, err
 	}
 
@@ -952,7 +952,16 @@ func (e *Executor) retireCheckpoint(t *state.Task) error {
 // tasks that still reference a checkpoint (a crash between completion and
 // reference cleanup). The completed status is already durable, so clearing
 // the reference and removing the file cannot lose transfer progress.
-func (e *Executor) retireCompletedCheckpoints() error {
+func (e *Executor) retireCompletedCheckpoints(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("executor: nil context while retiring completed checkpoints")
+	}
+	// A pre-cancelled resume must not mutate cleanup state or start ssh. By
+	// leaving the completed task's checkpoint reference intact, a later
+	// resume can retry the cleanup with the remote temp path still known.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("executor: completed-checkpoint cleanup interrupted before starting: %w", err)
+	}
 	var refs []*state.Task
 	e.runMu.Lock()
 	for i := range e.run.Tasks {
@@ -994,7 +1003,10 @@ func (e *Executor) retireCompletedCheckpoints() error {
 		}
 	}
 	for _, tp := range tempPaths {
-		e.removeRemoteTemp(context.Background(), tp)
+		e.removeRemoteTemp(ctx, tp)
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("executor: completed-checkpoint cleanup interrupted: %w", err)
+		}
 	}
 	return nil
 }
