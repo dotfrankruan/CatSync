@@ -87,13 +87,9 @@ func (c *Config) validate() error {
 	if !c.Tools.Rsync {
 		return errors.New("planner: rsync is required but not available")
 	}
-	// The native small-file stage needs only rsync, which is required above.
-	switch c.Backend {
-	case state.BackendMSCP:
-		if !c.Tools.MSCP {
-			return errors.New("planner: backend mscp requested but mscp is not available")
-		}
-	}
+	// The native small-file and large-file stages need only rsync and ssh;
+	// "mscp" is a compatibility name for the native multistream backend and
+	// requires no external tool.
 	return nil
 }
 
@@ -258,13 +254,8 @@ func planAuto(d *Decision, e discovery.Entry, dest map[string]discovery.RemoteEn
 		d.Backend = state.BackendFPSync
 		d.Reason = "new file below threshold: native parallel rsync"
 	case isNew && large:
-		if cfg.Tools.MSCP {
-			d.Backend = state.BackendMSCP
-			d.Reason = "new file at or above threshold: mscp"
-		} else {
-			d.Backend = state.BackendRsync
-			d.Reason = "new file at or above threshold: mscp unavailable, rsync fallback"
-		}
+		d.Backend = state.BackendMSCP
+		d.Reason = `new file at or above threshold: native multistream ("mscp")`
 	default:
 		d.Backend = state.BackendRsync
 		if dest == nil {

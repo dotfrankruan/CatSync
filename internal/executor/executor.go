@@ -246,7 +246,6 @@ func (e *Executor) detectTools() planner.Tools {
 	}
 	return planner.Tools{
 		Rsync: found(e.progs.rsync()),
-		MSCP:  found(e.progs.mscp()),
 	}
 }
 
@@ -716,7 +715,7 @@ func (e *Executor) execute(ctx context.Context) error {
 		fn   func(context.Context) error
 	}{
 		{"parallel-rsync", e.smallFileStage},
-		{"mscp", e.mscpStage},
+		{"native-large", e.nativeLargeStage},
 		{"rsync", e.rsyncStage},
 	}
 	for _, st := range stages {
@@ -959,11 +958,18 @@ func (e *Executor) retireCompletedCheckpoints() error {
 	if len(refs) == 0 {
 		return nil
 	}
-	// Persist all cleared references first, then remove the files.
+	// Persist all cleared references first, then remove the files. For
+	// native large-file tasks the remote temp is also removed after the
+	// references are durable — the final is already published, so this is
+	// pure cleanup.
+	var tempPaths []string
 	e.runMu.Lock()
 	paths := make([]string, len(refs))
 	for i, t := range refs {
 		paths[i] = t.Checkpoint
+		if t.Backend == state.BackendMSCP {
+			tempPaths = append(tempPaths, e.nativeTempPath(t))
+		}
 		t.Checkpoint = ""
 	}
 	e.runMu.Unlock()
@@ -979,6 +985,9 @@ func (e *Executor) retireCompletedCheckpoints() error {
 		if err := os.Remove(cp); err != nil && !errors.Is(err, os.ErrNotExist) {
 			e.warnf("remove leftover checkpoint %s: %v", cp, err)
 		}
+	}
+	for _, tp := range tempPaths {
+		e.removeRemoteTemp(context.Background(), tp)
 	}
 	return nil
 }

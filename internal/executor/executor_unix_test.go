@@ -12,7 +12,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -29,7 +28,10 @@ func TestMain(m *testing.M) {
 }
 
 // harness wires a source tree, a state directory, and the mock executables
-// (ssh, rsync, mscp) in script mode.
+// (ssh, rsync, mscp) in script mode. The mock ssh emulates a real remote
+// end on the local filesystem for SFTP subsystem and controlled metadata
+// commands: remoteDir is the "remote" root the native large-file backend
+// really writes through the real OpenSSH sftp-server.
 type harness struct {
 	t         *testing.T
 	src       string
@@ -37,6 +39,7 @@ type harness struct {
 	scriptDir string
 	logPath   string
 	progs     map[string]string
+	remoteDir string
 }
 
 func newHarness(t *testing.T) *harness {
@@ -53,6 +56,7 @@ func newHarness(t *testing.T) *harness {
 		scriptDir: t.TempDir(),
 		logPath:   filepath.Join(t.TempDir(), "invocations.jsonl"),
 		progs:     progs,
+		remoteDir: t.TempDir(),
 	}
 }
 
@@ -73,6 +77,46 @@ func (h *harness) config() Config {
 		},
 		Env: mockexec.EnvScript(h.scriptDir, h.logPath),
 	}
+}
+
+// configNative is config() with the destination path pointed at the real
+// local remoteDir: the native large-file backend transfers through the real
+// sftp-server, so the destination must exist on disk.
+func (h *harness) configNative() Config {
+	cfg := h.config()
+	cfg.Dest.Path = h.remoteDir
+	cfg.Env = h.nativeEnv()
+	return cfg
+}
+
+// nativeEnv returns the script env plus the record directory, which the
+// mock ssh's SFTP emulation needs for its fail-nth counter; the directory
+// is created so the counter persists.
+func (h *harness) nativeEnv(extra ...string) []string {
+	dir := filepath.Join(h.stateDir, "record")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		h.t.Fatal(err)
+	}
+	return append(append([]string{}, mockexec.EnvScript(h.scriptDir, h.logPath)...),
+		append([]string{mockexec.EnvRecordDir + "=" + dir, mockexec.EnvSSHNative + "=1"}, extra...)...)
+}
+
+// sftpSessionInvocations counts mock-ssh invocations that requested the
+// sftp subsystem (argv contains "-s" then "sftp").
+func sftpSessionInvocations(invs []mockexec.Invocation) []mockexec.Invocation {
+	var out []mockexec.Invocation
+	for _, inv := range invs {
+		if inv.Tool != "ssh" {
+			continue
+		}
+		for i, a := range inv.Args {
+			if a == "-s" && i+1 < len(inv.Args) {
+				out = append(out, inv)
+				break
+			}
+		}
+	}
+	return out
 }
 
 // writeScript installs a tool's script-style config.
@@ -197,9 +241,10 @@ func TestSyncAutoFreshDest(t *testing.T) {
 	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt"), h.newFileRecord("big.bin")))
 	h.scriptSSHFreshDest(post)
 	h.writeScript("rsync", "exit=0")
-	h.writeScript("mscp", "touch_flag=-W")
 
-	run, err := Sync(context.Background(), h.config())
+	cfg := h.configNative()
+	cfg.Verify = state.VerifyNone
+	run, err := Sync(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Sync: %v", err)
 	}
@@ -223,6 +268,11 @@ func TestSyncAutoFreshDest(t *testing.T) {
 	if fp := toolInvocations(invs, "fpart"); len(fp) != 0 {
 		t.Errorf("external fpart invoked %d times, want 0", len(fp))
 	}
+	// The external mscp is never executed: the large file went through the
+	// native multistream backend.
+	if ms := toolInvocations(invs, "mscp"); len(ms) != 0 {
+		t.Errorf("external mscp invoked %d times, want 0", len(ms))
+	}
 
 	// The small file went through one native rsync batch.
 	rs := toolInvocations(invs, "rsync")
@@ -244,25 +294,56 @@ func TestSyncAutoFreshDest(t *testing.T) {
 		t.Errorf("rsync batch stdin paths = %v, want [small.txt]", got)
 	}
 
-	ms := toolInvocations(invs, "mscp")
-	if len(ms) != 1 {
-		t.Fatalf("mscp invocations = %d, want 1", len(ms))
+	// The large file was really transferred natively: exact content, mode,
+	// and nanosecond mtime land at the destination; the temp is cleaned.
+	final := filepath.Join(h.remoteDir, "big.bin")
+	got, err := os.ReadFile(final)
+	if err != nil {
+		t.Fatalf("published final missing: %v", err)
 	}
-	mj := strings.Join(ms[0].Args, "\x00")
-	if !strings.Contains(mj, "-W\x00") || !strings.Contains(mj, "--\x00big.bin\x00u@h:/data/big.bin") {
-		t.Errorf("mscp argv = %v", ms[0].Args)
+	want, err := os.ReadFile(filepath.Join(h.src, "big.bin"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if ssh := toolInvocations(invs, "ssh"); len(ssh) != 2 {
-		t.Errorf("ssh invocations = %d, want 2 (plan manifest + verify manifest)", len(ssh))
+	if string(got) != string(want) {
+		t.Error("final content mismatch")
 	}
-	// The completed mscp task's checkpoint is retired by the gate.
+	fiFinal, err := os.Lstat(final)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fiSrc, err := os.Lstat(filepath.Join(h.src, "big.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fiFinal.Mode().Perm() != fiSrc.Mode().Perm() {
+		t.Errorf("final mode = %o, want source mode %o", fiFinal.Mode().Perm(), fiSrc.Mode().Perm())
+	}
+	if !fiFinal.ModTime().Equal(fiSrc.ModTime()) {
+		t.Errorf("final mtime = %v, want source mtime %v", fiFinal.ModTime(), fiSrc.ModTime())
+	}
+	// SFTP sessions happened: the hardlink probe plus the transfer pool.
+	if got := len(sftpSessionInvocations(invs)); got < 2 {
+		t.Errorf("sftp sessions = %d, want at least 2 (probe + transfer)", got)
+	}
+	// The remote temp was cleaned after completion.
+	entries, err := os.ReadDir(h.remoteDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".catsync-tmp-") {
+			t.Errorf("remote temp left behind: %s", e.Name())
+		}
+	}
+	// The completed task's checkpoint is retired.
 	for _, task := range run.Tasks {
 		if task.Checkpoint != "" {
 			t.Errorf("task %s retains checkpoint %s after completion", task.Path, task.Checkpoint)
 		}
 	}
 	ckptDir := filepath.Join(h.stateDir, "checkpoints", run.ID)
-	entries, _ := os.ReadDir(ckptDir)
+	entries, _ = os.ReadDir(ckptDir)
 	for _, e := range entries {
 		t.Errorf("checkpoint left behind: %s", e.Name())
 	}
@@ -291,14 +372,12 @@ stdout_file=`+pre+`
 ---
 match=if [ -d
 stdout_file=`+post+`
----
-match=mkdir -p
-exit=0
 `)
-	h.writeScript("mscp", "touch_flag=-W")
 	h.writeScript("rsync", "exit=0")
 
-	run, err := Sync(context.Background(), h.config())
+	cfg := h.configNative()
+	cfg.Verify = state.VerifyNone
+	run, err := Sync(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Sync: %v", err)
 	}
@@ -316,13 +395,16 @@ exit=0
 		t.Errorf("small new file backend = %s, want fpsync (native)", got)
 	}
 	if got := byPath["big-new.bin"].Backend; got != state.BackendMSCP {
-		t.Errorf("large new file backend = %s, want mscp", got)
+		t.Errorf("large new file backend = %s, want mscp (native multistream)", got)
 	}
 	if got := byPath["big-mod.bin"].Backend; got != state.BackendRsync {
 		t.Errorf("modified file backend = %s, want rsync", got)
 	}
 
 	invs := h.invocations()
+	if ms := toolInvocations(invs, "mscp"); len(ms) != 0 {
+		t.Errorf("external mscp invoked %d times, want 0", len(ms))
+	}
 	rs := toolInvocations(invs, "rsync")
 	if len(rs) != 2 {
 		t.Fatalf("rsync invocations = %d, want 2 (native small batch + conservative)", len(rs))
@@ -350,11 +432,29 @@ exit=0
 			t.Errorf("rsync argv contains --delete: %v", inv.Args)
 		}
 	}
-	if ms := toolInvocations(invs, "mscp"); len(ms) != 1 {
-		t.Errorf("mscp invocations = %d, want 1", len(ms))
+	// The new large file really transferred natively; the existing one was
+	// never touched by the native stage.
+	final := filepath.Join(h.remoteDir, "big-new.bin")
+	got, err := os.ReadFile(final)
+	if err != nil {
+		t.Fatalf("published final missing: %v", err)
 	}
-	if ssh := toolInvocations(invs, "ssh"); len(ssh) != 2 {
-		t.Errorf("ssh invocations = %d, want 2", len(ssh))
+	want, err := os.ReadFile(filepath.Join(h.src, "big-new.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Error("native final content mismatch")
+	}
+	// The native stage never touched big-mod: only the mocked conservative
+	// rsync owned it, and the mock writes nothing.
+	if _, err := os.Lstat(filepath.Join(h.remoteDir, "big-mod.bin")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("big-mod.bin appeared at the destination: native stage must not write it (%v)", err)
+	}
+	// No double writers: the destination path of the native file is only
+	// in the native stage, and the conservative rsync only got big-mod.
+	if got := len(sftpSessionInvocations(invs)); got < 2 {
+		t.Errorf("sftp sessions = %d, want at least 2", got)
 	}
 }
 
@@ -453,33 +553,57 @@ func TestSyncWithoutFPSyncProgramsStillUsesNativeBackend(t *testing.T) {
 	}
 }
 
-func TestSyncForcedUnavailableBackendFails(t *testing.T) {
+// TestSyncForcedMSCPWithoutExternalTool: forcing --backend mscp selects the
+// native multistream backend; a nonexistent mscp program path is irrelevant
+// because the external tool is never executed.
+func TestSyncForcedMSCPWithoutExternalTool(t *testing.T) {
 	h := newHarness(t)
-	h.writeSrc("small.txt", 10)
-	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
-	h.scriptSSHFreshDest(post)
-	h.writeScript("rsync", "exit=0")
-	cfg := h.config()
-	// mscp is the only backend with a real tool dependency; forcing it
-	// without the program must fail at planning.
+	h.writeSrc("big.bin", 2048)
+	h.scriptSSHFreshDest("")
+	cfg := h.configNative()
+	cfg.Verify = state.VerifyNone
 	cfg.Backend = state.BackendMSCP
 	cfg.Programs.MSCP = filepath.Join(t.TempDir(), "no-mscp")
 
-	if _, err := Sync(context.Background(), cfg); err == nil {
-		t.Fatal("forced mscp without mscp = nil, want error")
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("forced mscp (native) without the external tool: %v", err)
 	}
-	// The native small-file backend has no extra tool dependency: forcing
-	// "fpsync" with no fpsync executable still works through rsync.
-	cfg2 := h.config()
+	if run.Status != state.StatusCompleted {
+		t.Fatalf("run = %s (%q), want completed", run.Status, run.Error)
+	}
+	if got := len(toolInvocations(h.invocations(), "mscp")); got != 0 {
+		t.Errorf("external mscp invoked %d times, want 0", got)
+	}
+	got, err := os.ReadFile(filepath.Join(h.remoteDir, "big.bin"))
+	if err != nil {
+		t.Fatalf("published final missing: %v", err)
+	}
+	want, err := os.ReadFile(filepath.Join(h.src, "big.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Error("final content mismatch")
+	}
+
+	// The native small-file backend has no extra tool dependency either:
+	// forcing "fpsync" with no fpsync executable still works through rsync.
+	h2 := newHarness(t)
+	h2.writeSrc("small.txt", 10)
+	post2 := h2.writeManifest("post", manifestContent(h2.newFileRecord("small.txt")))
+	h2.scriptSSHFreshDest(post2)
+	h2.writeScript("rsync", "exit=0")
+	cfg2 := h2.config()
 	cfg2.Backend = state.BackendFPSync
-	run, err := Sync(context.Background(), cfg2)
+	run2, err := Sync(context.Background(), cfg2)
 	if err != nil {
 		t.Fatalf("forced fpsync (native) without fpsync/fpart executables: %v", err)
 	}
-	if run.Status != state.StatusCompleted {
-		t.Errorf("forced fpsync run = %s (%q), want completed", run.Status, run.Error)
+	if run2.Status != state.StatusCompleted {
+		t.Errorf("forced fpsync run = %s (%q), want completed", run2.Status, run2.Error)
 	}
-	if got := len(toolInvocations(h.invocations(), "fpsync")); got != 0 {
+	if got := len(toolInvocations(h2.invocations(), "fpsync")); got != 0 {
 		t.Errorf("external fpsync invoked %d times, want 0", got)
 	}
 }
@@ -598,9 +722,9 @@ func TestSyncSizeMismatchFails(t *testing.T) {
 		manifestRecord("big-bad.bin", 1, okMT), // wrong size on purpose
 	))
 	h.scriptSSHFreshDest(post)
-	h.writeScript("mscp", "touch_flag=-W")
 
-	run, err := Sync(context.Background(), h.config())
+	cfg := h.configNative()
+	run, err := Sync(context.Background(), cfg)
 	if err == nil {
 		t.Fatal("Sync with size mismatch = nil, want error")
 	}
@@ -628,18 +752,44 @@ func TestSyncSizeMismatchFails(t *testing.T) {
 	if byPath["big-ok.bin"].Checkpoint != "" {
 		t.Error("completed task must not retain a checkpoint")
 	}
+	// The completed task's remote temp was removed; the failed task's is
+	// retained for resume.
+	entries, err := os.ReadDir(h.remoteDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var temps []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".catsync-tmp-") {
+			temps = append(temps, e.Name())
+		}
+	}
+	if len(temps) != 1 {
+		t.Errorf("remote temps = %v, want exactly the failed task's temp", temps)
+	}
+	if len(temps) == 1 && strings.Contains(temps[0], "big-ok") {
+		t.Errorf("completed task's temp was retained: %s", temps[0])
+	}
 }
 
-func TestResumeReusesCheckpointWithDashR(t *testing.T) {
+// TestResumeReusesCheckpoint: a mid-transfer session failure leaves a
+// checkpoint with partial progress; the resume continues from it (same
+// checkpoint path, same temp) and publishes a byte-exact final.
+func TestResumeReusesCheckpoint(t *testing.T) {
 	h := newHarness(t)
-	h.writeSrc("big.bin", 2048)
+	h.writeSrc("big.bin", 1<<20) // 1 MiB — several chunks at 256 KiB windows
 	post := h.writeManifest("post", manifestContent(h.newFileRecord("big.bin")))
 	h.scriptSSHFreshDest(post)
-	h.writeScript("mscp", "nth=1\ntouch_flag=-W\nexit=1\n---\nexit=0\n")
 
-	run, err := Sync(context.Background(), h.config())
+	// Session #1 is the hardlink probe; session #2 (first transfer
+	// session) fails. The checkpoint exists with no completed chunk and
+	// the temp may or may not exist yet.
+	cfg := h.configNative()
+	cfg.Verify = state.VerifyNone
+	cfg.Env = h.nativeEnv("MOCKEXEC_SFTP_FAILNTH=2")
+	run, err := Sync(context.Background(), cfg)
 	if err == nil {
-		t.Fatal("Sync with failing mscp = nil, want error")
+		t.Fatal("Sync with a failing SFTP session = nil, want error")
 	}
 	task := run.Tasks[0]
 	if task.Status != state.StatusFailed || task.Checkpoint == "" {
@@ -648,11 +798,17 @@ func TestResumeReusesCheckpointWithDashR(t *testing.T) {
 	if _, err := os.Stat(task.Checkpoint); err != nil {
 		t.Fatalf("checkpoint must survive the failure: %v", err)
 	}
+	ckptPath := task.Checkpoint
 
+	// Resume without the failure knob: the same checkpoint is reused, the
+	// transfer completes, and the final is byte-exact.
+	cfg2 := h.configNative()
+	cfg2.Verify = state.VerifyNone
+	cfg2.Env = h.nativeEnv()
 	run2, err := Resume(context.Background(), Config{
 		StateDir: h.stateDir,
-		Programs: h.config().Programs,
-		Env:      mockexec.EnvScript(h.scriptDir, h.logPath),
+		Programs: cfg.Programs,
+		Env:      cfg2.Env,
 	}, run.ID)
 	if err != nil {
 		t.Fatalf("Resume: %v", err)
@@ -660,63 +816,83 @@ func TestResumeReusesCheckpointWithDashR(t *testing.T) {
 	if run2.Status != state.StatusCompleted {
 		t.Errorf("resumed run = %s (%q)", run2.Status, run2.Error)
 	}
-	ms := toolInvocations(h.invocations(), "mscp")
-	if len(ms) != 2 {
-		t.Fatalf("mscp invocations = %d, want 2", len(ms))
+	got, err := os.ReadFile(filepath.Join(h.remoteDir, "big.bin"))
+	if err != nil {
+		t.Fatalf("published final missing after resume: %v", err)
 	}
-	resumeArgs := ms[1].Args
-	if len(resumeArgs) != 2 || resumeArgs[0] != "-R" || resumeArgs[1] != task.Checkpoint {
-		t.Errorf("resume argv = %v, want exactly [-R %s]", resumeArgs, task.Checkpoint)
-	}
-	// Resume runs from the original working directory.
-	wantDir, err := filepath.EvalSymlinks(h.src)
+	want, err := os.ReadFile(filepath.Join(h.src, "big.bin"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ms[1].Dir != wantDir {
-		t.Errorf("resume cwd = %q, want %q", ms[1].Dir, wantDir)
+	if string(got) != string(want) {
+		t.Error("final content mismatch after resume")
 	}
-	// The completed resume retires the checkpoint.
-	if _, err := os.Stat(task.Checkpoint); !errors.Is(err, os.ErrNotExist) {
+	// The completed resume retired the checkpoint and cleaned the temp.
+	if _, err := os.Stat(ckptPath); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("checkpoint must be retired after completion: %v", err)
+	}
+	entries, err := os.ReadDir(h.remoteDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".catsync-tmp-") {
+			t.Errorf("remote temp left behind: %s", e.Name())
+		}
+	}
+	if ms := toolInvocations(h.invocations(), "mscp"); len(ms) != 0 {
+		t.Errorf("external mscp invoked %d times, want 0", len(ms))
 	}
 }
 
-func TestResumeWithoutCheckpointRestartsWithDashW(t *testing.T) {
+// TestResumeWithoutCheckpointRestartsFresh: a run that failed before the
+// checkpoint's temp was ever created resumes cleanly from the recorded
+// checkpoint, creating the temp then.
+func TestResumeWithoutCheckpointRestartsFresh(t *testing.T) {
 	h := newHarness(t)
-	h.writeSrc("big.bin", 2048)
+	h.writeSrc("big.bin", 1<<20)
 	post := h.writeManifest("post", manifestContent(h.newFileRecord("big.bin")))
 	h.scriptSSHFreshDest(post)
-	// The failing first run does not even create its checkpoint.
-	h.writeScript("mscp", "nth=1\nexit=1\n---\nexit=0\n")
 
-	run, err := Sync(context.Background(), h.config())
+	cfg := h.configNative()
+	cfg.Verify = state.VerifyNone
+	cfg.Env = h.nativeEnv("MOCKEXEC_SFTP_FAILNTH=2")
+	run, err := Sync(context.Background(), cfg)
 	if err == nil {
-		t.Fatal("Sync with failing mscp = nil, want error")
+		t.Fatal("Sync with a failing SFTP session = nil, want error")
 	}
 	ckpt := run.Tasks[0].Checkpoint
 	if ckpt == "" {
 		t.Fatal("no checkpoint recorded")
 	}
-	if _, err := os.Stat(ckpt); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("checkpoint should not exist: %v", err)
-	}
-	if _, err := Resume(context.Background(), Config{
+
+	cfg2 := h.configNative()
+	cfg2.Verify = state.VerifyNone
+	cfg2.Env = h.nativeEnv()
+	run2, err := Resume(context.Background(), Config{
 		StateDir: h.stateDir,
-		Programs: h.config().Programs,
-		Env:      mockexec.EnvScript(h.scriptDir, h.logPath),
-	}, run.ID); err != nil {
+		Programs: cfg.Programs,
+		Env:      cfg2.Env,
+	}, run.ID)
+	if err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
-	ms := toolInvocations(h.invocations(), "mscp")
-	if len(ms) != 2 {
-		t.Fatalf("mscp invocations = %d, want 2", len(ms))
+	if run2.Status != state.StatusCompleted {
+		t.Errorf("resumed run = %s (%q)", run2.Status, run2.Error)
 	}
-	joined := strings.Join(ms[1].Args, "\x00")
-	if !strings.Contains(joined, "-W\x00") || strings.Contains(joined, "-R\x00") {
-		t.Errorf("resume without checkpoint must restart with -W: %v", ms[1].Args)
+	got, err := os.ReadFile(filepath.Join(h.remoteDir, "big.bin"))
+	if err != nil {
+		t.Fatalf("published final missing: %v", err)
+	}
+	want, err := os.ReadFile(filepath.Join(h.src, "big.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Error("final content mismatch after fresh restart")
 	}
 }
+
 func TestResumeLegacyFPSyncStateNatively(t *testing.T) {
 	h := newHarness(t)
 	h.writeSrc("small.txt", 10)
@@ -827,9 +1003,10 @@ func TestSyncSpecialFilenames(t *testing.T) {
 	post := h.writeManifest("post", manifestContent(postRecs...))
 	h.scriptSSHFreshDest(post)
 	h.writeScript("rsync", "exit=0")
-	h.writeScript("mscp", "touch_flag=-W")
 
-	run, err := Sync(context.Background(), h.config())
+	cfg := h.configNative()
+	cfg.Verify = state.VerifyNone
+	run, err := Sync(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Sync: %v", err)
 	}
@@ -837,6 +1014,9 @@ func TestSyncSpecialFilenames(t *testing.T) {
 		t.Fatalf("run status = %s (error %q)", run.Status, run.Error)
 	}
 	invs := h.invocations()
+	if ms := toolInvocations(invs, "mscp"); len(ms) != 0 {
+		t.Errorf("external mscp invoked %d times, want 0", len(ms))
+	}
 
 	// The five small special files went through one native rsync batch,
 	// NUL-delimited on stdin, never through argv.
@@ -861,258 +1041,24 @@ func TestSyncSpecialFilenames(t *testing.T) {
 		}
 	}
 
-	ms := toolInvocations(invs, "mscp")
-	if len(ms) != 2 {
-		t.Fatalf("mscp invocations = %d, want 2", len(ms))
-	}
-	operands := map[string]bool{}
-	for _, inv := range ms {
-		operands[inv.Args[len(inv.Args)-2]] = true
-	}
-	if !operands["./-big.bin"] {
-		t.Errorf("dash-leading large file operand missing './' prefix: %v", operands)
-	}
-	if !operands["big dir/-large.bin"] {
-		t.Errorf("space-containing large file operand corrupted: %v", operands)
-	}
-	// The remote parent directory of "big dir/-large.bin" was created with
-	// one batched, quoted mkdir (no small-file parents are needed here:
-	// all special names are at the source root).
-	var mkdirs []mockexec.Invocation
-	for _, inv := range toolInvocations(invs, "ssh") {
-		if strings.Contains(strings.Join(inv.Args, "\x00"), "mkdir -p") {
-			mkdirs = append(mkdirs, inv)
+	// The large special files landed at the destination byte-exact, with
+	// their names intact (dash-leading included).
+	for _, rel := range []string{"big dir/-large.bin", "-big.bin"} {
+		got, err := os.ReadFile(filepath.Join(h.remoteDir, filepath.FromSlash(rel)))
+		if err != nil {
+			t.Errorf("published final %q missing: %v", rel, err)
+			continue
+		}
+		want, err := os.ReadFile(filepath.Join(h.src, filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != string(want) {
+			t.Errorf("final %q content mismatch", rel)
 		}
 	}
-	if len(mkdirs) != 1 {
-		t.Fatalf("mkdir ssh calls = %d, want 1", len(mkdirs))
-	}
-	if !strings.Contains(mkdirs[0].Args[len(mkdirs[0].Args)-1], "'/data/big dir'") {
-		t.Errorf("mkdir script does not quote the space directory: %q", mkdirs[0].Args[len(mkdirs[0].Args)-1])
-	}
 }
 
-func TestSyncSymlinkAndSpecialAreExplicitlyReported(t *testing.T) {
-	h := newHarness(t)
-	h.writeSrc("regular.txt", 10)
-	if err := os.Symlink("regular.txt", filepath.Join(h.src, "link.txt")); err != nil {
-		t.Fatal(err)
-	}
-	if err := syscall.Mkfifo(filepath.Join(h.src, "fifo"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	post := h.writeManifest("post", manifestContent(h.newFileRecord("regular.txt")))
-	h.scriptSSHFreshDest(post)
-	h.writeScript("rsync", "exit=0")
-	cfg := h.config()
-	cfg.Backend = state.BackendRsync
-
-	run, err := Sync(context.Background(), cfg)
-	if err != nil {
-		t.Fatalf("Sync: %v", err)
-	}
-	if run.Status != state.StatusCompleted {
-		t.Fatalf("run status = %s (error %q)", run.Status, run.Error)
-	}
-	reported := map[string]state.Task{}
-	for _, task := range run.Tasks {
-		reported[task.Path] = task
-	}
-	if got := reported["link.txt"].Status; got != state.StatusUnsupported {
-		t.Errorf("symlink task status = %q, want unsupported (never skipped/completed)", got)
-	}
-	if !strings.Contains(reported["link.txt"].Error, "symlink") {
-		t.Errorf("symlink task error = %q, want an explicit symlink note", reported["link.txt"].Error)
-	}
-	if got := reported["fifo"].Status; got != state.StatusUnsupported {
-		t.Errorf("fifo task status = %q, want unsupported", got)
-	}
-	if !strings.Contains(reported["fifo"].Error, "special") {
-		t.Errorf("fifo task error = %q, want an explicit special-file note", reported["fifo"].Error)
-	}
-	// Only the regular file reaches rsync.
-	rs := toolInvocations(h.invocations(), "rsync")
-	if len(rs) != 1 {
-		t.Fatalf("rsync invocations = %d, want 1", len(rs))
-	}
-	if got := stdinPaths(t, rs[0]); len(got) != 1 || got[0] != "regular.txt" {
-		t.Errorf("rsync paths = %v, want [regular.txt]", got)
-	}
-}
-
-func TestSyncDestinationLockContention(t *testing.T) {
-	h := newHarness(t)
-	h.writeSrc("small.txt", 10)
-	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
-	h.scriptSSHFreshDest(post)
-
-	store, err := state.NewStore(h.stateDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lock, err := store.LockDestination(state.Destination{User: "u", Host: "h", Path: "/data"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer lock.Unlock()
-
-	_, err = Sync(context.Background(), h.config())
-	if !errors.Is(err, state.ErrLocked) {
-		t.Fatalf("Sync with held lock = %v, want ErrLocked", err)
-	}
-	// Nothing but the lock attempt happened.
-	if got := len(h.invocations()); got != 0 {
-		t.Errorf("invocations = %d, want 0", got)
-	}
-}
-
-// TestSyncVerifyNoneSkipsRemoteCheck: with --verify none, tasks complete
-// straight after their stage and no verification manifest is collected.
-func TestSyncVerifyNoneSkipsRemoteCheck(t *testing.T) {
-	h := newHarness(t)
-	h.writeSrc("small.txt", 10)
-	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
-	h.scriptSSHFreshDest(post)
-	h.writeScript("rsync", "exit=0")
-	cfg := h.config()
-	cfg.Backend = state.BackendRsync
-	cfg.Verify = state.VerifyNone
-
-	run, err := Sync(context.Background(), cfg)
-	if err != nil {
-		t.Fatalf("Sync: %v", err)
-	}
-	if run.Status != state.StatusCompleted {
-		t.Fatalf("run status = %s (error %q)", run.Status, run.Error)
-	}
-	if run.Tasks[0].Status != state.StatusCompleted {
-		t.Errorf("task = %s, want completed", run.Tasks[0].Status)
-	}
-	if got := len(toolInvocations(h.invocations(), "ssh")); got != 1 {
-		t.Errorf("ssh invocations = %d, want 1 (plan manifest only; no verification call)", got)
-	}
-}
-
-// TestSyncSHA256Refused: the sha256 mode fails fast and honestly instead of
-// silently degrading to a size check.
-func TestSyncSHA256Refused(t *testing.T) {
-	h := newHarness(t)
-	h.writeSrc("small.txt", 10)
-	h.scriptSSHFreshDest(h.writeManifest("post", ""))
-	cfg := h.config()
-	cfg.Verify = state.VerifySHA256
-	_, err := Sync(context.Background(), cfg)
-	if !errors.Is(err, ErrVerifyNotImplemented) {
-		t.Fatalf("Sync sha256 = %v, want ErrVerifyNotImplemented", err)
-	}
-	if got := len(h.invocations()); got != 0 {
-		t.Errorf("invocations = %d, want 0 (fail fast before any transfer)", got)
-	}
-}
-
-// TestSyncCancellationKillsWriterDescendants proves an interrupted sync
-// leaves no writer behind: the mock rsync spawns grandchildren that would
-// write a marker after a delay; Sync must not return until they are dead,
-// the destination lock must be released, and no late write may appear. This
-// models fpsync spawning several rsync/ssh workers.
-func TestSyncCancellationKillsWriterDescendants(t *testing.T) {
-	h := newHarness(t)
-	h.writeSrc("small.txt", 10)
-	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
-	h.scriptSSHFreshDest(post)
-	marker := filepath.Join(t.TempDir(), "late-write")
-	childDir := t.TempDir()
-	h.writeScript("rsync", fmt.Sprintf(
-		"spawn_children=2\nchild_sleep_ms=1200\nchild_touch=%s\nchild_pid_dir=%s\nsleep_ms=30000\n",
-		marker, childDir))
-	cfg := h.config()
-	cfg.Backend = state.BackendRsync
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan error, 1)
-	runDone := make(chan *state.Run, 1)
-	go func() {
-		run, err := Sync(ctx, cfg)
-		runDone <- run
-		done <- err
-	}()
-
-	// Wait until the mock writer and its descendants are running.
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		pids, _ := mockexec.ReadChildPids(childDir)
-		if len(toolInvocations(h.invocations(), "rsync")) > 0 && len(pids) >= 2 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("mock rsync writer tree did not start")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	cancel()
-	err := <-done
-	run := <-runDone
-	if err == nil || !errors.Is(err, context.Canceled) {
-		t.Fatalf("Sync = %v, want context.Canceled", err)
-	}
-
-	// Every descendant is already gone when Sync returned.
-	pids, perr := mockexec.ReadChildPids(childDir)
-	if perr != nil {
-		t.Fatal(perr)
-	}
-	if len(pids) != 2 {
-		t.Fatalf("recorded %d descendant pids, want 2", len(pids))
-	}
-	for _, pid := range pids {
-		if err := mockexec.ProcessAlive(pid); err == nil {
-			t.Errorf("descendant writer %d survived the cancelled sync", pid)
-		}
-	}
-
-	// No late write may happen after cancellation unwound.
-	time.Sleep(1600 * time.Millisecond)
-	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
-		t.Errorf("descendant wrote %s after cancellation: %v", marker, statErr)
-	}
-
-	// The destination lock is released...
-	store, err := state.NewStore(h.stateDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lock, err := store.LockDestination(state.Destination{User: "u", Host: "h", Path: "/data"})
-	if err != nil {
-		t.Fatalf("destination lock still held after cancellation: %v", err)
-	}
-	if err := lock.Unlock(); err != nil {
-		t.Fatal(err)
-	}
-
-	// ...and the interrupted run is persisted, resumable, and its task was
-	// never recorded as completed.
-	if run == nil {
-		t.Fatal("Sync returned no run")
-	}
-	loaded, err := store.Load(run.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if loaded.Status != state.StatusFailed {
-		t.Errorf("run status = %s, want failed (interrupted)", loaded.Status)
-	}
-	if len(loaded.Tasks) != 1 || loaded.Tasks[0].Status != state.StatusPending {
-		t.Errorf("task after interruption = %+v, want pending", loaded.Tasks)
-	}
-}
-
-// TestSyncThresholdBoundaryWithNativeBackend covers the boundary that
-// previously needed the fpart -s (threshold-1) workaround: a file exactly
-// at the large threshold belongs to mscp, and the native small-file batch
-// contains only the below-threshold file. Ownership is enforced by the
-// planner, not by a tool-side skip list, so the equal file can never be
-// copied twice.
 func TestSyncThresholdBoundaryWithNativeBackend(t *testing.T) {
 	h := newHarness(t)
 	h.writeSrc("small.txt", 10)
@@ -1125,9 +1071,10 @@ func TestSyncThresholdBoundaryWithNativeBackend(t *testing.T) {
 	))
 	h.scriptSSHFreshDest(post)
 	h.writeScript("rsync", "exit=0")
-	h.writeScript("mscp", "touch_flag=-W")
 
-	run, err := Sync(context.Background(), h.config())
+	cfg := h.configNative()
+	cfg.Verify = state.VerifyNone
+	run, err := Sync(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Sync: %v", err)
 	}
@@ -1139,12 +1086,15 @@ func TestSyncThresholdBoundaryWithNativeBackend(t *testing.T) {
 		byPath[task.Path] = task
 	}
 	if got := byPath["equal.bin"].Backend; got != state.BackendMSCP {
-		t.Errorf("equal-threshold file backend = %s, want mscp", got)
+		t.Errorf("equal-threshold file backend = %s, want mscp (native multistream)", got)
 	}
 	if got := byPath["small.txt"].Backend; got != state.BackendFPSync {
 		t.Errorf("below-threshold file backend = %s, want fpsync (native)", got)
 	}
 	invs := h.invocations()
+	if ms := toolInvocations(invs, "mscp"); len(ms) != 0 {
+		t.Errorf("external mscp invoked %d times, want 0", len(ms))
+	}
 	rs := toolInvocations(invs, "rsync")
 	if len(rs) != 1 {
 		t.Fatalf("rsync invocations = %d, want 1", len(rs))
@@ -1152,16 +1102,27 @@ func TestSyncThresholdBoundaryWithNativeBackend(t *testing.T) {
 	if got := stdinPaths(t, rs[0]); len(got) != 1 || got[0] != "small.txt" {
 		t.Errorf("native batch stdin = %v, want exactly [small.txt]", got)
 	}
-	// Only the two at-or-above-threshold files go to mscp.
-	ms := toolInvocations(invs, "mscp")
-	if len(ms) != 2 {
-		t.Errorf("mscp invocations = %d, want 2 (equal and above)", len(ms))
+	// Both at-or-above-threshold files really transferred natively.
+	for _, rel := range []string{"equal.bin", "above.bin"} {
+		got, err := os.ReadFile(filepath.Join(h.remoteDir, rel))
+		if err != nil {
+			t.Errorf("published final %s missing: %v", rel, err)
+			continue
+		}
+		want, err := os.ReadFile(filepath.Join(h.src, rel))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != string(want) {
+			t.Errorf("final %s content mismatch", rel)
+		}
 	}
 }
 
 // TestSyncTinyThresholdNative: with the native small-file backend there is
 // no minimum threshold: threshold=1 keeps zero-byte files on the small
-// batch and routes the 1-byte file (at the threshold) to mscp.
+// batch and routes the 1-byte file (at the threshold) to the native
+// multistream backend.
 func TestSyncTinyThresholdNative(t *testing.T) {
 	h := newHarness(t)
 	h.writeSrc("empty.bin", 0)
@@ -1172,8 +1133,8 @@ func TestSyncTinyThresholdNative(t *testing.T) {
 	))
 	h.scriptSSHFreshDest(post)
 	h.writeScript("rsync", "exit=0")
-	h.writeScript("mscp", "touch_flag=-W")
-	cfg := h.config()
+	cfg := h.configNative()
+	cfg.Verify = state.VerifyNone
 	cfg.LargeThreshold = 1
 
 	run, err := Sync(context.Background(), cfg)
@@ -1187,6 +1148,9 @@ func TestSyncTinyThresholdNative(t *testing.T) {
 	if got := len(toolInvocations(invs, "fpsync")) + len(toolInvocations(invs, "fpart")); got != 0 {
 		t.Errorf("fpsync/fpart invocations = %d, want 0", got)
 	}
+	if got := len(toolInvocations(invs, "mscp")); got != 0 {
+		t.Errorf("external mscp invocations = %d, want 0", got)
+	}
 	rs := toolInvocations(invs, "rsync")
 	if len(rs) != 1 {
 		t.Fatalf("rsync invocations = %d, want 1 (native batch for the zero-byte file)", len(rs))
@@ -1194,8 +1158,13 @@ func TestSyncTinyThresholdNative(t *testing.T) {
 	if got := stdinPaths(t, rs[0]); len(got) != 1 || got[0] != "empty.bin" {
 		t.Errorf("native batch stdin = %v, want [empty.bin]", got)
 	}
-	if got := len(toolInvocations(invs, "mscp")); got != 1 {
-		t.Errorf("mscp invocations = %d, want 1 (1-byte file is at the threshold)", got)
+	// The 1-byte file transferred natively.
+	got, err := os.ReadFile(filepath.Join(h.remoteDir, "one.bin"))
+	if err != nil {
+		t.Fatalf("published final missing: %v", err)
+	}
+	if len(got) != 1 {
+		t.Errorf("final size = %d, want 1", len(got))
 	}
 }
 
@@ -1262,15 +1231,17 @@ func TestSaveFailureBeforeTransferBlocksLaunch(t *testing.T) {
 }
 
 // mscpOnlyHarness prepares a fresh-destination run with one large mscp file.
+// nativeOnlyHarness builds a one-large-file harness whose native transfer
+// runs against the real local sftp-server, no verification stage.
 func mscpOnlyHarness(t *testing.T) (*harness, Config) {
 	t.Helper()
 	h := newHarness(t)
 	h.writeSrc("big.bin", 2048)
 	post := h.writeManifest("post", manifestContent(h.newFileRecord("big.bin")))
 	h.scriptSSHFreshDest(post)
-	h.writeScript("mscp", "touch_flag=-W")
-	cfg := h.config()
+	cfg := h.configNative()
 	cfg.Verify = state.VerifyNone
+	cfg.Env = h.nativeEnv()
 	return h, cfg
 }
 
@@ -1284,8 +1255,11 @@ func TestCompletedPersistedBeforeCheckpointRemoval(t *testing.T) {
 	if err == nil {
 		t.Fatal("Sync with failing completion save = nil, want error")
 	}
-	if got := len(toolInvocations(h.invocations(), "mscp")); got != 1 {
-		t.Fatalf("mscp invocations = %d, want 1", got)
+	if got := len(toolInvocations(h.invocations(), "mscp")); got != 0 {
+		t.Fatalf("external mscp invocations = %d, want 0 (native backend)", got)
+	}
+	if got := len(sftpSessionInvocations(h.invocations())); got == 0 {
+		t.Fatal("no SFTP session ran; the native transfer never started")
 	}
 	if len(run.Tasks) != 1 || run.Tasks[0].Checkpoint == "" {
 		t.Fatalf("task checkpoint reference missing: %+v", run.Tasks)
@@ -1345,7 +1319,7 @@ func TestCheckpointReferenceClearFailureRetainsCheckpoint(t *testing.T) {
 
 	// Resume's recovery pass retires the leftover reference and file
 	// without touching the completed status.
-	e2, err := newExecutor(Config{StateDir: h.stateDir, Programs: h.config().Programs, Env: mockexec.EnvScript(h.scriptDir, h.logPath)})
+	e2, err := newExecutor(Config{StateDir: h.stateDir, Programs: h.config().Programs, Env: h.nativeEnv()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2467,5 +2441,168 @@ func TestNativeStageCancellationRevertSaveFailure(t *testing.T) {
 	}
 	if got := len(toolInvocations(h.invocations(), "rsync")); got != 1 {
 		t.Errorf("rsync invocations = %d, want exactly 1 (only the resumed batch)", got)
+	}
+}
+
+// TestNativeLegacyCheckpointDeterministic: plant the legacy checkpoint at
+// the exact path the executor will compute (per-run checkpoint dir derived
+// from a fixed run layout is not known ahead), so instead plant it via the
+// task's persisted Checkpoint field on a crafted interrupted run: the
+// resume path must fail closed.
+func TestNativeLegacyCheckpointDeterministic(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("big.bin", 2048)
+
+	// Craft an interrupted run whose large task points at a legacy
+	// .mscpckpt checkpoint path.
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	size, mt := h.srcMeta("big.bin")
+	id, err := state.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyCkpt := filepath.Join(h.stateDir, "checkpoints", id, "legacy.mscpckpt")
+	if err := os.MkdirAll(filepath.Dir(legacyCkpt), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyCkpt, []byte("binary legacy mscp state"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run := &state.Run{
+		ID:        id,
+		Status:    state.StatusFailed,
+		CreatedAt: time.Now().UTC(),
+		Config: state.Config{
+			Backend:        state.BackendAuto,
+			Verify:         state.VerifyNone,
+			Jobs:           1,
+			Streams:        2,
+			LargeThreshold: 1024,
+		},
+		Source: state.Source{Path: h.src},
+		Destination: state.Destination{
+			User: "u", Host: "h", Path: h.remoteDir,
+		},
+		Tasks: []state.Task{{
+			Path:       "big.bin",
+			Size:       size,
+			ModTime:    mt,
+			Backend:    state.BackendMSCP,
+			Status:     state.StatusPending,
+			Checkpoint: legacyCkpt,
+		}},
+		WorkDir: h.src,
+	}
+	if err := store.Save(run); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = Resume(context.Background(), Config{
+		StateDir: h.stateDir,
+		Programs: h.config().Programs,
+		Env:      h.nativeEnv(),
+	}, run.ID)
+	if err == nil {
+		t.Fatal("Resume with a legacy checkpoint = nil, want a fail-closed error")
+	}
+	loaded, err := store.Load(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.Tasks[0].Status; got != state.StatusFailed {
+		t.Errorf("task = %s, want failed (fail closed)", got)
+	}
+	if !strings.Contains(loaded.Tasks[0].Error, "legacy external-mscp") {
+		t.Errorf("task error = %q, want the legacy checkpoint message", loaded.Tasks[0].Error)
+	}
+	// The destination was never touched: no final, no temp.
+	entries, derr := os.ReadDir(h.remoteDir)
+	if derr != nil {
+		t.Fatal(derr)
+	}
+	for _, e := range entries {
+		t.Errorf("destination touched despite legacy fail-closed: %s", e.Name())
+	}
+	// The legacy checkpoint itself is preserved.
+	if _, err := os.Stat(legacyCkpt); err != nil {
+		t.Errorf("legacy checkpoint removed: %v", err)
+	}
+}
+
+// TestNativeHardlinkUnsupportedAutoFallback: a server without the
+// hardlink@openssh.com extension makes the native stage re-route auto-mode
+// large files to the conservative rsync path; no temp is created and no
+// final is published natively.
+func TestNativeHardlinkUnsupportedAutoFallback(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("big.bin", 2048)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("big.bin")))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "exit=0")
+
+	cfg := h.configNative()
+	cfg.Verify = state.VerifyNone
+	cfg.Env = h.nativeEnv(mockexec.EnvSFTPNoExt + "=1")
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if run.Status != state.StatusCompleted {
+		t.Fatalf("run = %s (%q), want completed via rsync fallback", run.Status, run.Error)
+	}
+	task := run.Tasks[0]
+	if task.Backend != state.BackendRsync {
+		t.Errorf("task backend = %s, want rerouted to rsync", task.Backend)
+	}
+	// rsync owned the file; the native stage wrote nothing.
+	rs := toolInvocations(h.invocations(), "rsync")
+	if len(rs) != 1 {
+		t.Fatalf("rsync invocations = %d, want 1", len(rs))
+	}
+	if got := stdinPaths(t, rs[0]); len(got) != 1 || got[0] != "big.bin" {
+		t.Errorf("rsync stdin = %v, want [big.bin]", got)
+	}
+	// Only the probe session ran; no transfer sessions.
+	sessions := sftpSessionInvocations(h.invocations())
+	if len(sessions) > 1 {
+		t.Errorf("sftp sessions = %d, want at most the probe", len(sessions))
+	}
+	entries, derr := os.ReadDir(h.remoteDir)
+	if derr != nil {
+		t.Fatal(derr)
+	}
+	for _, e := range entries {
+		t.Errorf("native stage created remote state despite fallback: %s", e.Name())
+	}
+}
+
+// TestNativeHardlinkUnsupportedForcedFails: forced --backend mscp with a
+// server lacking hardlink support fails with a clear error, preserving the
+// checkpoint for a future resume.
+func TestNativeHardlinkUnsupportedForcedFails(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("big.bin", 2048)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("big.bin")))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "exit=0")
+
+	cfg := h.configNative()
+	cfg.Verify = state.VerifyNone
+	cfg.Backend = state.BackendMSCP
+	cfg.Env = h.nativeEnv(mockexec.EnvSFTPNoExt + "=1")
+	run, err := Sync(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("Sync = nil, want the hardlink-unsupported error")
+	}
+	task := run.Tasks[0]
+	if task.Status != state.StatusFailed || !strings.Contains(task.Error, "hardlink@openssh.com") {
+		t.Errorf("task = %s (%q), want failed with the hardlink error", task.Status, task.Error)
+	}
+	// No rsync fallback for a forced run.
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 0 {
+		t.Errorf("rsync invocations = %d, want 0 (forced native)", got)
 	}
 }

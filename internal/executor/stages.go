@@ -3,8 +3,6 @@ package executor
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -14,7 +12,6 @@ import (
 	"sync"
 
 	"github.com/frankruan/catsync/internal/backend"
-	"github.com/frankruan/catsync/internal/backend/mscp"
 	"github.com/frankruan/catsync/internal/backend/rsync"
 	"github.com/frankruan/catsync/internal/partition"
 	"github.com/frankruan/catsync/internal/state"
@@ -377,152 +374,6 @@ func (e *Executor) completeTask(t *state.Task) error {
 	return e.retireCheckpoint(t)
 }
 
-// mscpStage runs the confirmed-new large-file tasks, one mscp process per
-// file, bounded by the jobs semaphore. mscp follows scp semantics and does
-// not create missing remote parent directories, so the stage first issues
-// one batched remote mkdir.
-func (e *Executor) mscpStage(ctx context.Context) error {
-	idxs := e.pendingTasks(state.BackendMSCP)
-	if len(idxs) == 0 {
-		return nil
-	}
-	if !e.detectTools().MSCP {
-		for _, i := range idxs {
-			if err := e.failTask(&e.run.Tasks[i], "mscp is no longer available; start a new run to replan"); err != nil {
-				return err
-			}
-		}
-		return errors.New("mscp unavailable")
-	}
-
-	// One batched mkdir -p for every parent directory the stage needs.
-	parents := map[string]struct{}{}
-	for _, i := range idxs {
-		rel := e.run.Tasks[i].Path
-		if slash := strings.LastIndexByte(rel, '/'); slash >= 0 {
-			parents[targetRemoteJoin(e.run.Destination.Path, rel[:slash])] = struct{}{}
-		}
-	}
-	if len(parents) > 0 {
-		dirs := make([]string, 0, len(parents))
-		for d := range parents {
-			dirs = append(dirs, d)
-		}
-		sort.Strings(dirs)
-		if err := e.mkdirRemoteParents(ctx, e.destTarget(), e.run.Config.IPv6, dirs); err != nil {
-			for _, i := range idxs {
-				if ferr := e.failTask(&e.run.Tasks[i], fmt.Sprintf("create remote parent directories: %v", err)); ferr != nil {
-					return ferr
-				}
-			}
-			return err
-		}
-	}
-
-	e.logf("stage mscp: %d large file(s), up to %d process(es) × %d connection(s)",
-		len(idxs), e.run.Config.Jobs, e.run.Config.Streams)
-
-	ckptDir, err := e.checkpointDir()
-	if err != nil {
-		return err
-	}
-	sem := make(chan struct{}, e.run.Config.Jobs)
-	var wg sync.WaitGroup
-	var errs []string
-	var errsMu sync.Mutex
-	for _, i := range idxs {
-		select {
-		case sem <- struct{}{}:
-		case <-ctx.Done():
-			wg.Wait()
-			return ctx.Err()
-		}
-		wg.Add(1)
-		go func(t *state.Task) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			if err := e.mscpTask(ctx, t, ckptDir); err != nil && ctx.Err() == nil {
-				errsMu.Lock()
-				errs = append(errs, err.Error())
-				errsMu.Unlock()
-			}
-		}(&e.run.Tasks[i])
-	}
-	wg.Wait()
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	if len(errs) > 0 {
-		return errors.New(strings.Join(errs, "; "))
-	}
-	return nil
-}
-
-// mscpTask transfers one large file, resuming from its retained checkpoint
-// when one exists.
-func (e *Executor) mscpTask(ctx context.Context, t *state.Task, ckptDir string) error {
-	ok, err := e.recheckBefore(t)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return nil
-	}
-	e.runMu.Lock()
-	if t.Checkpoint == "" {
-		sum := sha256.Sum256([]byte(t.Path))
-		t.Checkpoint = filepath.Join(ckptDir, hex.EncodeToString(sum[:])+".mscpckpt")
-	}
-	checkpoint := t.Checkpoint
-	e.runMu.Unlock()
-	if err := os.MkdirAll(filepath.Dir(checkpoint), 0o700); err != nil {
-		return e.failTask(t, fmt.Sprintf("create checkpoint directory: %v", err))
-	}
-
-	resume := fileExists(checkpoint)
-	cfg := mscp.Config{
-		Program:     e.progs.mscp(),
-		WorkDir:     e.run.WorkDir,
-		Path:        t.Path,
-		Dest:        e.destTarget(),
-		Connections: e.run.Config.Streams,
-		Inflight:    mscpInflight,
-		MinChunk:    mscpMinChunk,
-		Checkpoint:  checkpoint,
-		SSH:         e.sshOpts(e.run.Config.IPv6),
-		Env:         e.cfg.Env,
-		Stdout:      e.stdout,
-		Stderr:      e.stderr,
-	}
-
-	// The running intent must be durable before mscp starts.
-	if err := e.markRunning(t); err != nil {
-		return err
-	}
-	if resume {
-		err = cfg.Resume(ctx)
-	} else {
-		err = cfg.Run(ctx)
-	}
-	if err != nil {
-		if ctx.Err() == nil {
-			return e.failTask(t, fmt.Sprintf("mscp failed: %v", err))
-		}
-		return err
-	}
-	ok, rerr := e.recheckAfter(t)
-	if rerr != nil {
-		return rerr
-	}
-	if !ok {
-		return fmt.Errorf("%s: source changed during transfer", t.Path)
-	}
-	if e.stageVerifyNone() {
-		return e.completeTask(t)
-	}
-	return nil
-}
-
 // checkpointDir returns the per-run checkpoint directory.
 func (e *Executor) checkpointDir() (string, error) {
 	abs, err := filepath.Abs(e.cfg.StateDir)
@@ -660,8 +511,18 @@ func (e *Executor) verifyStage(ctx context.Context) error {
 			}
 			failures = append(failures, t.Path)
 		default:
+			// Native large tasks: remember the temp path from the
+			// checkpoint before completeTask retires it, then remove the
+			// temp after the completed state is durable.
+			tempPath := ""
+			if t.Backend == state.BackendMSCP {
+				tempPath = e.nativeTempPath(t)
+			}
 			if cerr := e.completeTask(t); cerr != nil {
 				return cerr
+			}
+			if tempPath != "" {
+				e.removeRemoteTemp(ctx, tempPath)
 			}
 		}
 	}

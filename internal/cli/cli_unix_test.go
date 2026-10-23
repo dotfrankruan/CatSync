@@ -23,7 +23,9 @@ func TestMain(m *testing.M) {
 }
 
 // cliHarness wires the mock executables into the CATSYNC_* environment the
-// CLI reads, with a script directory and invocation log.
+// CLI reads, with a script directory and invocation log. remoteDir is the
+// real local directory acting as the remote destination for native
+// transfers through the real sftp-server.
 type cliHarness struct {
 	t         *testing.T
 	src       string
@@ -31,6 +33,7 @@ type cliHarness struct {
 	scriptDir string
 	logPath   string
 	progs     map[string]string
+	remoteDir string
 }
 
 func newCLIHarness(t *testing.T) *cliHarness {
@@ -47,6 +50,7 @@ func newCLIHarness(t *testing.T) *cliHarness {
 		scriptDir: t.TempDir(),
 		logPath:   filepath.Join(t.TempDir(), "invocations.jsonl"),
 		progs:     progs,
+		remoteDir: t.TempDir(),
 	}
 	for tool, path := range progs {
 		t.Setenv("CATSYNC_"+strings.ToUpper(tool), path)
@@ -57,6 +61,18 @@ func newCLIHarness(t *testing.T) *cliHarness {
 	t.Setenv(mockexec.EnvScriptDir, h.scriptDir)
 	t.Setenv(mockexec.EnvInvocationLog, h.logPath)
 	return h
+}
+
+// armNative enables the mock ssh's real-remote emulation (SFTP subsystem,
+// controlled metadata commands) against h.remoteDir.
+func (h *cliHarness) armNative() {
+	h.t.Helper()
+	recDir := filepath.Join(h.stateDir, "record")
+	if err := os.MkdirAll(recDir, 0o755); err != nil {
+		h.t.Fatal(err)
+	}
+	h.t.Setenv(mockexec.EnvSSHNative, "1")
+	h.t.Setenv(mockexec.EnvRecordDir, recDir)
 }
 
 func (h *cliHarness) writeScript(tool, config string) {
@@ -133,15 +149,15 @@ exit=0
 // and status then reports the persisted run.
 func TestCLISyncEndToEnd(t *testing.T) {
 	h := newCLIHarness(t)
+	h.armNative()
 	h.writeSrc("small.txt", 10)
 	h.writeSrc("big.bin", 2048)
 	post := h.writeManifest("post", h.record("small.txt")+h.record("big.bin"))
 	h.scriptFreshDestSSH(post)
 	h.writeScript("rsync", "exit=0")
-	h.writeScript("mscp", "touch_flag=-W")
 
 	code, stdout, stderr := run(t, "sync", "--state-dir", h.stateDir,
-		"--large-threshold", "1KiB", h.src, "user@host:/data")
+		"--large-threshold", "1KiB", h.src, "user@host:"+h.remoteDir)
 	if code != ExitOK {
 		t.Fatalf("sync exit = %d, stderr:\n%s", code, stderr)
 	}
@@ -152,16 +168,31 @@ func TestCLISyncEndToEnd(t *testing.T) {
 		t.Errorf("external fpsync/fpart invoked: fpsync=%d fpart=%d, want 0",
 			len(h.invocations("fpsync")), len(h.invocations("fpart")))
 	}
-	if len(h.invocations("rsync")) != 1 || len(h.invocations("mscp")) != 1 {
-		t.Errorf("invocations: rsync=%d mscp=%d, want 1 each",
-			len(h.invocations("rsync")), len(h.invocations("mscp")))
+	if len(h.invocations("rsync")) != 1 {
+		t.Errorf("invocations: rsync=%d, want 1", len(h.invocations("rsync")))
+	}
+	// No external mscp; the large file went through the native backend and
+	// really landed at the destination.
+	if got := len(h.invocations("mscp")); got != 0 {
+		t.Errorf("external mscp invoked %d times, want 0", got)
+	}
+	got, err := os.ReadFile(filepath.Join(h.remoteDir, "big.bin"))
+	if err != nil {
+		t.Fatalf("published final missing: %v", err)
+	}
+	want, err := os.ReadFile(filepath.Join(h.src, "big.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Error("final content mismatch")
 	}
 
 	code, stdout, stderr = run(t, "status", "--state-dir", h.stateDir)
 	if code != ExitOK {
 		t.Fatalf("status exit = %d, stderr:\n%s", code, stderr)
 	}
-	for _, want := range []string{"completed", "native-small 1, mscp 1, rsync 0", "user@host:/data"} {
+	for _, want := range []string{"completed", "native-small 1, mscp 1, rsync 0", "user@host:" + h.remoteDir} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("status output missing %q:\n%s", want, stdout)
 		}
@@ -252,36 +283,58 @@ func TestCLISyncFailureExitCode(t *testing.T) {
 // the rsync transport "ssh -6", and mscp -6.
 func TestCLIIPv6CommandShapes(t *testing.T) {
 	h := newCLIHarness(t)
+	h.armNative()
 	h.writeSrc("big.bin", 2048)
 	post := h.writeManifest("post", h.record("big.bin"))
 	h.scriptFreshDestSSH(post)
-	h.writeScript("mscp", "touch_flag=-W")
 
 	code, _, stderr := run(t, "sync", "--state-dir", h.stateDir, "--ipv6", "--backend", "mscp",
-		"--large-threshold", "1KiB", h.src, "user@[2001:db8::1]:/data")
+		"--large-threshold", "1KiB", h.src, "user@[2001:db8::1]:"+h.remoteDir)
 	if code != ExitOK {
 		t.Fatalf("sync exit = %d, stderr:\n%s", code, stderr)
 	}
-	for _, inv := range h.invocations("ssh") {
+	// Every ssh invocation — manifest, SFTP sessions, metadata commands —
+	// carries the standalone -6 flag; no external mscp runs.
+	if got := len(h.invocations("mscp")); got != 0 {
+		t.Errorf("external mscp invoked %d times, want 0", got)
+	}
+	ssh := h.invocations("ssh")
+	if len(ssh) == 0 {
+		t.Fatal("no ssh invocations")
+	}
+	for _, inv := range ssh {
 		if len(inv.Args) < 1 || inv.Args[0] != "-6" {
 			t.Errorf("ssh argv missing -6: %v", inv.Args)
 		}
 	}
-	ms := h.invocations("mscp")
-	if len(ms) != 1 {
-		t.Fatalf("mscp invocations = %d, want 1", len(ms))
-	}
-	found6 := false
-	for _, a := range ms[0].Args {
-		if a == "-6" {
-			found6 = true
+	// The SFTP session argv is exactly the native shape: ssh -6 -T -s
+	// user@[2001:db8::1] sftp, the remote path never an operand.
+	var sftpArgv []string
+	for _, inv := range ssh {
+		joined := strings.Join(inv.Args, "\x00")
+		if strings.Contains(joined, "-s\x00user@2001:db8::1\x00sftp") {
+			sftpArgv = inv.Args
+			break
 		}
 	}
-	if !found6 {
-		t.Errorf("mscp argv missing -6: %v", ms[0].Args)
+	if sftpArgv == nil {
+		t.Fatalf("no native SFTP session invocation found: %v", ssh)
 	}
-	if got := ms[0].Args[len(ms[0].Args)-1]; got != "user@[2001:db8::1]:/data/big.bin" {
-		t.Errorf("mscp target = %q, want bracketed IPv6", got)
+	for _, a := range sftpArgv {
+		if strings.Contains(a, h.remoteDir) {
+			t.Errorf("SFTP argv carries the remote path: %v", sftpArgv)
+		}
+	}
+	got, err := os.ReadFile(filepath.Join(h.remoteDir, "big.bin"))
+	if err != nil {
+		t.Fatalf("published final missing: %v", err)
+	}
+	want, err := os.ReadFile(filepath.Join(h.src, "big.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Error("final content mismatch")
 	}
 }
 
@@ -449,15 +502,15 @@ func TestCLIReportsUnsupportedEntries(t *testing.T) {
 // between operands drive real commands end to end.
 func TestCLIInterspersedArgsEndToEnd(t *testing.T) {
 	h := newCLIHarness(t)
+	h.armNative()
 	h.writeSrc("small.txt", 10)
 	h.writeSrc("big.bin", 2048)
 	post := h.writeManifest("post", h.record("small.txt")+h.record("big.bin"))
 	h.scriptFreshDestSSH(post)
 	h.writeScript("rsync", "exit=0")
-	h.writeScript("mscp", "touch_flag=-W")
 
 	// Every option trails the operands.
-	code, stdout, stderr := run(t, "sync", h.src, "user@host:/data",
+	code, stdout, stderr := run(t, "sync", h.src, "user@host:"+h.remoteDir,
 		"--state-dir", h.stateDir, "--large-threshold", "1KiB",
 		"--jobs", "2", "--streams", "2")
 	if code != ExitOK {

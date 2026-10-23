@@ -172,6 +172,21 @@ func RunHelper() int {
 		return runGrandchild()
 	}
 	tool := filepath.Base(os.Args[0])
+	// When invoked as ssh for the SFTP subsystem or a controlled metadata
+	// command, emulate a real remote end on the local filesystem instead of
+	// following the script. This must happen before stdin is read: the SFTP
+	// protocol stream is stdin.
+	if tool == "ssh" {
+		if code, handled := sshEmulation(os.Args[1:]); handled {
+			if dir := os.Getenv(EnvRecordDir); dir != "" {
+				record(dir, nil)
+			}
+			if log := os.Getenv(EnvInvocationLog); log != "" {
+				appendInvocation(log, tool, nil)
+			}
+			return code
+		}
+	}
 	// Read stdin once: the record, the invocation log, and the script
 	// section matcher all need it, and it is either a bounded file list or
 	// the null device.

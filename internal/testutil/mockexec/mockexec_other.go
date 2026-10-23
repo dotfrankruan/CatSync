@@ -23,3 +23,10 @@ func installCatchSignal(dir string) {}
 
 // installZeroExitSignal is a no-op on non-Unix platforms.
 func installZeroExitSignal(name, dir string) error { return nil }
+
+// sshEmulation is unavailable on non-Unix platforms: the mock ssh never
+// emulates a remote end there.
+func sshEmulation(args []string) (int, bool) { return 0, false }
+
+// SFTPServerAvailable always reports false on non-Unix platforms.
+func SFTPServerAvailable() bool { return false }
