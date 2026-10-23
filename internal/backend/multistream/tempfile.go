@@ -213,27 +213,37 @@ func OpenResumeTemp(client *sftp.Client, spec RemoteTempSpec) (*RemoteTempWriter
 	return openResumeTemp(clientOps{client}, spec)
 }
 
-func openResumeTemp(ops remoteOps, spec RemoteTempSpec) (*RemoteTempWriter, error) {
-	if err := spec.validate(); err != nil {
-		return nil, err
-	}
+// checkResumeTarget validates the resume target before any handle is
+// opened: the final path must not exist, and the temp must already exist
+// as a regular file of exactly the planned size.
+func checkResumeTarget(ops remoteOps, spec RemoteTempSpec) error {
 	if _, err := ops.Lstat(spec.FinalPath); err == nil {
-		return nil, fmt.Errorf("%w: %s", ErrRemoteFinalExists, spec.FinalPath)
+		return fmt.Errorf("%w: %s", ErrRemoteFinalExists, spec.FinalPath)
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("multistream: lstat final path: %w", err)
+		return fmt.Errorf("multistream: lstat final path: %w", err)
 	}
 	fi, err := ops.Lstat(spec.TempPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("%w: %s", ErrRemoteTempMissing, spec.TempPath)
+			return fmt.Errorf("%w: %s", ErrRemoteTempMissing, spec.TempPath)
 		}
-		return nil, fmt.Errorf("multistream: lstat temp: %w", err)
+		return fmt.Errorf("multistream: lstat temp: %w", err)
 	}
 	if !fi.Mode().IsRegular() || fi.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("%w: %s is not a regular file", ErrRemoteTempMismatch, spec.TempPath)
+		return fmt.Errorf("%w: %s is not a regular file", ErrRemoteTempMismatch, spec.TempPath)
 	}
 	if fi.Size() != int64(spec.Size) {
-		return nil, fmt.Errorf("%w: %s is %d bytes, want %d", ErrRemoteTempMismatch, spec.TempPath, fi.Size(), spec.Size)
+		return fmt.Errorf("%w: %s is %d bytes, want %d", ErrRemoteTempMismatch, spec.TempPath, fi.Size(), spec.Size)
+	}
+	return nil
+}
+
+func openResumeTemp(ops remoteOps, spec RemoteTempSpec) (*RemoteTempWriter, error) {
+	if err := spec.validate(); err != nil {
+		return nil, err
+	}
+	if err := checkResumeTarget(ops, spec); err != nil {
+		return nil, err
 	}
 	f, err := ops.OpenFile(spec.TempPath, os.O_WRONLY)
 	if err != nil {

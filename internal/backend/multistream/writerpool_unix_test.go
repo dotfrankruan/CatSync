@@ -44,6 +44,7 @@ func TestWriterPoolOpensIndependentHandles(t *testing.T) {
 	ops := make([]remoteOps, 4)
 	for i := range ops {
 		ops[i] = &fakeOps{
+			lstatFn: defaultTempLstat,
 			openFileFn: func(p string, flags int) (remoteFile, error) {
 				mu.Lock()
 				opens = append(opens, flags)
@@ -76,6 +77,7 @@ func TestWriterPoolOpenFailureClosesPrevious(t *testing.T) {
 	for i := range ops {
 		i := i
 		ops[i] = &fakeOps{
+			lstatFn: defaultTempLstat,
 			openFileFn: func(p string, flags int) (remoteFile, error) {
 				if i == 2 {
 					return nil, errors.New("open boom")
@@ -109,6 +111,7 @@ func TestWriterPoolHandleStatMismatch(t *testing.T) {
 	for i := range ops {
 		i := i
 		ops[i] = &fakeOps{
+			lstatFn: defaultTempLstat,
 			openFileFn: func(p string, flags int) (remoteFile, error) {
 				size := int64(256)
 				if i == 1 {
@@ -132,6 +135,7 @@ func TestWriterPoolShortWriteRetryAndZeroProgress(t *testing.T) {
 	var calls int
 	var wrote []byte
 	ops := []remoteOps{&fakeOps{
+		lstatFn: defaultTempLstat,
 		openFileFn: func(string, int) (remoteFile, error) {
 			return &fakeFile{
 				statFn: func() (os.FileInfo, error) { return fakeInfo{name: "t", size: 256, mode: 0o600}, nil },
@@ -198,6 +202,7 @@ func TestWriterPoolCopySpreadsSessions(t *testing.T) {
 	for i := range ops {
 		idx := i
 		ops[i] = &fakeOps{
+			lstatFn: defaultTempLstat,
 			openFileFn: func(p string, flags int) (remoteFile, error) {
 				if flags != os.O_WRONLY {
 					t.Errorf("pool open flags = %#x, want O_WRONLY", flags)
@@ -265,6 +270,7 @@ func TestWriterPoolSyncAllCloseAllOrder(t *testing.T) {
 	for i := range ops {
 		i := i
 		ops[i] = &fakeOps{
+			lstatFn: defaultTempLstat,
 			openFileFn: func(string, int) (remoteFile, error) {
 				return &fakeFile{
 					statFn: func() (os.FileInfo, error) { return fakeInfo{name: "t", size: 256, mode: 0o600}, nil },
@@ -324,6 +330,7 @@ func TestWriterPoolConcurrencyCap(t *testing.T) {
 	ops := make([]remoteOps, 2)
 	for i := range ops {
 		ops[i] = &fakeOps{
+			lstatFn: defaultTempLstat,
 			openFileFn: func(string, int) (remoteFile, error) {
 				return &fakeFile{
 					statFn: func() (os.FileInfo, error) { return fakeInfo{name: "t", size: 256, mode: 0o600}, nil },
@@ -427,4 +434,16 @@ func TestWriterPoolNilClient(t *testing.T) {
 	if _, err := OpenRemoteWriterPool(spec, []*sftp.Client{nil}); !errors.Is(err, ErrInvalidRemoteTemp) {
 		t.Fatalf("OpenRemoteWriterPool(nil client) = %v, want ErrInvalidRemoteTemp", err)
 	}
+}
+
+// defaultTempLstat answers the resume-target validation done by the pool:
+// final is absent, temp exists as a regular file of the requested size. The
+// spread test's spec has size 64; the others 256 — the pool only checks
+// consistency against the spec, so return the size that spec wants by
+// reading the path: the spread test uses the same temp path with size 64.
+func defaultTempLstat(p string) (os.FileInfo, error) {
+	if p == "/data/.catsync-tmp-big.bin" {
+		return fakeInfo{name: "t", size: 256, mode: 0o600}, nil
+	}
+	return nil, os.ErrNotExist
 }

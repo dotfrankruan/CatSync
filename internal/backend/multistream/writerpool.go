@@ -63,6 +63,12 @@ func openRemoteWriterPool(spec RemoteTempSpec, ops []remoteOps) (*RemoteWriterPo
 	if len(ops) == 0 {
 		return nil, fmt.Errorf("%w: no sessions", ErrInvalidRemoteTemp)
 	}
+	// Resume validation against the first session: the final path must not
+	// exist yet, and the temp must already be a regular file of the planned
+	// size. Each handle is re-checked after opening below.
+	if err := checkResumeTarget(ops[0], spec); err != nil {
+		return nil, err
+	}
 	p := &RemoteWriterPool{
 		writers: make(chan poolWriter, len(ops)),
 		done:    make(chan struct{}),
