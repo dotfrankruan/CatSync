@@ -39,7 +39,6 @@ type fakeOps struct {
 	calls      []string
 	lstatFn    func(path string) (os.FileInfo, error)
 	openFileFn func(path string, flags int) (remoteFile, error)
-	chmodFn    func(path string, mode os.FileMode) error
 	removeFn   func(path string) error
 }
 
@@ -59,11 +58,6 @@ func (o *fakeOps) OpenFile(p string, flags int) (remoteFile, error) {
 	return o.openFileFn(p, flags)
 }
 
-func (o *fakeOps) Chmod(p string, mode os.FileMode) error {
-	o.record("chmod %s %o", p, mode)
-	return o.chmodFn(p, mode)
-}
-
 func (o *fakeOps) Remove(p string) error {
 	o.record("remove %s", p)
 	return o.removeFn(p)
@@ -78,12 +72,19 @@ func (o *fakeOps) callList() []string {
 // fakeFile is a remoteFile whose behavior comes from function fields.
 type fakeFile struct {
 	writeAtFn  func(p []byte, off int64) (int, error)
+	chmodFn    func(mode os.FileMode) error
 	truncateFn func(size int64) error
 	syncFn     func() error
 	statFn     func() (os.FileInfo, error)
 	closeFn    func() error
 }
 
+func (f *fakeFile) Chmod(mode os.FileMode) error {
+	if f.chmodFn != nil {
+		return f.chmodFn(mode)
+	}
+	return nil
+}
 func (f *fakeFile) WriteAt(p []byte, off int64) (int, error) {
 	if f.writeAtFn != nil {
 		return f.writeAtFn(p, off)
@@ -162,7 +163,11 @@ func TestRemoteTempValidationBeforeRemoteCalls(t *testing.T) {
 // close.
 func TestPrepareFreshTempFakeOps(t *testing.T) {
 	spec := tempSpec()
-	f := &fakeFile{}
+	var chmodMode os.FileMode
+	f := &fakeFile{chmodFn: func(mode os.FileMode) error {
+		chmodMode = mode
+		return nil
+	}}
 	ops := &fakeOps{
 		lstatFn: func(string) (os.FileInfo, error) { return nil, os.ErrNotExist },
 		openFileFn: func(p string, flags int) (remoteFile, error) {
@@ -175,25 +180,32 @@ func TestPrepareFreshTempFakeOps(t *testing.T) {
 			}
 			return f, nil
 		},
-		chmodFn: func(p string, mode os.FileMode) error {
-			if mode != 0o600 {
-				t.Errorf("chmod mode = %o, want 600", mode)
-			}
-			return nil
-		},
 		removeFn: func(string) error { return nil },
 	}
 	if err := prepareFreshTemp(ops, spec); err != nil {
 		t.Fatal(err)
 	}
+	if chmodMode != 0o600 {
+		t.Errorf("handle chmod mode = %o, want 600", chmodMode)
+	}
 	want := []string{
 		"lstat /data/big.bin",
 		fmt.Sprintf("openfile /data/.catsync-tmp-big.bin flags=%#x", os.O_WRONLY|os.O_CREATE|os.O_EXCL),
-		"chmod /data/.catsync-tmp-big.bin 600",
 	}
 	got := ops.callList()
 	if strings.Join(got, ";") != strings.Join(want, ";") {
-		t.Errorf("call order = %v, want %v", got, want)
+		t.Errorf("call order = %v, want %v (chmod happens on the handle, not the ops)", got, want)
+	}
+}
+
+// TestRemoteTempNilClient: a nil *sftp.Client fails before any remote call.
+func TestRemoteTempNilClient(t *testing.T) {
+	spec := tempSpec()
+	if err := PrepareFreshTemp(nil, spec); !errors.Is(err, ErrInvalidRemoteTemp) {
+		t.Errorf("PrepareFreshTemp(nil) = %v, want ErrInvalidRemoteTemp", err)
+	}
+	if _, err := OpenResumeTemp(nil, spec); !errors.Is(err, ErrInvalidRemoteTemp) {
+		t.Errorf("OpenResumeTemp(nil) = %v, want ErrInvalidRemoteTemp", err)
 	}
 }
 
@@ -208,7 +220,6 @@ func TestPrepareFreshTempFailureCleansTemp(t *testing.T) {
 		return &fakeOps{
 			lstatFn:    func(string) (os.FileInfo, error) { return nil, os.ErrNotExist },
 			openFileFn: func(string, int) (remoteFile, error) { return f, nil },
-			chmodFn:    func(string, os.FileMode) error { return nil },
 			removeFn:   func(string) error { return removeErr },
 		}
 	}

@@ -81,11 +81,18 @@ func (s RemoteTempSpec) validate() error {
 // remoteFile is the narrow per-handle surface the temp layer uses.
 type remoteFile interface {
 	io.WriterAt
+	// Chmod sets the object's permission bits through the open handle,
+	// never via a path that could have been replaced.
+	Chmod(mode os.FileMode) error
 	// Truncate resizes the object.
 	Truncate(size int64) error
 	// Sync flushes the object to remote storage.
 	Sync() error
-	// Stat stats the object through the open handle.
+	// Stat stats the object through the open handle. It re-verifies the
+	// opened object's reported attributes; it cannot prove inode identity
+	// across a replace-with-same-attributes attack — that is why the layer
+	// instead relies on checkpoint binding, unpredictable run-specific
+	// names, and the final no-clobber publish.
 	Stat() (os.FileInfo, error)
 	Close() error
 }
@@ -95,7 +102,6 @@ type remoteFile interface {
 type remoteOps interface {
 	Lstat(path string) (os.FileInfo, error)
 	OpenFile(path string, flags int) (remoteFile, error)
-	Chmod(path string, mode os.FileMode) error
 	Remove(path string) error
 }
 
@@ -105,9 +111,6 @@ type clientOps struct{ c *sftp.Client }
 func (o clientOps) Lstat(p string) (os.FileInfo, error) { return o.c.Lstat(p) }
 func (o clientOps) OpenFile(p string, flags int) (remoteFile, error) {
 	return o.c.OpenFile(p, flags)
-}
-func (o clientOps) Chmod(p string, mode os.FileMode) error {
-	return o.c.Chmod(p, mode)
 }
 func (o clientOps) Remove(p string) error { return o.c.Remove(p) }
 
@@ -131,13 +134,18 @@ func (w *RemoteTempWriter) Close() error { return w.f.Close() }
 // PrepareFreshTemp creates the remote temporary object for a fresh
 // transfer. The final destination must not exist in any form (file,
 // directory, or symlink). The temporary object is created with
-// O_WRONLY|O_CREATE|O_EXCL and mode 0600 — an existing temporary object is
-// never overwritten or truncated. Parent directories are never created;
-// the caller must prepare them explicitly beforehand.
+// O_WRONLY|O_CREATE|O_EXCL — an existing temporary object is never
+// overwritten or truncated — and its permissions tightened to 0600 through
+// the open handle, never through a path that could have been replaced.
+// Parent directories are never created; the caller must prepare them
+// explicitly beforehand.
 //
 // Safety against overwriting comes from the remote exclusive create, not
 // from a check-then-create sequence.
 func PrepareFreshTemp(client *sftp.Client, spec RemoteTempSpec) error {
+	if client == nil {
+		return fmt.Errorf("%w: nil sftp client", ErrInvalidRemoteTemp)
+	}
 	return prepareFreshTemp(clientOps{client}, spec)
 }
 
@@ -160,8 +168,9 @@ func prepareFreshTemp(ops remoteOps, spec RemoteTempSpec) error {
 		return fmt.Errorf("multistream: create temp: %w", err)
 	}
 	// The SFTP OPEN packet carries no permission attributes, so the server
-	// applied its umask default; tighten to 0600 explicitly.
-	if err := ops.Chmod(spec.TempPath, 0o600); err != nil {
+	// applied its umask default; tighten to 0600 through the open handle,
+	// never via the path.
+	if err := f.Chmod(0o600); err != nil {
 		_ = f.Close()
 		rmErr := ops.Remove(spec.TempPath)
 		if rmErr != nil {
@@ -198,6 +207,9 @@ func prepareFreshTemp(ops remoteOps, spec RemoteTempSpec) error {
 // so a replaced file cannot slip through. The handle is opened O_WRONLY
 // only: no O_CREATE, no O_TRUNC, no O_APPEND.
 func OpenResumeTemp(client *sftp.Client, spec RemoteTempSpec) (*RemoteTempWriter, error) {
+	if client == nil {
+		return nil, fmt.Errorf("%w: nil sftp client", ErrInvalidRemoteTemp)
+	}
 	return openResumeTemp(clientOps{client}, spec)
 }
 
