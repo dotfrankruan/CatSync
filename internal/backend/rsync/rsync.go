@@ -1,5 +1,5 @@
-// Package rsync builds and runs CatSync's conservative transfer stage: a
-// disjoint set of relative file paths streamed to rsync over a
+// Package rsync builds and runs CatSync's bidirectional conservative
+// transfer stage: a disjoint set of relative file paths streamed to rsync over a
 // NUL-delimited --files-from list, with archive semantics, partial-transfer
 // retention in a relative --partial-dir, and never any deletion.
 //
@@ -7,7 +7,7 @@
 //
 //	rsync --archive --partial --partial-dir=<relative> --relative \
 //	      --files-from=- --from0 [--dry-run] -e <ssh transport> \
-//	      -- <absolute-source>/ <[user@]host:path>
+//	      -- <source-root>/ <destination-root>/
 //
 // --whole-file, --inplace, and --delete are never emitted. File names travel
 // as NUL-delimited standard-input data, not as arguments, so spaces,
@@ -45,10 +45,14 @@ var forbiddenFlags = []string{"--delete", "--whole-file", "--inplace"}
 type Config struct {
 	// Program is the rsync executable; empty means "rsync" (PATH lookup).
 	Program string
-	// SourceDir is the absolute local source root the relative paths are
-	// based on.
+	// Direction selects upload or download. The zero value preserves the
+	// historical local-to-remote behavior.
+	Direction target.Direction
+	// SourceDir is the absolute local root: the source for uploads and the
+	// destination for downloads.
 	SourceDir string
-	// Dest is the validated remote destination.
+	// Dest is the validated remote endpoint: the destination for uploads
+	// and the source for downloads.
 	Dest target.Destination
 	// SSH carries SSH transport options.
 	SSH backend.SSH
@@ -97,6 +101,13 @@ func (c *Config) Command() (argv []string, stdin []byte, err error) {
 	if !filepath.IsAbs(c.SourceDir) {
 		return nil, nil, fmt.Errorf("rsync: source directory %q is not absolute", c.SourceDir)
 	}
+	direction := c.Direction
+	if direction == "" {
+		direction = target.LocalToRemote
+	}
+	if direction != target.LocalToRemote && direction != target.RemoteToLocal {
+		return nil, nil, fmt.Errorf("rsync: invalid transfer direction %q", c.Direction)
+	}
 	if err := backend.ValidateDestination(c.Dest); err != nil {
 		return nil, nil, err
 	}
@@ -143,11 +154,21 @@ func (c *Config) Command() (argv []string, stdin []byte, err error) {
 		args = append(args, "--dry-run")
 	}
 	args = append(args, "-e", c.SSH.RsyncTransport())
-	// Both operands are proven never to begin with '-' (the source is
-	// absolute, the destination was validated); "--" ends option parsing
-	// for defense in depth.
-	args = append(args, "--", withTrailingSlash(c.SourceDir), c.Dest.String())
+	// Both local operands are absolute and the remote endpoint was validated;
+	// "--" ends option parsing for defense in depth.
+	if direction == target.RemoteToLocal {
+		args = append(args, "--", remoteWithTrailingSlash(c.Dest), withTrailingSlash(c.SourceDir))
+	} else {
+		args = append(args, "--", withTrailingSlash(c.SourceDir), c.Dest.String())
+	}
 	return args, payload.Bytes(), nil
+}
+
+func remoteWithTrailingSlash(remote target.Destination) string {
+	if !strings.HasSuffix(remote.Path, "/") {
+		remote.Path += "/"
+	}
+	return remote.String()
 }
 
 // Run executes the configured transfer and waits for completion. An empty

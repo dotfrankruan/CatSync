@@ -48,6 +48,36 @@ func TestCommandGolden(t *testing.T) {
 	}
 }
 
+func TestCommandDownloadGolden(t *testing.T) {
+	cfg := validConfig()
+	cfg.Direction = target.RemoteToLocal
+	cfg.SourceDir = "/srv/download"
+	cfg.Dest = target.Destination{User: "alice", Host: "example.com", Path: "/remote source"}
+	argv, stdin, err := cfg.Command()
+	if err != nil {
+		t.Fatalf("Command: %v", err)
+	}
+	want := []string{
+		"rsync",
+		"--archive",
+		"--partial",
+		"--partial-dir=.catsync-rsync-partial",
+		"--relative",
+		"--files-from=-",
+		"--from0",
+		"-e", "ssh",
+		"--",
+		"alice@example.com:/remote source/",
+		"/srv/download/",
+	}
+	if !reflect.DeepEqual(argv, want) {
+		t.Errorf("argv mismatch:\n got %#v\nwant %#v", argv, want)
+	}
+	if got, want := string(stdin), "a/b.txt\x00c.txt\x00"; got != want {
+		t.Errorf("stdin = %q, want %q", got, want)
+	}
+}
+
 func TestCommandDryRunAndIPv6(t *testing.T) {
 	cfg := validConfig()
 	cfg.DryRun = true
@@ -179,6 +209,13 @@ func TestCommandSpecialPathsTravelAsStdin(t *testing.T) {
 }
 
 func TestCommandValidation(t *testing.T) {
+	t.Run("invalid direction", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Direction = target.Direction("sideways")
+		if _, _, err := cfg.Command(); err == nil {
+			t.Error("invalid direction accepted")
+		}
+	})
 	t.Run("relative source", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.SourceDir = "relative/src"
