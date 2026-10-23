@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -23,11 +24,23 @@ import (
 // helper marker in its environment. TestMain checks the marker before any
 // flag parsing, so the ssh-shaped argv is never parsed as flags.
 const (
-	envHelper   = "CATSYNC_TEST_SFTP_HELPER"
-	envRecord   = "CATSYNC_TEST_SFTP_RECORD"   // dir receiving argv/pid records
-	envEchoEnv  = "CATSYNC_TEST_SFTP_ECHOENV"  // env var name echoed to stderr
-	envFailExit = "CATSYNC_TEST_SFTP_FAILEXIT" // exit immediately with this code
+	envHelper     = "CATSYNC_TEST_SFTP_HELPER"
+	envRecord     = "CATSYNC_TEST_SFTP_RECORD"     // dir receiving argv/pid records
+	envEchoEnv    = "CATSYNC_TEST_SFTP_ECHOENV"    // env var name echoed to stderr
+	envFailExit   = "CATSYNC_TEST_SFTP_FAILEXIT"   // exit immediately with this code
+	envRealServer = "CATSYNC_TEST_SFTP_REALSERVER" // run the real sftp-server
 )
+
+// sftpServerBin is the real OpenSSH sftp-server used by the fake-ssh helper
+// when envRealServer is set, so tempfile tests exercise the real protocol —
+// exclusive create, truncate, chmod, fsync — not an approximation.
+const sftpServerBin = "/usr/libexec/sftp-server"
+
+// realServerAvailable reports whether the real server binary exists.
+func realServerAvailable() bool {
+	_, err := os.Stat(sftpServerBin)
+	return err == nil
+}
 
 // TestMain runs the fake-ssh helper when marked, else the tests.
 func TestMain(m *testing.M) {
@@ -64,6 +77,18 @@ func runFakeSSH() int {
 			n = 2
 		}
 		return n
+	}
+	if os.Getenv(envRealServer) != "" && realServerAvailable() {
+		// The real server inherits our stdio exactly; no copying, no shell.
+		cmd := exec.Command(sftpServerBin)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "fake ssh: sftp-server: %v\n", err)
+			return 2
+		}
+		return 0
 	}
 	srv := sftp.NewRequestServer(stdioConn{os.Stdin, os.Stdout}, sftp.InMemHandler())
 	_ = srv.Serve()
