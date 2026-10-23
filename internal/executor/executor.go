@@ -179,6 +179,20 @@ func (c *Config) validateResume() error {
 	return nil
 }
 
+// lockedWriter serializes concurrent writes to one underlying writer. The
+// native large-file stage runs several ssh/SFTP sessions concurrently and
+// they all share the run's stderr.
+type lockedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (w *lockedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.w.Write(p)
+}
+
 // Executor carries one run's shared machinery.
 type Executor struct {
 	cfg    Config
@@ -218,6 +232,8 @@ func newExecutor(cfg Config) (*Executor, error) {
 	if e.stderr == nil {
 		e.stderr = io.Discard
 	}
+	// Child stderr can arrive concurrently from several ssh sessions.
+	e.stderr = &lockedWriter{w: e.stderr}
 	return e, nil
 }
 
