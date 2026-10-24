@@ -170,6 +170,10 @@ func manifestRecord(path string, size int64, mt time.Time) string {
 	return fmt.Sprintf("%s\x00%d\x00%s\x00", path, size, epochtime.Format(mt))
 }
 
+func sourceManifestRecord(path string, size int64, mt time.Time) string {
+	return fmt.Sprintf("%s\x00f\x00%d\x00%s\x00", path, size, epochtime.Format(mt))
+}
+
 // newFileRecord renders the manifest record for a current source file.
 func (h *harness) newFileRecord(rel string) string {
 	size, mt := h.srcMeta(rel)
@@ -350,6 +354,73 @@ func TestSyncAutoFreshDest(t *testing.T) {
 	entries, _ = os.ReadDir(ckptDir)
 	for _, e := range entries {
 		t.Errorf("checkpoint left behind: %s", e.Name())
+	}
+}
+
+func TestSyncNativeRemoteToLocalLargeFile(t *testing.T) {
+	if !mockexec.SFTPServerAvailable() {
+		t.Skip("real sftp-server is unavailable")
+	}
+	h := newHarness(t)
+	rel := "nested/remote large.bin"
+	remote := filepath.Join(h.remoteDir, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(remote), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := bytes.Repeat([]byte("catsync-download-"), 4096)
+	if err := os.WriteFile(remote, want, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	mtime := time.Unix(1_700_100_200, 345678901)
+	if err := os.Chtimes(remote, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := h.writeManifest("remote-source", sourceManifestRecord(rel, fi.Size(), fi.ModTime()))
+	h.writeScript("ssh", "match=if [ -d\nstdout_file="+manifest+"\n")
+	h.writeScript("rsync", "exit=0")
+	cfg := h.configNative()
+	cfg.Direction = target.RemoteToLocal
+	cfg.SourceDir = h.src
+	cfg.Dest.Path = h.remoteDir
+	cfg.Backend = state.BackendMSCP
+	cfg.Verify = state.VerifySize
+
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Sync download: %v", err)
+	}
+	if run.Status != state.StatusCompleted || len(run.Tasks) != 1 || run.Tasks[0].Status != state.StatusCompleted || run.Tasks[0].Backend != state.BackendMSCP {
+		t.Fatalf("run/tasks = %+v", run)
+	}
+	got, err := os.ReadFile(filepath.Join(h.src, filepath.FromSlash(rel)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("native downloaded content mismatch")
+	}
+	localInfo, err := os.Stat(filepath.Join(h.src, filepath.FromSlash(rel)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if localInfo.Mode().Perm() != 0o640 || !localInfo.ModTime().Equal(fi.ModTime()) {
+		t.Fatalf("downloaded metadata = %o %v, want %o %v", localInfo.Mode().Perm(), localInfo.ModTime(), 0o640, fi.ModTime())
+	}
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 0 {
+		t.Fatalf("rsync invocations = %d, want native-only download", got)
+	}
+	entries, err := os.ReadDir(filepath.Dir(filepath.Join(h.src, filepath.FromSlash(rel))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".catsync-tmp-") {
+			t.Fatalf("local download temp left behind: %s", entry.Name())
+		}
 	}
 }
 

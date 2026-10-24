@@ -637,7 +637,7 @@ func (e *Executor) verifyStage(ctx context.Context) error {
 				return cerr
 			}
 			if tempPath != "" {
-				e.removeRemoteTemp(ctx, tempPath)
+				e.removeNativeTemp(ctx, tempPath)
 			}
 		}
 	}

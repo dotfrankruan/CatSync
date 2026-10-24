@@ -59,6 +59,9 @@ func (e *Executor) sftpConfig() multistream.SFTPConfig {
 // bounded by the jobs semaphore. The persisted backend value stays "mscp"
 // for compatibility; no external mscp is ever executed.
 func (e *Executor) nativeLargeStage(ctx context.Context) error {
+	if e.run.Config.Direction.Effective() == state.DirectionRemoteToLocal {
+		return e.nativeLargeDownloadStage(ctx)
+	}
 	idxs := e.pendingTasks(state.BackendMSCP)
 	if len(idxs) == 0 {
 		return nil
@@ -149,6 +152,134 @@ func (e *Executor) nativeLargeStage(ctx context.Context) error {
 	}
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// nativeLargeDownloadStage downloads confirmed-new large files through
+// independent system-SSH SFTP sessions. Publication is a same-directory
+// local hardlink, so no remote hardlink extension or remote mkdir is
+// involved.
+func (e *Executor) nativeLargeDownloadStage(ctx context.Context) error {
+	idxs := e.pendingTasks(state.BackendMSCP)
+	if len(idxs) == 0 {
+		return nil
+	}
+	if err := e.requireSSH(); err != nil {
+		if ferr := e.failBatch(e.tasksAt(idxs), fmt.Sprintf("ssh is not available: %v", err)); ferr != nil {
+			return ferr
+		}
+		return err
+	}
+	tasks := e.tasksAt(idxs)
+	active, err := e.recheckRemoteSource(ctx, tasks, "before native download")
+	if err != nil {
+		return err
+	}
+	if len(active) == 0 {
+		return errors.New("all native download tasks failed source revalidation")
+	}
+	if err := ensureLocalParents(e.run.Destination.Path, active); err != nil {
+		if ferr := e.failBatch(active, fmt.Sprintf("prepare local destination parents: %v", err)); ferr != nil {
+			return ferr
+		}
+		return err
+	}
+	e.logf("stage native-large download: %d large file(s), up to %d job(s) × %d SFTP session(s)",
+		len(active), e.run.Config.Jobs, e.run.Config.Streams)
+	ckptDir, err := e.checkpointDir()
+	if err != nil {
+		return err
+	}
+	sem := make(chan struct{}, e.run.Config.Jobs)
+	var wg sync.WaitGroup
+	var errs []string
+	var errsMu sync.Mutex
+	for _, t := range active {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
+			return ctx.Err()
+		}
+		wg.Add(1)
+		go func(t *state.Task) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := e.nativeLargeDownloadTask(ctx, t, ckptDir); err != nil && ctx.Err() == nil {
+				errsMu.Lock()
+				errs = append(errs, err.Error())
+				errsMu.Unlock()
+			}
+		}(t)
+	}
+	wg.Wait()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+func (e *Executor) nativeLargeDownloadTask(ctx context.Context, t *state.Task, ckptDir string) error {
+	if strings.HasSuffix(t.Checkpoint, ".mscpckpt") || fileExists(legacyCheckpointName(ckptDir, t.Path)) {
+		return e.failTask(t, legacyMSCPMessage)
+	}
+	e.runMu.Lock()
+	if t.Checkpoint == "" {
+		t.Checkpoint = nativeCheckpointName(ckptDir, t.Path)
+	}
+	checkpoint := t.Checkpoint
+	e.runMu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(checkpoint), 0o700); err != nil {
+		return e.failTask(t, fmt.Sprintf("create checkpoint directory: %v", err))
+	}
+	remoteSource := backend.RemotePath(e.run.Source.Path, t.Path)
+	localFinal := filepath.Join(e.run.Destination.Path, filepath.FromSlash(t.Path))
+	opts := multistream.TransferOptions{
+		SFTP:           e.sftpConfig(),
+		Streams:        e.run.Config.Streams,
+		Workers:        e.run.Config.Streams,
+		ChunkSize:      nativeChunkSize,
+		CheckpointPath: checkpoint,
+		ExpectedRemote: &multistream.RemoteIdentity{Size: uint64(t.Size), ModTime: t.ModTime},
+	}
+	if err := e.markRunning(t); err != nil {
+		return err
+	}
+	var result *multistream.TransferResult
+	var err error
+	if fileExists(checkpoint) {
+		ck, lerr := multistream.LoadCheckpoint(checkpoint)
+		if lerr != nil {
+			return e.failTask(t, fmt.Sprintf("load native checkpoint: %v", lerr))
+		}
+		if ck.Source != t.Path {
+			return e.failTask(t, fmt.Sprintf("native checkpoint is bound to source %q, not %q; refusing to resume", ck.Source, t.Path))
+		}
+		result, err = multistream.ResumeDownload(ctx, remoteSource, t.Path, checkpoint, localFinal, opts)
+		if errors.Is(err, multistream.ErrLocalTempMissing) && len(ck.Completed) == 0 {
+			if rmErr := os.Remove(checkpoint); rmErr != nil {
+				return e.failTask(t, fmt.Sprintf("restart after missing local temp: remove checkpoint: %v", rmErr))
+			}
+			result, err = multistream.Download(ctx, remoteSource, t.Path, localFinal, opts)
+		}
+	} else {
+		result, err = multistream.Download(ctx, remoteSource, t.Path, localFinal, opts)
+	}
+	if err != nil {
+		if ctx.Err() == nil {
+			return e.failTask(t, fmt.Sprintf("native large download failed: %v", err))
+		}
+		return err
+	}
+	if e.stageVerifyNone() {
+		if err := e.completeTask(t); err != nil {
+			return err
+		}
+		e.removeLocalTemp(result.TempPath)
 	}
 	return nil
 }
@@ -394,6 +525,26 @@ func (e *Executor) removeRemoteTemp(ctx context.Context, tempPath string) {
 	if err != nil {
 		e.warnf("native-large: remove remote temp %s: %v (the published file is unaffected; clean up manually or rerun)", tempPath, err)
 	}
+}
+
+// removeLocalTemp retires the extra hardlink left after a native download
+// has been durably recorded complete. Failure is cleanup-only: the final
+// path is already published and remains valid.
+func (e *Executor) removeLocalTemp(tempPath string) {
+	if tempPath == "" {
+		return
+	}
+	if err := os.Remove(tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		e.warnf("native-large: remove local temp %s: %v (the published file is unaffected; clean up manually or rerun)", tempPath, err)
+	}
+}
+
+func (e *Executor) removeNativeTemp(ctx context.Context, tempPath string) {
+	if e.run.Config.Direction.Effective() == state.DirectionRemoteToLocal {
+		e.removeLocalTemp(tempPath)
+		return
+	}
+	e.removeRemoteTemp(ctx, tempPath)
 }
 
 // nativeTempPath reads a completed native task's temp path from its

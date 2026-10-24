@@ -101,8 +101,27 @@ func sshEmulation(args []string) (int, bool) {
 			}
 		}
 		return 0, true
+	case len(cmd) == 1 && strings.HasPrefix(cmd[0], "if [ -f "):
+		return emulateSourceIdentity(cmd[0]), true
 	}
 	return 0, false
+}
+
+func emulateSourceIdentity(script string) int {
+	const prefix = "if [ -f "
+	const suffix = " ] && [ ! -L "
+	end := strings.Index(script, suffix)
+	if end < 0 {
+		fmt.Fprintln(os.Stderr, "mockexec: malformed source identity probe")
+		return 2
+	}
+	p := unquoteShellWord(script[len(prefix):end])
+	fi, err := os.Lstat(p)
+	if err != nil || !fi.Mode().IsRegular() || fi.Mode()&os.ModeSymlink != 0 {
+		return 44
+	}
+	fmt.Fprintf(os.Stdout, "file%c%d%c%s%c", 0, fi.Size(), 0, epochtime.Format(fi.ModTime()), 0)
+	return 0
 }
 
 // extractQuotedTokens returns the single-quoted words of s, unquoted. The
