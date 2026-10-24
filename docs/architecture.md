@@ -214,6 +214,11 @@ a certificate file. A Smallstep `step ssh login` identity that exists only in
 the inherited agent is therefore usable directly; an expired certificate can
 be refreshed and the durable run resumed.
 
+An optional explicit SSH port is part of the immutable run configuration.
+Zero delegates to ssh_config; values from 1 through 65535 are rendered as
+`-p PORT` for direct SSH/SFTP invocations and inside rsync's fixed `-e`
+transport. Persisting the value ensures resume cannot silently switch ports.
+
 CatSync checks installed help/version output at runtime. A missing rsync or
 ssh is fatal. Optimized `copy` excludes symlinks and special files and never
 deletes destination-only data; `sync` delegates those entries and delayed

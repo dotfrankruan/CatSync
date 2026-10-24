@@ -16,6 +16,7 @@ package backend
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -26,6 +27,9 @@ import (
 type SSH struct {
 	// IPv6 restricts connections to IPv6 (rsync transport "ssh -6").
 	IPv6 bool
+	// Port selects an explicit SSH server port. Zero delegates port
+	// selection to the system ssh configuration.
+	Port int
 	// Program overrides the ssh executable used as rsync's remote shell
 	// (-e). Empty means the default "ssh". The value becomes the first
 	// token of rsync's -e value and is therefore restricted by
@@ -43,10 +47,14 @@ func (s SSH) RsyncTransport() string {
 	if prog == "" {
 		prog = "ssh"
 	}
+	transport := prog
 	if s.IPv6 {
-		return prog + " -6"
+		transport += " -6"
 	}
-	return prog
+	if s.Port != 0 {
+		transport += " -p " + strconv.Itoa(s.Port)
+	}
+	return transport
 }
 
 // ValidateTransport checks that the ssh program override can be represented
@@ -56,6 +64,9 @@ func (s SSH) RsyncTransport() string {
 // could be mistaken for an option, so both are refused as configuration
 // errors instead.
 func (s SSH) ValidateTransport() error {
+	if s.Port < 0 || s.Port > 65535 {
+		return fmt.Errorf("backend: ssh port %d is outside 1..65535", s.Port)
+	}
 	prog := s.Program
 	if prog == "" {
 		return nil

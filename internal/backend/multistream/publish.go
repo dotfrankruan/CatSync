@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"time"
 
 	"github.com/pkg/sftp"
@@ -52,6 +53,12 @@ func sshCommandArgv(cfg SFTPConfig, remoteCmd []string) ([]string, error) {
 	argv := []string{prog}
 	if cfg.IPv6 {
 		argv = append(argv, "-6")
+	}
+	if cfg.Port < 0 || cfg.Port > 65535 {
+		return nil, fmt.Errorf("multistream: ssh port %d is outside 1..65535", cfg.Port)
+	}
+	if cfg.Port != 0 {
+		argv = append(argv, "-p", strconv.Itoa(cfg.Port))
 	}
 	argv = append(argv, "-T", who)
 	return append(argv, remoteCmd...), nil

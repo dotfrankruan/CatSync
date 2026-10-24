@@ -159,6 +159,7 @@ Prints the version.
 | `--streams` | 4 | SFTP sessions per large-file transfer |
 | `--large-threshold` | `512MiB` | size at or above which a file counts as large |
 | `--ipv6` | off | restrict ssh, rsync transport, and the native large-file backend to IPv6 |
+| `--port` | ssh config | explicit SSH server port (`1..65535`), persisted for resume and applied to every SSH/rsync/SFTP path |
 | `--state-dir` | XDG state | run state directory |
 | `--quiet` / `--verbose` | off | output control |
 
@@ -387,6 +388,17 @@ IPv6-only VPS → IPv6-only VPS:
 catsync sync --ipv6 /srv/data/ deploy@[2001:db8::10]:/srv/data
 ```
 
+Explicit non-default SSH port (applies uniformly to manifest collection,
+rsync, native SFTP streams, metadata, and verification commands):
+
+```sh
+catsync copy --port 2222 ./data deploy@backup.example.com:/srv/data
+```
+
+Without `--port`, CatSync leaves port selection to the system `ssh`, so a
+`Port` entry in `~/.ssh/config` continues to work unchanged. The selected
+explicit port is recorded in run state and automatically reused by `resume`.
+
 macOS → Linux VPS (small files parallelized, 8 jobs × 2 streams):
 
 ```sh
@@ -480,7 +492,7 @@ printed.
 
 | Variable | Effective scope |
 | --- | --- |
-| `CATSYNC_SSH` | Every ssh invocation CatSync starts: remote manifest, batched mkdir, native multistream SFTP sessions, and the controlled metadata commands, **and** rsync's `-e` transport. Must be one token without whitespace or control characters (rsync splits `-e` on whitespace); `--ipv6` appends `-6`. Invalid values are a usage error. |
+| `CATSYNC_SSH` | Every ssh invocation CatSync starts: remote manifest, batched mkdir, native multistream SFTP sessions, and the controlled metadata commands, **and** rsync's `-e` transport. Must be one token without whitespace or control characters (rsync splits `-e` on whitespace); `--ipv6` appends `-6` and `--port` appends `-p PORT`. Invalid values are a usage error. |
 | `CATSYNC_RSYNC` | The rsync processes CatSync starts (conservative stage and every native small-file batch). |
 
 `CATSYNC_FPSYNC`, `CATSYNC_FPART`, and `CATSYNC_MSCP` no longer exist:

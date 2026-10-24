@@ -855,5 +855,5 @@ func targetRemoteJoin(base, rel string) string {
 // whole ssh path CatSync itself starts; mscp's libssh uses its own
 // resolution and is not affected.
 func (e *Executor) sshOpts(ipv6 bool) backend.SSH {
-	return backend.SSH{IPv6: ipv6, Program: e.progs.sshProgram()}
+	return backend.SSH{IPv6: ipv6, Port: e.run.Config.Port, Program: e.progs.sshProgram()}
 }

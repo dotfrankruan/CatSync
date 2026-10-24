@@ -153,6 +153,8 @@ type Config struct {
 	Mirror bool `json:"mirror,omitempty"`
 	// IPv6 restricts backend tools to IPv6.
 	IPv6 bool `json:"ipv6"`
+	// Port selects an explicit SSH server port. Zero uses ssh_config.
+	Port int `json:"port,omitempty"`
 	// Verify is the completion verification mode: auto, none, size, or sha256.
 	Verify string `json:"verify"`
 	// Jobs caps parallel transfer jobs.
@@ -170,6 +172,9 @@ func (c *Config) validate() error {
 	}
 	if !c.Backend.Valid() {
 		return fmt.Errorf("invalid backend %q", c.Backend)
+	}
+	if c.Port < 0 || c.Port > 65535 {
+		return fmt.Errorf("SSH port %d is outside 1..65535", c.Port)
 	}
 	switch c.Verify {
 	case VerifyAuto, VerifyNone, VerifySize, VerifySHA256:

@@ -29,6 +29,7 @@ func (o *Options) executorConfig(transfer target.Transfer, stdout, stderr io.Wri
 		Backend:          state.Backend(o.Backend),
 		DryRun:           o.DryRun,
 		IPv6:             o.IPv6,
+		Port:             o.Port,
 		Verify:           o.Verify,
 		Jobs:             o.Jobs,
 		Streams:          o.Streams,
@@ -259,10 +260,10 @@ func printRunStatus(w io.Writer, run *state.Run, verbose bool) {
 	if run.Config.Mirror {
 		mode = "sync"
 	}
-	fmt.Fprintf(w, "  config:      mode=%s direction=%s backend=%s verify=%s jobs=%d streams=%d threshold=%d ipv6=%v dry_run=%v\n",
+	fmt.Fprintf(w, "  config:      mode=%s direction=%s backend=%s verify=%s jobs=%d streams=%d threshold=%d ipv6=%v port=%d dry_run=%v\n",
 		mode,
 		run.Config.Direction.Effective(), run.Config.Backend, run.Config.Verify, run.Config.Jobs, run.Config.Streams,
-		run.Config.LargeThreshold, run.Config.IPv6, run.Config.DryRun)
+		run.Config.LargeThreshold, run.Config.IPv6, run.Config.Port, run.Config.DryRun)
 	if run.Config.Mirror {
 		fmt.Fprintf(w, "  mirror:      reconciled=%v (destination-only deletion uses rsync --delete-delay)\n", run.MirrorReconciled)
 	}

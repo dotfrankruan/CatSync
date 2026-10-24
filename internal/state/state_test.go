@@ -248,6 +248,8 @@ func TestSaveRejectsInvalidRuns(t *testing.T) {
 		"zero created_at":    func(r *state.Run) { r.CreatedAt = time.Time{} },
 		"bad backend":        func(r *state.Run) { r.Config.Backend = "teleport" },
 		"bad verify":         func(r *state.Run) { r.Config.Verify = "md5" },
+		"negative port":      func(r *state.Run) { r.Config.Port = -1 },
+		"port too large":     func(r *state.Run) { r.Config.Port = 65536 },
 		"zero jobs":          func(r *state.Run) { r.Config.Jobs = 0 },
 		"task bad backend":   func(r *state.Run) { r.Tasks[0].Backend = "teleport" },
 		"task bad status":    func(r *state.Run) { r.Tasks[0].Status = "exploded" },

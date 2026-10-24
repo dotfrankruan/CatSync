@@ -49,6 +49,7 @@ func (e *Executor) sftpConfig() multistream.SFTPConfig {
 		Program: e.progs.sshProgram(),
 		Dest:    e.destTarget(),
 		IPv6:    e.run.Config.IPv6,
+		Port:    e.run.Config.Port,
 		Env:     e.cfg.Env,
 		Stderr:  e.stderr,
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -31,6 +32,8 @@ type SFTPConfig struct {
 	Dest target.Destination
 	// IPv6 adds -6.
 	IPv6 bool
+	// Port selects an explicit SSH server port. Zero uses ssh_config.
+	Port int
 	// Env lists environment additions for the ssh process (see
 	// process.Spec.Env); values are never printed or logged.
 	Env []string
@@ -60,6 +63,12 @@ func (c SFTPConfig) Command() ([]string, error) {
 	argv := []string{prog}
 	if c.IPv6 {
 		argv = append(argv, "-6")
+	}
+	if c.Port < 0 || c.Port > 65535 {
+		return nil, fmt.Errorf("multistream: ssh port %d is outside 1..65535", c.Port)
+	}
+	if c.Port != 0 {
+		argv = append(argv, "-p", strconv.Itoa(c.Port))
 	}
 	return append(argv, "-T", "-s", who, "sftp"), nil
 }

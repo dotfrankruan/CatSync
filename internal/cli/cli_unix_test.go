@@ -355,7 +355,7 @@ func TestCLIIPv6CommandShapes(t *testing.T) {
 	post := h.writeManifest("post", h.record("big.bin"))
 	h.scriptFreshDestSSH(post)
 
-	code, _, stderr := run(t, "copy", "--state-dir", h.stateDir, "--ipv6", "--backend", "mscp",
+	code, _, stderr := run(t, "copy", "--state-dir", h.stateDir, "--ipv6", "--port", "2222", "--backend", "mscp",
 		"--large-threshold", "1KiB", h.src, "user@[2001:db8::1]:"+h.remoteDir)
 	if code != ExitOK {
 		t.Fatalf("sync exit = %d, stderr:\n%s", code, stderr)
@@ -373,8 +373,15 @@ func TestCLIIPv6CommandShapes(t *testing.T) {
 		if len(inv.Args) < 1 || inv.Args[0] != "-6" {
 			t.Errorf("ssh argv missing -6: %v", inv.Args)
 		}
+		foundPort := false
+		for i := 0; i+1 < len(inv.Args); i++ {
+			foundPort = foundPort || inv.Args[i] == "-p" && inv.Args[i+1] == "2222"
+		}
+		if !foundPort {
+			t.Errorf("ssh argv missing -p 2222: %v", inv.Args)
+		}
 	}
-	// The SFTP session argv is exactly the native shape: ssh -6 -T -s
+	// The SFTP session argv is the native shape: ssh -6 -p 2222 -T -s
 	// user@[2001:db8::1] sftp, the remote path never an operand.
 	var sftpArgv []string
 	for _, inv := range ssh {
@@ -416,7 +423,7 @@ func TestCLIResumeAfterInterrupt(t *testing.T) {
 
 	done := make(chan int, 1)
 	go func() {
-		code, _, _ := run(t, "copy", "--state-dir", h.stateDir, "--backend", "rsync", h.src, "user@host:/data")
+		code, _, _ := run(t, "copy", "--state-dir", h.stateDir, "--backend", "rsync", "--port", "2222", h.src, "user@host:/data")
 		done <- code
 	}()
 	// Wait until the mock rsync has actually started (its invocation is
@@ -452,6 +459,17 @@ func TestCLIResumeAfterInterrupt(t *testing.T) {
 	if got := len(h.invocations("rsync")); got != 2 {
 		t.Errorf("rsync invocations = %d, want 2", got)
 	}
+	for _, inv := range h.invocations("rsync") {
+		foundTransport := false
+		for i, arg := range inv.Args {
+			if arg == "-e" && i+1 < len(inv.Args) {
+				foundTransport = strings.HasSuffix(inv.Args[i+1], " -p 2222")
+			}
+		}
+		if !foundTransport {
+			t.Errorf("rsync invocation lost persisted custom port: %v", inv.Args)
+		}
+	}
 }
 
 // TestCLIUsageAndRuntimeExitCodes pins the exit-code contract.
@@ -466,6 +484,12 @@ func TestCLIUsageAndRuntimeExitCodes(t *testing.T) {
 	// Usage: jobs x streams over budget.
 	if code, _, _ := run(t, "sync", "--jobs", "64", "--streams", "64", h.src, "u@h:/d"); code != ExitUsage {
 		t.Errorf("over-budget exit = %d, want %d", code, ExitUsage)
+	}
+	for _, value := range []string{"-1", "65536"} {
+		code, _, stderr := run(t, "copy", "--port="+value, h.src, "u@h:/d")
+		if code != ExitUsage || !strings.Contains(stderr, "--port") {
+			t.Errorf("invalid port %s = exit %d, stderr %q; want usage error", value, code, stderr)
+		}
 	}
 	// Runtime: corrupt state file.
 	if err := os.WriteFile(filepath.Join(h.stateDir, "broken.json"), []byte("{"), 0o600); err != nil {
@@ -631,7 +655,7 @@ func TestCLISSHOverrideReachesRsyncTransport(t *testing.T) {
 	h.scriptFreshDestSSH(post)
 	h.writeScript("rsync", "exit=0")
 
-	code, _, stderr := run(t, "copy", "--state-dir", h.stateDir, "--backend", "rsync",
+	code, _, stderr := run(t, "copy", "--state-dir", h.stateDir, "--backend", "rsync", "--port", "2222",
 		h.src, "user@host:/data")
 	if code != ExitOK {
 		t.Fatalf("sync exit = %d, stderr:\n%s", code, stderr)
@@ -640,7 +664,7 @@ func TestCLISSHOverrideReachesRsyncTransport(t *testing.T) {
 	if len(rs) != 1 {
 		t.Fatalf("rsync invocations = %d, want 1", len(rs))
 	}
-	wantTransport := h.progs["ssh"]
+	wantTransport := h.progs["ssh"] + " -p 2222"
 	found := false
 	for i, a := range rs[0].Args {
 		if a == "-e" {
@@ -658,6 +682,15 @@ func TestCLISSHOverrideReachesRsyncTransport(t *testing.T) {
 	// path as well).
 	if got := len(h.invocations("ssh")); got < 1 {
 		t.Errorf("ssh manifest invocations = %d, want at least 1", got)
+	}
+	for _, inv := range h.invocations("ssh") {
+		foundPort := false
+		for i := 0; i+1 < len(inv.Args); i++ {
+			foundPort = foundPort || inv.Args[i] == "-p" && inv.Args[i+1] == "2222"
+		}
+		if !foundPort {
+			t.Errorf("direct ssh argv missing custom port: %v", inv.Args)
+		}
 	}
 }
 

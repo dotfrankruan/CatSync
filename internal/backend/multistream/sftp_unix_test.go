@@ -88,11 +88,24 @@ func unquoteShellWord(s string) string {
 // publish layer uses — touch (ns-precision mtime) and test -ef — in Go so
 // the semantics match GNU/Linux precisely regardless of the host OS.
 func runRemoteCommand(args []string) int {
-	// Skip leading flag tokens (-6, -T), then the [user@]host token.
+	// Skip CatSync's leading SSH options (including -p's operand), then the
+	// [user@]host token.
 	i := 0
-	for i < len(args) && strings.HasPrefix(args[i], "-") {
-		i++
+	for i < len(args) {
+		switch args[i] {
+		case "-6", "-T", "-s":
+			i++
+		case "-p":
+			if i+1 >= len(args) {
+				return 2
+			}
+			i += 2
+		default:
+			goto optionsDone
+		}
 	}
+
+optionsDone:
 	if i >= len(args) {
 		fmt.Fprintln(os.Stderr, "fake ssh: missing host")
 		return 2
@@ -308,6 +321,18 @@ func TestSFTPCommandIPv6(t *testing.T) {
 	}
 }
 
+func TestSFTPCommandCustomPort(t *testing.T) {
+	cfg := SFTPConfig{Dest: target.Destination{User: "alice", Host: "example.com", Path: "/data"}, IPv6: true, Port: 2222}
+	argv, err := cfg.Command()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"ssh", "-6", "-p", "2222", "-T", "-s", "alice@example.com", "sftp"}
+	if fmt.Sprint(argv) != fmt.Sprint(want) {
+		t.Errorf("argv = %v, want %v", argv, want)
+	}
+}
+
 // TestSFTPCommandNeverCarriesPath: the remote path must never leak into the
 // connection arguments.
 func TestSFTPCommandNeverCarriesPath(t *testing.T) {
@@ -349,6 +374,8 @@ func TestSFTPCommandValidation(t *testing.T) {
 		{Dest: target.Destination{}},                                         // empty destination
 		{Dest: target.Destination{Host: "h", Path: "relative"}},              // relative path
 		{Program: "a\x00b", Dest: target.Destination{Host: "h", Path: "/d"}}, // NUL program
+		{Port: -1, Dest: target.Destination{Host: "h", Path: "/d"}},
+		{Port: 65536, Dest: target.Destination{Host: "h", Path: "/d"}},
 	}
 	for i, cfg := range bad {
 		if _, err := cfg.Command(); err == nil {

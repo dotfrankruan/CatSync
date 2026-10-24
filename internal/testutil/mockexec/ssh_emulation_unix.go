@@ -67,13 +67,26 @@ func sshEmulation(args []string) (int, bool) {
 	if os.Getenv(EnvSSHNative) == "" {
 		return 0, false
 	}
-	// Skip leading flag tokens (-6, -T, -s), then the [user@]host token;
+	// Skip the leading options CatSync emits, including -p's operand, then
+	// the [user@]host token;
 	// the rest is the remote command, each element shell-quoted by the
 	// caller.
 	i := 0
-	for i < len(args) && strings.HasPrefix(args[i], "-") {
-		i++
+	for i < len(args) {
+		switch args[i] {
+		case "-6", "-T", "-s":
+			i++
+		case "-p":
+			if i+1 >= len(args) {
+				return 0, false
+			}
+			i += 2
+		default:
+			goto optionsDone
+		}
 	}
+
+optionsDone:
 	if i >= len(args) {
 		return 0, false
 	}

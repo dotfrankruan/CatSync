@@ -109,6 +109,8 @@ type Config struct {
 	Mirror bool
 	// IPv6 restricts backend tools and auxiliary SSH calls to IPv6.
 	IPv6 bool
+	// Port selects an explicit SSH server port. Zero uses ssh_config.
+	Port int
 	// Verify is the completion verification mode: none or size.
 	Verify string
 	// Jobs caps concurrent transfer processes.
@@ -157,6 +159,9 @@ func (c *Config) validateFull() error {
 	if c.Jobs*c.Streams > MaxSSHConnections {
 		return fmt.Errorf("%w: jobs × streams = %d exceeds the SSH connection budget %d", ErrInvalidConfig, c.Jobs*c.Streams, MaxSSHConnections)
 	}
+	if c.Port < 0 || c.Port > 65535 {
+		return fmt.Errorf("%w: SSH port %d is outside 1..65535", ErrInvalidConfig, c.Port)
+	}
 	if strings.TrimSpace(c.StateDir) == "" {
 		return fmt.Errorf("%w: state directory is empty", ErrInvalidConfig)
 	}
@@ -169,7 +174,7 @@ func (c *Config) validateFull() error {
 	// The ssh override reaches rsync's -e transport, which rsync splits on
 	// whitespace; refuse overrides it cannot represent instead of silently
 	// running a different command.
-	if err := (backend.SSH{Program: c.Programs.SSH}).ValidateTransport(); err != nil {
+	if err := (backend.SSH{Program: c.Programs.SSH, Port: c.Port}).ValidateTransport(); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidConfig, err)
 	}
 	for _, p := range []struct{ name, value string }{
@@ -421,7 +426,7 @@ func (e *Executor) failBatch(tasks []*state.Task, msg string) error {
 // populated or legitimately empty map (the destination directory exists or
 // was proven absent), false on any collection failure.
 func (e *Executor) collectManifest(ctx context.Context, dest target.Destination, ipv6 bool) (map[string]discovery.RemoteEntry, bool, error) {
-	argv, err := discovery.ManifestCommandProg(e.progs.ssh(), dest, ipv6)
+	argv, err := discovery.ManifestCommandProgPort(e.progs.ssh(), dest, ipv6, e.sshPort())
 	if err != nil {
 		return nil, false, err
 	}
@@ -457,7 +462,7 @@ func (e *Executor) collectManifest(ctx context.Context, dest target.Destination,
 // one SSH call. A missing source is a hard error, unlike a missing upload
 // destination, which is an authoritative empty destination.
 func (e *Executor) collectRemoteSource(ctx context.Context, source target.Destination, ipv6 bool) ([]discovery.Entry, error) {
-	argv, err := discovery.SourceManifestCommandProg(e.progs.ssh(), source, ipv6)
+	argv, err := discovery.SourceManifestCommandProgPort(e.progs.ssh(), source, ipv6, e.sshPort())
 	if err != nil {
 		return nil, err
 	}
@@ -512,7 +517,7 @@ func (e *Executor) mkdirRemoteParents(ctx context.Context, dest target.Destinati
 	if len(dirs) == 0 {
 		return nil
 	}
-	argv, err := discovery.MkdirCommandProg(e.progs.ssh(), dest, ipv6, dirs)
+	argv, err := discovery.MkdirCommandProgPort(e.progs.ssh(), dest, ipv6, e.sshPort(), dirs)
 	if err != nil {
 		return err
 	}
@@ -530,6 +535,16 @@ func (e *Executor) mkdirRemoteParents(ctx context.Context, dest target.Destinati
 		return fmt.Errorf("executor: create remote directories: %w", err)
 	}
 	return nil
+}
+
+// sshPort returns the immutable run port after a run exists and the fresh
+// invocation port during planning. Resume therefore cannot silently fall
+// back to the current process defaults.
+func (e *Executor) sshPort() int {
+	if e.run != nil {
+		return e.run.Config.Port
+	}
+	return e.cfg.Port
 }
 
 func firstLine(s string) string {
@@ -658,6 +673,7 @@ func (e *Executor) buildRun(out *PlanOutcome) (*state.Run, error) {
 			DryRun:         e.cfg.DryRun,
 			Mirror:         e.cfg.Mirror,
 			IPv6:           e.cfg.IPv6,
+			Port:           e.cfg.Port,
 			Verify:         e.cfg.Verify,
 			Jobs:           e.cfg.Jobs,
 			Streams:        e.cfg.Streams,
@@ -815,6 +831,7 @@ func resumeWith(ctx context.Context, cfg Config, id string, prepare func(*Execut
 		Jobs:           run.Config.Jobs,
 		Streams:        run.Config.Streams,
 		LargeThreshold: run.Config.LargeThreshold,
+		Port:           run.Config.Port,
 		StateDir:       cfg.StateDir,
 		Programs:       cfg.Programs,
 		Env:            cfg.Env,

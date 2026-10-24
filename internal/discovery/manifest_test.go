@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -374,6 +375,36 @@ func TestManifestCommandProgIPv6(t *testing.T) {
 	for i := range want {
 		if argv[i] != want[i] {
 			t.Fatalf("argv[%d] = %q, want %q", i, argv[i], want[i])
+		}
+	}
+}
+
+func TestSSHCommandsCustomPort(t *testing.T) {
+	dest := target.Destination{User: "u", Host: "h", Path: "/d"}
+	manifest, err := ManifestCommandProgPort("ssh", dest, true, 2222)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := manifest[:5], []string{"ssh", "-6", "-p", "2222", "u@h"}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("manifest prefix = %q, want %q", got, want)
+	}
+	source, err := SourceManifestCommandProgPort("ssh", dest, false, 2222)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := source[:4], []string{"ssh", "-p", "2222", "u@h"}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("source prefix = %q, want %q", got, want)
+	}
+	mkdir, err := MkdirCommandProgPort("ssh", dest, false, 2222, []string{"/d/x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := mkdir[:4], []string{"ssh", "-p", "2222", "u@h"}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("mkdir prefix = %q, want %q", got, want)
+	}
+	for _, port := range []int{-1, 65536} {
+		if _, err := ManifestCommandProgPort("ssh", dest, false, port); err == nil {
+			t.Errorf("port %d accepted, want error", port)
 		}
 	}
 }

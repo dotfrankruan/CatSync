@@ -48,6 +48,7 @@ func TestSaveLoadRoundtrip(t *testing.T) {
 	r.Status = state.StatusRunning
 	r.Config.DryRun = true
 	r.Config.IPv6 = true
+	r.Config.Port = 2222
 	r.Config.Verify = state.VerifySHA256
 	r.Error = "remote manifest unavailable; rsync fallback"
 	finished := fixedTime.Add(time.Hour)

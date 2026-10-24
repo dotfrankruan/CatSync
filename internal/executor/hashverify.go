@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/dotfrankruan/CatSync/internal/backend"
@@ -29,7 +30,7 @@ const (
 
 const noRemoteHashToolWarning = "SHA-256 CONTENT VERIFICATION WAS NOT PERFORMED: the remote endpoint has no supported SHA-256 utility (sha256sum, shasum, openssl, or busybox sha256sum). Only file-size verification was performed. Install one of those tools on the remote endpoint to enable content verification. CatSync did not download and will never download remote files as a hash-verification fallback."
 
-func remoteCommandArgv(program string, remote target.Destination, ipv6 bool, script string) ([]string, error) {
+func remoteCommandArgv(program string, remote target.Destination, ipv6 bool, port int, script string) ([]string, error) {
 	if program == "" {
 		program = "ssh"
 	}
@@ -44,6 +45,12 @@ func remoteCommandArgv(program string, remote target.Destination, ipv6 bool, scr
 	if ipv6 {
 		argv = append(argv, "-6")
 	}
+	if port < 0 || port > 65535 {
+		return nil, fmt.Errorf("executor: SSH port %d is outside 1..65535", port)
+	}
+	if port != 0 {
+		argv = append(argv, "-p", strconv.Itoa(port))
+	}
 	return append(argv, "-T", who, script), nil
 }
 
@@ -53,7 +60,7 @@ func (e *Executor) detectRemoteHashTool(ctx context.Context) (remoteHashTool, er
 		"elif command -v openssl >/dev/null 2>&1; then printf openssl; " +
 		"elif command -v busybox >/dev/null 2>&1; then printf busybox; " +
 		"else printf none; fi"
-	argv, err := remoteCommandArgv(e.progs.sshProgram(), e.destTarget(), e.run.Config.IPv6, script)
+	argv, err := remoteCommandArgv(e.progs.sshProgram(), e.destTarget(), e.run.Config.IPv6, e.run.Config.Port, script)
 	if err != nil {
 		return "", err
 	}
@@ -101,7 +108,7 @@ func (e *Executor) remoteHashes(ctx context.Context, tool remoteHashTool, tasks 
 			script.WriteString(cmd)
 			end++
 		}
-		argv, err := remoteCommandArgv(e.progs.sshProgram(), e.destTarget(), e.run.Config.IPv6, script.String())
+		argv, err := remoteCommandArgv(e.progs.sshProgram(), e.destTarget(), e.run.Config.IPv6, e.run.Config.Port, script.String())
 		if err != nil {
 			return nil, err
 		}

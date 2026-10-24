@@ -14,6 +14,9 @@ func TestRsyncTransport(t *testing.T) {
 	if got := (SSH{IPv6: true}).RsyncTransport(); got != "ssh -6" {
 		t.Errorf("IPv6 transport = %q, want ssh -6", got)
 	}
+	if got := (SSH{IPv6: true, Port: 2222}).RsyncTransport(); got != "ssh -6 -p 2222" {
+		t.Errorf("IPv6 custom-port transport = %q, want ssh -6 -p 2222", got)
+	}
 }
 
 func TestValidateDestination(t *testing.T) {
@@ -107,6 +110,11 @@ func TestValidateTransport(t *testing.T) {
 	for _, bad := range []string{"/opt/a b/ssh", "ssh\t-x", "ssh\nx", "-ssh", "a\x00b"} {
 		if err := (SSH{Program: bad}).ValidateTransport(); err == nil {
 			t.Errorf("ValidateTransport(%q) = nil, want error", bad)
+		}
+	}
+	for _, port := range []int{-1, 65536} {
+		if err := (SSH{Port: port}).ValidateTransport(); err == nil {
+			t.Errorf("ValidateTransport port %d = nil, want error", port)
 		}
 	}
 }

@@ -320,7 +320,13 @@ func ManifestCommand(dest target.Destination) ([]string, error) {
 // callers must plan with unknown (nil) destination metadata, which routes
 // every file to rsync.
 func ManifestCommandProg(prog string, dest target.Destination, ipv6 bool) ([]string, error) {
-	argv, err := sshArgv(prog, dest, ipv6)
+	return ManifestCommandProgPort(prog, dest, ipv6, 0)
+}
+
+// ManifestCommandProgPort is ManifestCommandProg with an optional explicit
+// SSH port. Port zero leaves port selection to ssh_config.
+func ManifestCommandProgPort(prog string, dest target.Destination, ipv6 bool, port int) ([]string, error) {
+	argv, err := sshArgv(prog, dest, ipv6, port)
 	if err != nil {
 		return nil, err
 	}
@@ -335,7 +341,13 @@ func ManifestCommandProg(prog string, dest target.Destination, ipv6 bool) ([]str
 // including a type byte, so unsupported symlinks and special files are not
 // silently omitted. find does not follow symlinks.
 func SourceManifestCommandProg(prog string, source target.Destination, ipv6 bool) ([]string, error) {
-	argv, err := sshArgv(prog, source, ipv6)
+	return SourceManifestCommandProgPort(prog, source, ipv6, 0)
+}
+
+// SourceManifestCommandProgPort is SourceManifestCommandProg with an optional
+// explicit SSH port. Port zero leaves port selection to ssh_config.
+func SourceManifestCommandProgPort(prog string, source target.Destination, ipv6 bool, port int) ([]string, error) {
+	argv, err := sshArgv(prog, source, ipv6, port)
 	if err != nil {
 		return nil, err
 	}
@@ -353,10 +365,16 @@ func SourceManifestCommandProg(prog string, source target.Destination, ipv6 bool
 // escaped for the remote shell. An empty directory list is an error: no
 // command means no invocation.
 func MkdirCommandProg(prog string, dest target.Destination, ipv6 bool, dirs []string) ([]string, error) {
+	return MkdirCommandProgPort(prog, dest, ipv6, 0, dirs)
+}
+
+// MkdirCommandProgPort is MkdirCommandProg with an optional explicit SSH
+// port. Port zero leaves port selection to ssh_config.
+func MkdirCommandProgPort(prog string, dest target.Destination, ipv6 bool, port int, dirs []string) ([]string, error) {
 	if len(dirs) == 0 {
 		return nil, errors.New("discovery: mkdir command needs at least one directory")
 	}
-	argv, err := sshArgv(prog, dest, ipv6)
+	argv, err := sshArgv(prog, dest, ipv6, port)
 	if err != nil {
 		return nil, err
 	}
@@ -376,7 +394,7 @@ func MkdirCommandProg(prog string, dest target.Destination, ipv6 bool, dirs []st
 
 // sshArgv builds the leading tokens of an ssh invocation: program,
 // optional -6, and the [user@]host target.
-func sshArgv(prog string, dest target.Destination, ipv6 bool) ([]string, error) {
+func sshArgv(prog string, dest target.Destination, ipv6 bool, port int) ([]string, error) {
 	if prog == "" {
 		return nil, errors.New("discovery: ssh program is empty")
 	}
@@ -402,6 +420,12 @@ func sshArgv(prog string, dest target.Destination, ipv6 bool) ([]string, error) 
 	argv := []string{prog}
 	if ipv6 {
 		argv = append(argv, "-6")
+	}
+	if port < 0 || port > 65535 {
+		return nil, fmt.Errorf("discovery: SSH port %d is outside 1..65535", port)
+	}
+	if port != 0 {
+		argv = append(argv, "-p", strconv.Itoa(port))
 	}
 	return append(argv, who), nil
 }

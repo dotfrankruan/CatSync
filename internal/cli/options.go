@@ -30,6 +30,8 @@ type Options struct {
 	Progress string
 	// IPv6 restricts backend tools to IPv6.
 	IPv6 bool
+	// Port selects an explicit SSH server port. Zero uses ssh_config.
+	Port int
 	// StateDir holds run state used by resume and status.
 	StateDir string
 	// Verify selects the completion verification mode: auto, none, size,
@@ -79,6 +81,7 @@ func (o *Options) bindSharedFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&o.Quiet, "quiet", o.Quiet, "suppress non-error output")
 	fs.StringVar(&o.Progress, "progress", o.Progress, "progress display: auto, always, or never")
 	fs.BoolVar(&o.IPv6, "ipv6", o.IPv6, "restrict backend tools to IPv6")
+	fs.IntVar(&o.Port, "port", o.Port, "SSH server port (1-65535; default uses ssh_config)")
 	fs.StringVar(&o.StateDir, "state-dir", o.StateDir, "directory holding catsync run state")
 	fs.StringVar(&o.Verify, "verify", o.Verify, "completion verification: auto, none, size, or sha256")
 	fs.IntVar(&o.Jobs, "jobs", o.Jobs, "maximum parallel transfer jobs")
@@ -125,6 +128,9 @@ func (o *Options) Validate() error {
 	}
 	if o.Jobs*o.Streams > executor.MaxSSHConnections {
 		return fmt.Errorf("--jobs × --streams = %d exceeds the SSH connection budget of %d; lower one of them", o.Jobs*o.Streams, executor.MaxSSHConnections)
+	}
+	if o.Port < 0 || o.Port > 65535 {
+		return fmt.Errorf("--port must be between 1 and 65535, got %d", o.Port)
 	}
 	return nil
 }
