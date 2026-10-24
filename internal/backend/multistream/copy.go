@@ -63,7 +63,7 @@ type CopyOptions struct {
 //     the returned error wraps ctx.Err(); a pre-cancelled copy performs no
 //     I/O and calls no callbacks at all.
 //
-// What Copy deliberately does NOT do (the future transport's job): create,
+// What Copy deliberately does NOT do (the transport orchestrator's job): create,
 // truncate, fsync, or rename the destination; manage remote metadata;
 // persist checkpoints. It reports completed chunks via OnComplete and
 // leaves durability to the caller.

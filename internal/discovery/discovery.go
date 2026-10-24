@@ -1,5 +1,5 @@
-// Package discovery streams local source-tree entries and collects remote
-// destination metadata.
+// Package discovery streams local trees and parses remote source or
+// destination manifests for bidirectional planning and revalidation.
 //
 // Local discovery (Walk, Stream) enumerates the source tree without ever
 // following symbolic links: every entry beneath the root is inspected with

@@ -1,10 +1,9 @@
-// Package multistream is the pure-Go, transport-agnostic foundation for
-// CatSync's planned native multi-stream large-file backend.
+// Package multistream implements CatSync's native multi-stream large-file
+// backend for uploads and downloads over system-SSH SFTP sessions.
 //
-// The package is not wired into any production stage yet: mscp remains the
-// active large-file backend. Everything here is transport-agnostic — a
-// later phase adds the SSH/SFTP transport, the remote temporary-object
-// lifecycle, and executor integration.
+// Its plan and copy engine stay transport-agnostic; the surrounding package
+// supplies resumable checkpoints, SFTP reader/writer pools, receiving-side
+// temporary objects, and no-clobber publication.
 //
 // A large file is split into a deterministic plan of fixed-size chunks
 // (Plan). The same file size and chunk size always produce the same plan,
