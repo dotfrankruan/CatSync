@@ -439,6 +439,25 @@ func TestSFTPEnvAdditionsAndStderrIsolation(t *testing.T) {
 	}
 }
 
+// TestSFTPInheritsSSHAgentSocket proves agent-only identities (including a
+// Smallstep certificate inserted into ssh-agent without a certificate file)
+// reach the exact system-ssh process used by the SFTP transport.
+func TestSFTPInheritsSSHAgentSocket(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", "/private/test/agent-only-smallstep.sock")
+	cfg := helperConfig(t, t.TempDir(), envEchoEnv+"=SSH_AUTH_SOCK")
+	var stderr bytes.Buffer
+	cfg.Stderr = &stderr
+	if err := cfg.WithClient(context.Background(), func(client *sftp.Client) error {
+		_, err := client.Stat("/")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(stderr.String()); got != "/private/test/agent-only-smallstep.sock" {
+		t.Fatalf("inherited SSH_AUTH_SOCK = %q", got)
+	}
+}
+
 func TestSFTPCallbackErrorPreserved(t *testing.T) {
 	dir := t.TempDir()
 	cfg := helperConfig(t, dir)

@@ -2,9 +2,9 @@
 
 *Because one TCP connection is never enough.*
 
-CatSync is a local orchestration CLI for moving large directory trees to a
-remote host over SSH. It discovers a local source tree, collects the remote
-destination's metadata in one batched SSH call, assigns every file exactly
+CatSync is a local orchestration CLI for moving large directory trees in
+either direction between the local machine and a remote host over SSH. It
+discovers the source tree, collects destination metadata, assigns every file exactly
 one backend in an immutable **disjoint plan**, and drives battle-tested
 external tools to move the data in parallel:
 
@@ -12,17 +12,17 @@ external tools to move the data in parallel:
   small files deterministically and runs up to `--jobs` rsync processes
   concurrently (no external fpsync/fpart),
 - **native multistream** for large files confirmed new at the destination:
-  several system-ssh SFTP sessions per file write disjoint byte ranges into
+  several system-ssh SFTP sessions per file copy disjoint byte ranges into
   one same-directory temporary object, with an atomic checkpoint per chunk,
-  then a no-clobber hardlink publish (no external mscp),
+  then a no-clobber hardlink publish on the receiving side (no external mscp),
 - **rsync** for everything else, as the conservative correctness fallback
   with delta transfer.
 
-The remote host needs only SSH/SFTP and rsync; no CatSync daemon runs
-remotely. The native large-file backend additionally needs the
-`hardlink@openssh.com` SFTP extension (OpenSSH ≥ 9.0) and GNU coreutils on
-the remote for exact nanosecond metadata; without them, auto mode falls
-back to rsync before any data is written.
+The remote host needs only SSH/SFTP, rsync, and GNU findutils; no CatSync
+daemon runs remotely. Native uploads additionally need the
+`hardlink@openssh.com` SFTP extension (OpenSSH ≥ 9.0) and GNU coreutils for
+exact nanosecond metadata; native downloads publish locally and do not need
+the remote hardlink extension.
 
 CatSync is licensed under the AGPL-3.0-only; see [LICENSE](LICENSE).
 
@@ -30,14 +30,14 @@ CatSync is licensed under the AGPL-3.0-only; see [LICENSE](LICENSE).
 
 ```
 catsync (local orchestrator)
-  │ 1. stream local discovery (Lstat; symlinks never followed)
-  │ 2. one batched remote manifest over SSH (GNU find, NUL-delimited)
+  │ 1. stream source discovery (local Lstat or one remote GNU-find scan)
+  │ 2. collect destination metadata (remote manifest or local Lstat walk)
   │ 3. plan: assign every relative path exactly one backend
   │ 4. persist the run atomically (state dir) before transferring
   │ 5. execute stages sequentially, so writers never overlap:
   │      native parallel-rsync (small files) → native multistream
   │      (new large files) → rsync (rest)
-  │ 6. verify completed tasks (batched remote size check)
+  │ 6. verify completed tasks (batched receiving-side size check)
   │ 7. mark tasks completed; only then retire native checkpoints
   └ all subprocesses are exec'd with argument arrays — no local shell
 ```
@@ -49,7 +49,7 @@ task is marked running on disk *before* its subprocess starts (a failed save
 aborts the launch), completion is persisted before a native checkpoint is
 retired, and checkpoint references are cleared before their files are
 removed, so interrupted cleanup leaves only a harmless orphan. A destination-scoped lock file prevents
-two runs from writing the same remote tree at once. Interrupted runs are
+two runs from writing the same destination tree at once. Interrupted runs are
 recovered explicitly: `running` tasks return to `pending` and `resume`
 revalidates and continues them.
 
@@ -94,7 +94,7 @@ or copy `bin/catsync` into your `PATH`.
 Probes rsync and ssh with bounded version probes; both are required. No
 secrets or environment contents are printed.
 
-### `catsync plan SOURCE [user@]host:/absolute/path`
+### `catsync plan SOURCE DESTINATION`
 
 Discovers the source, collects the remote manifest (or announces the
 conservative fallback), runs the planner, and prints the summary: per-backend
@@ -105,11 +105,13 @@ example `--backend fpsync` with a large file) exit nonzero. `--backend
 fpsync` is kept as a compatibility name; it selects the native
 parallel-rsync small-file backend and never invokes external fpsync/fpart.
 
-### `catsync sync SOURCE [user@]host:/absolute/path`
+### `catsync sync SOURCE DESTINATION`
 
 Executes the full durable lifecycle and prints the run ID and final
 summary. Nonzero exit on any transfer or verification failure. A run
-interrupted with Ctrl-C stays resumable.
+interrupted with Ctrl-C stays resumable. Exactly one operand must be remote:
+`LOCAL [user@]host:/path` uploads and `[user@]host:/path LOCAL` downloads;
+remote-to-remote and local-to-local forms are rejected.
 
 ### `catsync resume [RUN_ID]`
 
@@ -201,13 +203,16 @@ concurrently, each receiving exactly its own batch as a NUL-delimited
 
 Because batches share destination parent directories and `--relative` would
 otherwise let each rsync update those parents' attributes concurrently,
-CatSync first creates every parent with **one** batched remote `mkdir -p`,
-then runs the batches with `--no-implied-dirs` so rsync never creates or
+CatSync creates receiving-side parents before launching any batch: one
+batched remote `mkdir -p` for uploads, or component-by-component local
+creation for downloads (rejecting symlink/non-directory parents). It then
+runs the batches with `--no-implied-dirs` so rsync never creates or
 attribute-updates an implied directory. This is verified with real rsync
 3.5.1 runs: nested trees copy correctly, shared parents keep their
 attributes, and two concurrent batches into one parent do not interfere.
 
-Per batch, CatSync revalidates every source file right before launch,
+Per batch, CatSync revalidates every source file right before launch (local
+`Lstat` for uploads, a batched remote GNU-find manifest for downloads),
 persists the whole batch's running intent in ONE atomic save (a failed save
 blocks the launch and leaves every task pending, never a partial commit),
 and re-checks the sources after rsync exits. Cancellation is honored at
@@ -226,7 +231,7 @@ The native large-file backend has no delta mode and no remote-to-remote
 mode, so auto mode uses it only for large files **confirmed absent** at the
 destination. Existing or uncertain large files always belong to rsync.
 
-One transfer works like this:
+An upload works like this:
 
 1. The source is stat'ed (regular file, size, nanosecond mtime) and a
    deterministic chunk plan is built (16 MiB chunks).
@@ -278,6 +283,21 @@ never triggers a fallback; every task fails with the probe's cause.
 `--backend mscp` is a compatibility name: it selects this native backend
 and never executes an external mscp.
 
+A download uses the same deterministic chunk plan, atomic checkpoint, fixed
+worker memory, sequential system-ssh SFTP session startup, per-chunk
+durability barrier, cancellation, and resume rules in the opposite
+direction. Each SFTP session opens its own read handle on the exact remote
+regular file; workers write ranges into an exclusive, pre-sized local temp
+next to the final path. The remote source's size and **nanosecond** mtime are
+checked against the immutable plan before copying and checked again after
+all readers close. CatSync then applies mode and exact mtime locally and
+publishes with `link(2)`, never rename, so an existing local final is not
+overwritten. Completion is persisted before the extra local temp hardlink
+is removed. Resume validates the remote source, checkpoint, local temp, and
+destination binding and skips completed chunks. Native downloads need the
+SFTP subsystem and GNU findutils, but not the remote hardlink extension or
+GNU `touch`.
+
 Legacy checkpoints written by the old external-mscp backend (binary,
 relative-path format) are detected and fail closed: they are never parsed
 as native checkpoints, the possibly partial destination is never touched,
@@ -295,10 +315,10 @@ stay enabled), never `--inplace` (atomic rename into place stays enabled).
 
 - `--verify none`: a task completes when its backend exits zero and the
   source file is unchanged before and after the transfer.
-- `--verify size` (default): after all stages, one batched remote manifest
-  is collected and every transferred file's remote size is compared with
-  the source size. A mismatch fails the task and the run. **Size equality
-  is not content proof.**
+- `--verify size` (default): after all stages, CatSync scans the receiving
+  side (one remote manifest for uploads, one local walk for downloads) and
+  compares every transferred file's size with the source size. A mismatch
+  fails the task and the run. **Size equality is not content proof.**
 - `--verify sha256`: **not implemented in this MVP.** It fails fast with a
   clear error instead of silently degrading to a size check.
 
@@ -320,6 +340,12 @@ macOS → Linux VPS (small files parallelized, 8 jobs × 2 streams):
 
 ```sh
 catsync sync --jobs 8 --streams 2 --large-threshold 1GiB ~/Pictures deploy@backup.example.com:/srv/pictures
+```
+
+Linux VPS → macOS/Linux (remote-to-local; the operand order selects download):
+
+```sh
+catsync sync --jobs 4 --streams 2 deploy@backup.example.com:/srv/archive ~/Downloads/archive
 ```
 
 Dry-run and plan:
@@ -344,7 +370,32 @@ Forced backends (must preserve the safety policy or fail):
 catsync sync --backend rsync /srv/data/ deploy@203.0.113.10:/srv/data
 catsync sync --backend fpsync --large-threshold 1GiB /srv/small-files/ deploy@203.0.113.10:/srv/small-files
 catsync sync --backend mscp /srv/isos/ deploy@203.0.113.10:/srv/isos   # only if none exist remotely
+catsync sync --backend mscp deploy@203.0.113.10:/srv/isos ~/Downloads/isos   # only if none exist locally
 ```
+
+## SSH authentication and Smallstep certificates
+
+CatSync deliberately delegates authentication to the **system `ssh`**. Every
+manifest command, rsync transport, SFTP session, and metadata command inherits
+the invoking process's environment, including `SSH_AUTH_SOCK`, and uses normal
+`~/.ssh/config`, agent, `known_hosts`, `ProxyJump`, `ControlMaster`, PKCS#11,
+and security-key behavior. CatSync does not add `-i`, does not set
+`IdentitiesOnly=yes`, does not parse private keys, and does not require an SSH
+certificate to exist as a file.
+
+This directly supports Smallstep's agent-only flow:
+
+```sh
+step ssh login your-name                 # places the short-lived identity/certificate in ssh-agent
+ssh user@host true                       # optional: prove the same shell can authenticate
+catsync sync ./data user@host:/srv/data  # inherits that same SSH_AUTH_SOCK
+```
+
+Run `step ssh login` and CatSync from an environment connected to the same
+agent. Avoid launching CatSync through `sudo` unless the agent socket and its
+permissions are deliberately preserved. CatSync never invokes `step` or
+refreshes certificates itself; if a short-lived certificate expires while a
+run is opening new SSH sessions, authenticate again and use `catsync resume`.
 
 ## Security notes
 
@@ -354,6 +405,8 @@ catsync sync --backend mscp /srv/isos/ deploy@203.0.113.10:/srv/isos   # only if
   escaped.
 - SSH host-key checking is never disabled; CatSync passes no
   `StrictHostKeyChecking` overrides. Configure `~/.ssh/config` as usual.
+- SSH credentials may live only in an inherited agent. CatSync neither
+  requires nor manufactures on-disk identity/certificate files.
 - No destination path ever has two writers at once: the plan assigns one
   owner per file, stages (native small-file batches, mscp, rsync) run
   strictly sequentially, and each small-file batch owns a disjoint file
@@ -364,8 +417,9 @@ catsync sync --backend mscp /srv/isos/ deploy@203.0.113.10:/srv/isos   # only if
 - There is no deletion of destination data: no `--delete`. The only remote
   removal is the native stage's own temporary object after a verified
   publish.
-- Credentials and private keys are never read or printed; no environment
-  value is ever printed. See the override scope table below.
+- CatSync itself never reads or prints credentials or private keys; no
+  environment value is ever printed. System ssh remains responsible for its
+  ordinary configured key and agent access. See the override scope table below.
 
 ### Program overrides (diagnostics and tests)
 
@@ -390,9 +444,9 @@ CatSync never runs or probes those tools.
 - **Symlinks, special files, and scan-error entries** are recorded with the
   distinct unsupported status, reported by count and path in sync, resume,
   status, and plan output, and never transferred or followed.
-- **Native multistream** transfers new files only; a modified large file
-  always falls to rsync. Transfers run where the source lives — no
-  remote-to-remote copies.
+- **Native multistream** transfers new files only in either local↔remote
+  direction; a modified large file always falls to rsync. Remote-to-remote
+  copies are not supported.
 - **Progress reporting** is coarse: stage start/finish lines and the tools'
   own output. There is no aggregate byte-progress percentage; each rsync
   batch's stderr is captured and printed with its batch number when
@@ -400,9 +454,9 @@ CatSync never runs or probes those tools.
 - **Manifest buffering**: the remote manifest is buffered in memory during
   collection (tens of bytes per remote file).
 - **sha256 verification** is not implemented in this MVP.
-- Remote destinations must run a POSIX shell; the optimized manifest
-  additionally needs GNU find, with a conservative rsync-only fallback
-  otherwise. The native large-file backend additionally needs an OpenSSH ≥
-  9.0 sftp-server (fsync and hardlink extensions) and GNU coreutils
-  (nanosecond `touch`); without them auto mode falls back to rsync before
-  any byte is written.
+- Remote endpoints must run a POSIX shell and GNU findutils. Upload
+  destination-manifest failure has a conservative rsync-only fallback;
+  remote source discovery for a download cannot safely fall back and fails.
+  Native uploads additionally need an OpenSSH ≥ 9.0 sftp-server (fsync and
+  hardlink extensions) and GNU coreutils (nanosecond `touch`); native
+  downloads use SFTP reads and a local no-clobber hardlink publish.

@@ -1,15 +1,17 @@
 # CatSync MVP architecture
 
-CatSync is a local orchestration CLI. It discovers a local source tree, obtains
-remote metadata in batches, assigns every path exactly one backend in an
+CatSync is a local orchestration CLI for local-to-remote and remote-to-local
+transfers. It discovers the source tree, obtains endpoint metadata in batches,
+assigns every path exactly one backend in an
 immutable plan, and drives external `rsync` and `ssh` processes plus its own
 native large-file backend. The small-file stage is native: CatSync partitions
 small files in pure Go and runs concurrent rsync batches itself; no external
 fpsync/fpart is used. The large-file stage is native multistream: sequential
-system-ssh SFTP sessions write disjoint byte ranges into a same-directory
-temp object with per-chunk atomic checkpoints and a no-clobber hardlink
-publish; no external mscp is used. The remote host needs only SSH/SFTP and
-rsync; it does not run a CatSync daemon.
+system-ssh SFTP sessions copy disjoint byte ranges into a receiving-side
+same-directory temp object with per-chunk atomic checkpoints and a no-clobber hardlink
+publish; no external mscp is used. The remote host needs only SSH/SFTP,
+rsync, and GNU findutils (plus GNU coreutils for native upload metadata); it
+does not run a CatSync daemon.
 
 ## Safety model
 
@@ -19,7 +21,7 @@ Planning produces one owner for every relative path:
 | --- | --- |
 | unchanged size and mtime | skip |
 | new file below threshold | native parallel-rsync batches (backend name `fpsync` for compatibility) |
-| new file at or above threshold | native multistream (backend name `mscp` for compatibility); rsync if the server lacks the hardlink extension |
+| new file at or above threshold | native multistream (backend name `mscp` for compatibility); uploads use rsync if the server lacks the hardlink extension |
 | existing or uncertain file | rsync |
 | symlink, special file, or scan error | unsupported (distinct task status) |
 
@@ -29,25 +31,29 @@ run and stages execute sequentially, so two programs never write the same
 destination path concurrently. Ownership is exact: each path has one backend,
 and within the small-file stage each batch owns a disjoint file set, so the
 concurrent rsync processes never touch the same destination file. Shared
-destination parents are pre-created with one batched remote mkdir and the
+destination parents are pre-created with one batched remote mkdir for uploads
+or symlink-safe component creation locally for downloads, and the
 batches run with `--no-implied-dirs`, so implied parent directories are
 never created or attribute-updated by rsync — no directory-metadata race.
 The MVP never passes a deletion option.
 
-The source is rescanned before a task starts and after it exits. A changed
+The source is rescanned before a task starts and after it exits (locally for
+uploads, through batched remote manifests and exact per-file native probes
+for downloads). A changed
 source is a failed task, not a successful transfer. State is written by
 temporary-file plus rename and a destination lock prevents overlapping runs.
 
 ## Execution stages
 
-1. Stream regular-file discovery into a bounded planner.
-2. Fetch one NUL-delimited remote manifest over SSH, rather than one SSH call
-   per file.
+1. Stream regular-file discovery into a bounded planner (local Lstat walk or
+   one NUL-delimited remote GNU-find manifest).
+2. Collect receiving-side metadata (one remote manifest for uploads or one
+   local walk for downloads).
 3. Persist the plan and original source working directory.
 4. Run the native small-file stage: pack pending small-file tasks into
    deterministic disjoint batches (at most 2000 files and at most the large
-   threshold in logical bytes per batch), create all remote parent
-   directories with one batched ssh mkdir, then run up to `jobs` concurrent
+   threshold in logical bytes per batch), create receiving-side parent
+   directories safely, then run up to `jobs` concurrent
    rsync processes with `--no-implied-dirs` and per-batch NUL-delimited
    `--files-from` lists. Then run native multistream new-large-file tasks
    (checkpoint per chunk, exclusive temp, hardlink publish), then the rsync
@@ -75,7 +81,7 @@ destination file, so partial progress survives re-batching.
 
 ### Native multistream large-file backend
 
-The native backend (`internal/backend/multistream`) needs no external tool
+The native backend (`internal/backend/multistream`) needs no transfer tool
 beyond system ssh: it speaks the SFTP subsystem itself through
 `github.com/pkg/sftp`. One transfer: deterministic chunk plan → atomic local
 checkpoint (JSON; source size, nanosecond mtime, destination identity, chunk
@@ -97,14 +103,23 @@ recorded completion is recovered by proving final and temp are the same inode
 via a controlled remote `test -ef`. Legacy external-mscp checkpoints (binary,
 relative-path format) are detected and fail closed.
 
-The backend requires an OpenSSH ≥ 9.0 sftp-server (fsync, hardlink) and GNU
-coreutils on the remote. Auto mode probes the capability before any remote
+Native uploads require an OpenSSH ≥ 9.0 sftp-server (fsync, hardlink) and GNU
+coreutils on the remote. Upload auto mode probes the capability before any remote
 write; only a task proven never started (no checkpoint reference, no derived
 `.nativeckpt`, no legacy `.mscpckpt`) may fall back to the conservative rsync
 stage. Everything else fails closed and keeps its backend, checkpoint, temp,
 and final untouched, because rsync would bypass the no-clobber publish. A
 probe error is not an "unsupported" answer and never causes a fallback; a
 forced run fails clearly.
+
+Remote-to-local native transfer mirrors these invariants: a GNU-find probe
+binds the exact remote size and nanosecond mtime to the immutable plan; each
+system-ssh SFTP session opens an independent read handle; range workers write
+an exclusive same-directory local temp; local fsync precedes each checkpoint
+completion; the remote identity is rechecked before local mode/mtime and a
+no-clobber `link(2)` publish. Resume validates the checkpoint and local temp
+and skips completed ranges. Since publication is local, downloads do not
+require the remote hardlink extension or GNU `touch`.
 
 ### rsync
 
@@ -155,7 +170,11 @@ replace executables CatSync itself spawns; `CATSYNC_SSH` also becomes rsync's
 `CATSYNC_FPART`, and `CATSYNC_MSCP` no longer exist: CatSync never runs or
 probes those tools. The native large-file backend uses the system ssh for
 every connection, so ssh_config, agents, known_hosts, ProxyJump, and hardware
-keys apply unchanged.
+keys apply unchanged. All child processes inherit `SSH_AUTH_SOCK`; CatSync
+never adds `-i` or `IdentitiesOnly`, parses a key, invokes `step`, or requires
+a certificate file. A Smallstep `step ssh login` identity that exists only in
+the inherited agent is therefore usable directly; an expired certificate can
+be refreshed and the durable run resumed.
 
 CatSync checks installed help/version output at runtime. A missing rsync or
 ssh is fatal. The MVP excludes symlinks and special files, does not delete
