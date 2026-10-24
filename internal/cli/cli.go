@@ -1,6 +1,6 @@
 // Package cli implements the catsync command-line interface: command
 // dispatch, shared option parsing and validation, the built-in doctor and
-// version commands, and the plan, sync, resume, and status transfer
+// version commands, and the plan, copy, sync, resume, and status transfer
 // commands driven by the executor package.
 package cli
 

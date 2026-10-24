@@ -886,6 +886,37 @@ func TestSyncDryRunTransfersNothing(t *testing.T) {
 	}
 }
 
+func TestMirrorDryRunUsesItemizedRsyncWithoutTransferStages(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 10)
+	post := h.writeManifest("post", manifestContent())
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "match=--dry-run\nexit=0\n")
+	cfg := h.config()
+	cfg.DryRun = true
+	cfg.Mirror = true
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("mirror dry-run: %v", err)
+	}
+	if run.Status != state.StatusCompleted || run.MirrorReconciled {
+		t.Fatalf("run status/reconciled = %s/%v", run.Status, run.MirrorReconciled)
+	}
+	invs := toolInvocations(h.invocations(), "rsync")
+	if len(invs) != 1 {
+		t.Fatalf("rsync invocations = %d, want one preview", len(invs))
+	}
+	joined := strings.Join(invs[0].Args, "\x00")
+	for _, want := range []string{"--dry-run", "--itemize-changes", "--delete-delay", "--checksum"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("preview lacks %s: %#v", want, invs[0].Args)
+		}
+	}
+	if len(stdinPaths(t, invs[0])) != 0 {
+		t.Fatal("full-tree preview unexpectedly used a file list")
+	}
+}
+
 func TestSyncSubprocessFailurePropagates(t *testing.T) {
 	h := newHarness(t)
 	h.writeSrc("small.txt", 10)

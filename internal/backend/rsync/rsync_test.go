@@ -57,7 +57,7 @@ func TestMirrorCommandGolden(t *testing.T) {
 	}
 	want := []string{
 		"rsync", "--archive", "--checksum", "--hard-links", "--acls", "--xattrs", "--delete-delay", "--partial",
-		"--partial-dir=.catsync-rsync-partial", "-e", "ssh", "--",
+		"-e", "ssh", "--",
 		"/srv/source/", "alice@example.com:/data",
 	}
 	if !reflect.DeepEqual(argv, want) {

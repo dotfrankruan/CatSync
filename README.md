@@ -37,8 +37,10 @@ catsync (local orchestrator)
   │ 5. execute stages sequentially, so writers never overlap:
   │      native parallel-rsync (small files) → native multistream
   │      (new large files) → rsync (rest)
-  │ 6. verify completed tasks (batched receiving-side size check)
-  │ 7. mark tasks completed; only then retire native checkpoints
+  │ 6. sync only: checksum-based full-tree archive reconciliation,
+  │      with destination-only deletion delayed until transfers succeed
+  │ 7. verify completed tasks (size plus optional remote SHA-256)
+  │ 8. mark tasks completed; only then retire native checkpoints
   └ all subprocesses are exec'd with argument arrays — no local shell
 ```
 
@@ -105,10 +107,21 @@ example `--backend fpsync` with a large file) exit nonzero. `--backend
 fpsync` is kept as a compatibility name; it selects the native
 parallel-rsync small-file backend and never invokes external fpsync/fpart.
 
+### `catsync copy SOURCE DESTINATION`
+
+Executes the durable parallel transfer lifecycle without deleting anything
+that exists only at the destination. This is the historical CatSync behavior
+and the safe choice for additive backup/copy jobs.
+
 ### `catsync sync SOURCE DESTINATION`
 
-Executes the full durable lifecycle and prints the run ID and final
-summary. Nonzero exit on any transfer or verification failure. A run
+Executes the same optimized transfer stages, then runs a final whole-tree
+rsync archive reconciliation with checksums and delayed deletion. It preserves
+directories, symlinks, hard links, ACLs, and extended attributes and removes
+destination-only entries, making the destination an exact archive mirror of
+the source when the source stays stable. The destructive reconciliation runs
+only when every preceding transfer stage succeeded. Nonzero exit on any
+transfer, reconciliation, or verification failure. A run
 interrupted with Ctrl-C stays resumable. Exactly one operand must be remote:
 `LOCAL [user@]host:/path` uploads and `[user@]host:/path LOCAL` downloads;
 remote-to-remote and local-to-local forms are rejected.
@@ -139,8 +152,9 @@ Prints the version.
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--backend` | `auto` | `auto`, `fpsync` (native parallel-rsync; does not invoke fpsync/fpart), `mscp` (native multistream; never invokes external mscp), or `rsync` |
-| `--dry-run` | off | plan and persist the run, transfer nothing |
+| `--dry-run` | off | transfer nothing; `sync` additionally runs rsync's itemized mirror preview, including deletions |
 | `--verify` | `auto` | `auto`, `none`, `size`, or `sha256` (see verification policy below) |
+| `--progress` | `auto` | `auto` (interactive terminal only), `always` (log snapshots), or `never` |
 | `--jobs` | 4 | max concurrent rsync batches (small-file stage) or concurrent large-file transfers |
 | `--streams` | 4 | SFTP sessions per large-file transfer |
 | `--large-threshold` | `512MiB` | size at or above which a file counts as large |
@@ -150,8 +164,14 @@ Prints the version.
 
 Options may appear before, between, or after the operands — `catsync sync
 --jobs 8 SRC DEST` and `catsync sync SRC DEST --jobs 8` are equivalent — and
-`--` ends option parsing. `--delete` is always rejected: CatSync never
-deletes destination files.
+`--` ends option parsing. Raw `--delete` is rejected: select the complete
+safety policy explicitly with `copy` (never delete) or `sync` (exact mirror).
+
+The aggregate progress display combines concurrent rsync batches and native
+multistream workers. It reports percentage, transferred logical bytes,
+current smoothed speed, elapsed time, ETA, ETD (estimated local completion
+clock time), and the active stage. It redraws one line on a terminal and is
+silent when redirected unless `--progress always` is selected.
 
 **SSH connection budget.** A run's estimated worst-case connection count is
 `jobs × streams` (each of up to `jobs` large-file transfers holds `streams`
@@ -176,15 +196,12 @@ Auto mode assigns every regular file exactly one owner:
 
 Symlinks, special files (devices, FIFOs, sockets), and entries whose scan
 failed are recorded with the task status **unsupported**, which is distinct
-from `skipped` (nothing to do) and from `failed` (a transfer was attempted
-and failed). They are never followed, never written to the destination, and
-never counted as completed. The run summary and `catsync status` always
-report the unsupported count, without needing `--verbose`, name the paths on
-stderr at the end of `sync`/`resume`, and list every unsupported entry under
-`--verbose`; `catsync plan` shows them before anything runs. `sync` still
-exits 0 when every *transferable* file transferred — unsupported entries are
-a documented MVP limitation, reported loudly rather than silently folded
-into skipped work.
+from `skipped` and `failed`. In `copy`, they are never followed or written;
+the final summary and `status` report them prominently. In `sync`, the final
+full-tree rsync reconciliation owns entries outside the optimized regular-file
+plan. If that reconciliation succeeds they are recorded completed; if rsync
+cannot reproduce one because of platform or privilege limits, the entire sync
+fails instead of claiming an exact mirror.
 
 Size and mtime are planning *hints*, not proof of content equality; the
 verification stage is the completion gate. Forced backends must preserve
@@ -306,10 +323,20 @@ release or inspected manually.
 
 ### rsync: the conservative fallback
 
-`rsync --archive --partial --partial-dir=.catsync-rsync-partial --relative
+Ordinary copy stages use `rsync --archive --partial --partial-dir=.catsync-rsync-partial --relative
 --files-from=- --from0 -e ssh SRC/ DEST` with the file list on
 NUL-delimited stdin. Never `--delete`, never `--whole-file` (delta updates
 stay enabled), never `--inplace` (atomic rename into place stays enabled).
+
+Only `catsync sync` adds a final full-tree reconciliation using
+`--archive --checksum --hard-links --acls --xattrs --partial --delete-delay`. It has no
+per-file filter, so it also represents empty directories, symlinks, and
+directory metadata. Unlike ordinary stages it does not protect a CatSync
+partial directory, which could otherwise survive as an extra destination
+entry. `--delete-delay` defers destination-only removals until
+rsync has completed its transfer work. The reconciliation intent and result
+are persisted, so an interrupted or failed mirror remains resumable even if
+all optimized per-file tasks already finished.
 
 ## Verification
 
@@ -338,10 +365,16 @@ required.
 
 ## Examples
 
-Linux VPS → Linux VPS (run on the source VPS):
+Exact Linux VPS → Linux VPS mirror (run on the source VPS; deletes extras):
 
 ```sh
 catsync sync /srv/data/ deploy@203.0.113.10:/srv/data
+```
+
+Non-deleting copy:
+
+```sh
+catsync copy /srv/data/ deploy@203.0.113.10:/srv/data
 ```
 
 IPv6-only VPS → IPv6-only VPS:
@@ -428,9 +461,9 @@ run is opening new SSH sessions, authenticate again and use `catsync resume`.
   destination parents are pre-created and transferred with
   `--no-implied-dirs`, so concurrent batches never race on directory
   metadata either.
-- There is no deletion of destination data: no `--delete`. The only remote
-  removal is the native stage's own temporary object after a verified
-  publish.
+- `copy` never deletes destination-only data. `sync` deliberately performs
+  checksum-based archive reconciliation with `--delete-delay`, but only after
+  all preceding transfer stages succeed. Raw `--delete` is not accepted.
 - CatSync itself never reads or prints credentials or private keys; no
   environment value is ever printed. System ssh remains responsible for its
   ordinary configured key and agent access. See the override scope table below.
@@ -455,16 +488,19 @@ CatSync never runs or probes those tools.
   re-stat'd immediately before and after their transfer, and a changed file
   fails its task — but a consistent point-in-time copy of a live tree is
   not promised. Sync quiescent trees or snapshot first.
-- **Symlinks, special files, and scan-error entries** are recorded with the
-  distinct unsupported status, reported by count and path in sync, resume,
-  status, and plan output, and never transferred or followed.
+- **Symlinks, special files, and scan-error entries** are unsupported by the
+  optimized per-file planner and remain untransferred in `copy`. A successful
+  final `sync` reconciliation delegates the full tree to rsync, which handles
+  directories, symlinks, and supported special files; platform privileges
+  still determine whether device/special metadata can be reproduced.
 - **Native multistream** transfers new files only in either local↔remote
   direction; a modified large file always falls to rsync. Remote-to-remote
   copies are not supported.
-- **Progress reporting** is coarse: stage start/finish lines and the tools'
-  own output. There is no aggregate byte-progress percentage; each rsync
-  batch's stderr is captured and printed with its batch number when
-  non-empty.
+- **Progress totals are logical transfer bytes**, aggregated from successful
+  rsync and native multistream writes. Delta transfer, already-completed
+  resume chunks, checksum-only mirror work, metadata, and deletion do not map
+  one-to-one to network bytes, so ETA/ETD are live estimates and may jump at
+  stage boundaries.
 - **Manifest buffering**: the remote manifest is buffered in memory during
   collection (tens of bytes per remote file).
 - **Hash-tool availability**: default `--verify auto` falls back to size-only

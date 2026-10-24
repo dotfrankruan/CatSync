@@ -320,7 +320,6 @@ func (c *MirrorConfig) Command() ([]string, error) {
 		"--xattrs",
 		"--delete-delay",
 		"--partial",
-		"--partial-dir=" + DefaultPartialDir,
 	}
 	if c.DryRun {
 		args = append(args, "--dry-run", "--itemize-changes")

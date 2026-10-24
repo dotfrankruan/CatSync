@@ -263,6 +263,9 @@ func printRunStatus(w io.Writer, run *state.Run, verbose bool) {
 		mode,
 		run.Config.Direction.Effective(), run.Config.Backend, run.Config.Verify, run.Config.Jobs, run.Config.Streams,
 		run.Config.LargeThreshold, run.Config.IPv6, run.Config.DryRun)
+	if run.Config.Mirror {
+		fmt.Fprintf(w, "  mirror:      reconciled=%v (destination-only deletion uses rsync --delete-delay)\n", run.MirrorReconciled)
+	}
 	counts := map[state.Status]int{}
 	byBackend := map[state.Backend]int{}
 	checkpoints := 0

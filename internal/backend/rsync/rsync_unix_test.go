@@ -260,6 +260,7 @@ func TestLocalRealRsyncMirrorDeletesAfterTransferAndPreservesTree(t *testing.T) 
 	src := t.TempDir()
 	dst := t.TempDir()
 	writeSourceFile(t, src, "kept/file.txt", []byte("new content"))
+	writeSourceFile(t, src, "checksum.txt", []byte("ABCD"))
 	if err := os.Mkdir(filepath.Join(src, "empty"), 0o750); err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +268,11 @@ func TestLocalRealRsyncMirrorDeletesAfterTransferAndPreservesTree(t *testing.T) 
 		t.Fatal(err)
 	}
 	writeSourceFile(t, dst, "stale.txt", []byte("delete me"))
+	writeSourceFile(t, dst, DefaultPartialDir+"/stale.part", []byte("delete internal residue"))
 	writeSourceFile(t, dst, "kept/file.txt", []byte("old"))
+	// Same size and mtime but different content: only --checksum can detect
+	// and repair this case.
+	writeSourceFile(t, dst, "checksum.txt", []byte("WXYZ"))
 
 	cfg := MirrorConfig{Program: prog, SourceDir: src, Dest: testDest()}
 	argv, err := cfg.Command()
@@ -284,12 +289,18 @@ func TestLocalRealRsyncMirrorDeletesAfterTransferAndPreservesTree(t *testing.T) 
 	if _, err := os.Lstat(filepath.Join(dst, "stale.txt")); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("destination-only file remains: %v", err)
 	}
+	if _, err := os.Lstat(filepath.Join(dst, DefaultPartialDir)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("protected partial residue remains: %v", err)
+	}
 	got, err := os.ReadFile(filepath.Join(dst, "kept/file.txt"))
 	if err != nil || string(got) != "new content" {
 		t.Fatalf("mirrored file = %q, %v", got, err)
 	}
 	if fi, err := os.Stat(filepath.Join(dst, "empty")); err != nil || !fi.IsDir() {
 		t.Fatalf("empty directory not mirrored: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(dst, "checksum.txt")); err != nil || string(got) != "ABCD" {
+		t.Fatalf("checksum-only mismatch was not repaired: %q, %v", got, err)
 	}
 	if target, err := os.Readlink(filepath.Join(dst, "link")); err != nil || target != "kept/file.txt" {
 		t.Fatalf("symlink = %q, %v", target, err)

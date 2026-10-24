@@ -35,7 +35,11 @@ destination parents are pre-created with one batched remote mkdir for uploads
 or symlink-safe component creation locally for downloads, and the
 batches run with `--no-implied-dirs`, so implied parent directories are
 never created or attribute-updated by rsync — no directory-metadata race.
-The MVP never passes a deletion option.
+`copy` stops after these non-deleting stages. `sync` is explicitly destructive:
+only after every optimized transfer stage succeeds, one full-tree rsync pass
+uses archive, checksum, hard-link, ACL, xattr, and delayed-delete semantics.
+That final pass represents empty directories and symlinks that the per-file
+planner intentionally omits. A failed earlier stage never reaches deletion.
 
 The source is rescanned before a task starts and after it exits (locally for
 uploads, through batched remote manifests and exact per-file native probes
@@ -58,7 +62,10 @@ temporary-file plus rename and a destination lock prevents overlapping runs.
    `--files-from` lists. Then run native multistream new-large-file tasks
    (checkpoint per chunk, exclusive temp, hardlink publish), then the rsync
    conservative/delta stage.
-5. Verify successful tasks and atomically save their terminal state. The
+5. For `sync` only, persist an unreconciled intent and run the full-tree
+   checksum mirror with `--delete-delay`; persist reconciliation success.
+   `copy` skips this stage and never deletes destination-only entries.
+6. Verify successful tasks and atomically save their terminal state. The
    default `auto` policy always checks size, then compares SHA-256 digests when
    the remote endpoint provides `sha256sum`, `shasum`, `openssl`, or BusyBox.
    If none is installed, it completes with size verification and emits a
@@ -136,6 +143,27 @@ protects remote arguments by default; CatSync detects remote compatibility
 before relying on version-dependent flags. It does not use `--whole-file` or
 `--inplace`.
 
+The separate mirror configuration is reachable only from `sync`. It has no
+`--files-from` filter and uses `--archive --checksum --hard-links --acls
+--xattrs --partial --delete-delay`, without protecting a separate partial
+directory that could remain as an extra destination entry. Deletion is therefore an explicit command-level
+policy, not a pass-through flag. `sync --dry-run` runs the same command with
+`--dry-run --itemize-changes` so deletions and non-regular entries are visible
+without mutation. `MirrorReconciled` is saved false before launch and true
+only after exit zero; a failed reconciliation remains resumable even when all
+per-file tasks completed.
+
+## Progress accounting
+
+One concurrency-safe reporter aggregates successful write-byte deltas from
+all active backends. Native multistream reports every successful range write;
+each rsync process emits `--info=progress2`, whose monotonic counters are
+converted to deltas before aggregation. Terminal mode redraws one line at a
+bounded rate. Redirected output is silent by default; forced line mode emits
+periodic snapshots. Every snapshot includes percentage, logical bytes,
+smoothed current speed, elapsed time, ETA, ETD, and the active stage. These
+are logical progress estimates rather than exact network-byte accounting.
+
 ## Persistent model
 
 Each JSON run records a schema version, run ID, source, destination, original
@@ -143,10 +171,12 @@ working directory, configuration, timestamps, and tasks. A task records its
 relative path, source size/mtime, destination metadata, backend, status,
 attempt count, checkpoint reference, and last error. Valid statuses are
 `pending`, `running`, `completed`, `failed`, `skipped`, and `unsupported`.
-`unsupported` records entries the MVP cannot transfer (symlinks, special
-files, scan errors); it is never folded into `skipped` and never counted as
-completed. Run summaries and `status` always print the unsupported count and
-name the paths on stderr after `sync`/`resume`.
+`unsupported` records entries the optimized per-file planner cannot transfer
+(symlinks, special files, scan errors). They remain unsupported and are
+reported for `copy`. A successful full-tree `sync` reconciliation owns them
+through rsync and atomically changes their task status to completed; if rsync
+cannot reproduce them, reconciliation fails and the run never claims an exact
+mirror.
 
 A task is completed only after subprocess success, unchanged-source checks,
 and requested verification. On startup, `running` becomes `pending` with an
@@ -183,9 +213,10 @@ the inherited agent is therefore usable directly; an expired certificate can
 be refreshed and the durable run resumed.
 
 CatSync checks installed help/version output at runtime. A missing rsync or
-ssh is fatal. The MVP excludes symlinks and special files, does not delete
-remote files, and does not promise a consistent snapshot of a mutating source
-tree.
+ssh is fatal. Optimized `copy` excludes symlinks and special files and never
+deletes destination-only data; `sync` delegates those entries and delayed
+deletion to its final full-tree rsync pass. Neither mode promises a consistent
+snapshot of a mutating source tree.
 
 Primary references:
 
