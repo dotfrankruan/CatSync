@@ -106,6 +106,25 @@ func runRemoteCommand(args []string) int {
 		fmt.Fprintln(os.Stderr, "fake ssh: empty remote command")
 		return 2
 	}
+	// The download source-identity probe is deliberately one fixed shell
+	// script. Emulate GNU find's output here because the test host may have
+	// BSD find; the real Linux/SSH path is covered by the live E2E.
+	if len(cmd) == 1 && strings.HasPrefix(cmd[0], "if [ -f ") {
+		const prefix = "if [ -f "
+		const suffix = " ] && [ ! -L "
+		end := strings.Index(cmd[0], suffix)
+		if end < 0 {
+			fmt.Fprintln(os.Stderr, "fake ssh: malformed identity probe")
+			return 2
+		}
+		p := unquoteShellWord(cmd[0][len(prefix):end])
+		fi, err := os.Lstat(p)
+		if err != nil || !fi.Mode().IsRegular() || fi.Mode()&os.ModeSymlink != 0 {
+			return 44
+		}
+		fmt.Fprintf(os.Stdout, "file%c%d%c%s%c", 0, fi.Size(), 0, epochtime.Format(fi.ModTime()), 0)
+		return 0
+	}
 	switch cmd[0] {
 	case "touch":
 		// touch -m -d @<sec>.<nsec> <path>
