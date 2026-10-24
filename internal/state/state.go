@@ -131,6 +131,7 @@ func (s Status) Valid() bool {
 
 // Verification modes recorded in Config.Verify.
 const (
+	VerifyAuto   = "auto"
 	VerifyNone   = "none"
 	VerifySize   = "size"
 	VerifySHA256 = "sha256"
@@ -148,7 +149,7 @@ type Config struct {
 	DryRun bool `json:"dry_run"`
 	// IPv6 restricts backend tools to IPv6.
 	IPv6 bool `json:"ipv6"`
-	// Verify is the completion verification mode: none, size, or sha256.
+	// Verify is the completion verification mode: auto, none, size, or sha256.
 	Verify string `json:"verify"`
 	// Jobs caps parallel transfer jobs.
 	Jobs int `json:"jobs"`
@@ -167,7 +168,7 @@ func (c *Config) validate() error {
 		return fmt.Errorf("invalid backend %q", c.Backend)
 	}
 	switch c.Verify {
-	case VerifyNone, VerifySize, VerifySHA256:
+	case VerifyAuto, VerifyNone, VerifySize, VerifySHA256:
 	default:
 		return fmt.Errorf("invalid verify mode %q", c.Verify)
 	}

@@ -42,12 +42,28 @@ const EnvSFTPNoExt = "MOCKEXEC_SFTP_NOEXT"
 // script-mode tests keep full control.
 const EnvSSHNative = "MOCKEXEC_SSH_NATIVE"
 
+// EnvSSHHashTool selects the SHA-256 utility reported by the capability
+// probe in tests. Empty means no supported tool.
+const EnvSSHHashTool = "MOCKEXEC_SSH_HASH_TOOL"
+
 // sshEmulation handles an invocation of the mock "ssh" tool that asks for
 // the SFTP subsystem or runs one of the controlled metadata commands the
 // native large-file backend uses (touch -m -d @epoch.nanos, test -ef,
 // mkdir -p). Everything else returns handled=false so the script behavior
 // applies. The remote filesystem is the local filesystem.
 func sshEmulation(args []string) (int, bool) {
+	// Default script-mode tests emulate a minimal remote with no hash
+	// utility. This exact capability probe is safe to answer without the
+	// broader native-filesystem emulation and exercises auto's size-only
+	// downgrade path.
+	if len(args) > 0 && strings.Contains(args[len(args)-1], "command -v sha256sum") && strings.Contains(args[len(args)-1], "command -v openssl") {
+		tool := os.Getenv(EnvSSHHashTool)
+		if tool == "" {
+			tool = "none"
+		}
+		fmt.Fprint(os.Stdout, tool)
+		return 0, true
+	}
 	if os.Getenv(EnvSSHNative) == "" {
 		return 0, false
 	}
@@ -103,6 +119,16 @@ func sshEmulation(args []string) (int, bool) {
 		return 0, true
 	case len(cmd) == 1 && strings.HasPrefix(cmd[0], "if [ -f "):
 		return emulateSourceIdentity(cmd[0]), true
+	case len(cmd) == 1 && strings.HasPrefix(cmd[0], "set -e; out=$("):
+		c := exec.Command("/bin/sh", "-c", cmd[0])
+		c.Stdout, c.Stderr = os.Stdout, os.Stderr
+		if err := c.Run(); err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				return exitErr.ExitCode(), true
+			}
+			return 2, true
+		}
+		return 0, true
 	}
 	return 0, false
 }

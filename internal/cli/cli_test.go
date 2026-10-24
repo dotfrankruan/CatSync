@@ -126,17 +126,15 @@ func TestStatusMissingRun(t *testing.T) {
 	}
 }
 
-// TestSHA256VerificationFailsFast checks that --verify sha256 is refused
-// with a clear usage error before any transfer work happens.
-func TestSHA256VerificationFailsFast(t *testing.T) {
-	src := tempSource(t)
-	for _, name := range []string{"plan", "sync"} {
-		code, _, stderr := run(t, name, "--verify", "sha256", "--state-dir", t.TempDir(), src, "user@host:/data")
-		if code != ExitUsage {
-			t.Errorf("%s --verify sha256 exit = %d, want %d", name, code, ExitUsage)
-		}
-		if !strings.Contains(stderr, "sha256") || !strings.Contains(stderr, "not implemented") {
-			t.Errorf("%s stderr should explain sha256 is not implemented:\n%s", name, stderr)
+func TestVerificationDefaultsAndValidation(t *testing.T) {
+	if got := defaultOptions().Verify; got != "auto" {
+		t.Fatalf("default verify = %q, want auto", got)
+	}
+	for _, mode := range []string{"auto", "none", "size", "sha256"} {
+		opts := defaultOptions()
+		opts.Verify = mode
+		if err := opts.Validate(); err != nil {
+			t.Errorf("verify mode %q rejected: %v", mode, err)
 		}
 	}
 }

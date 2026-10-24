@@ -245,7 +245,7 @@ func runStateCommand(name string, args []string, stdout, stderr io.Writer) int {
 // exitForError maps an executor error to a process exit code: invalid
 // configuration is a usage error; everything else is a runtime failure.
 func exitForError(err error) int {
-	if errors.Is(err, executor.ErrInvalidConfig) || errors.Is(err, executor.ErrVerifyNotImplemented) {
+	if errors.Is(err, executor.ErrInvalidConfig) {
 		return ExitUsage
 	}
 	return ExitError

@@ -61,9 +61,6 @@ var (
 	// ErrInvalidConfig rejects an inconsistent executor configuration;
 	// the CLI maps it to the usage exit status.
 	ErrInvalidConfig = errors.New("executor: invalid configuration")
-	// ErrVerifyNotImplemented rejects the sha256 verification mode: this
-	// MVP implements none and size only and refuses to pretend otherwise.
-	ErrVerifyNotImplemented = errors.New("executor: verify mode sha256 is not implemented in this MVP (use none or size)")
 	// ErrNotResumable reports a run with no work left to resume.
 	ErrNotResumable = errors.New("executor: run is not resumable")
 )
@@ -138,9 +135,7 @@ func (c *Config) validateFull() error {
 		return fmt.Errorf("%w: backend %q", ErrInvalidConfig, c.Backend)
 	}
 	switch c.Verify {
-	case state.VerifyNone, state.VerifySize:
-	case state.VerifySHA256:
-		return ErrVerifyNotImplemented
+	case state.VerifyAuto, state.VerifyNone, state.VerifySize, state.VerifySHA256:
 	default:
 		return fmt.Errorf("%w: verify mode %q", ErrInvalidConfig, c.Verify)
 	}
@@ -226,6 +221,11 @@ type Executor struct {
 	// propagated to the caller and never silently swallowed when it could
 	// affect correctness or resumability.
 	saveFn func(*state.Run) error
+
+	// finalWarnings are emitted only after a successful run is durably
+	// completed, so a verification downgrade cannot be lost among transfer
+	// progress lines.
+	finalWarnings []string
 }
 
 func newExecutor(cfg Config) (*Executor, error) {
@@ -930,6 +930,9 @@ func (e *Executor) finalize(errs []string) error {
 			e.warnf("run %s: %d source entrie(s) are unsupported (symlinks, special files, or scan errors) and were NOT transferred", e.run.ID, unsupported)
 		} else {
 			e.logf("run %s: completed", e.run.ID)
+		}
+		for _, warning := range e.finalWarnings {
+			e.warnf("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\nWARNING: %s\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", warning)
 		}
 		return nil
 	}

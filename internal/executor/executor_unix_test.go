@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -421,6 +422,76 @@ func TestSyncNativeRemoteToLocalLargeFile(t *testing.T) {
 		if strings.HasPrefix(entry.Name(), ".catsync-tmp-") {
 			t.Fatalf("local download temp left behind: %s", entry.Name())
 		}
+	}
+}
+
+func TestVerifyAutoUsesRemoteSHA256Tool(t *testing.T) {
+	if _, err := exec.LookPath("shasum"); err != nil {
+		t.Skip("shasum unavailable on test host")
+	}
+	h := newHarness(t)
+	h.writeSrc("big.bin", 2048)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("big.bin")))
+	h.scriptSSHFreshDest(post)
+	cfg := h.configNative()
+	cfg.Verify = state.VerifyAuto
+	cfg.Env = h.nativeEnv(mockexec.EnvSSHHashTool + "=shasum")
+	var stdout, stderr bytes.Buffer
+	cfg.Stdout, cfg.Stderr = &stdout, &stderr
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Sync: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if run.Status != state.StatusCompleted || run.Tasks[0].Status != state.StatusCompleted {
+		t.Fatalf("run/task status = %s/%s", run.Status, run.Tasks[0].Status)
+	}
+	if !strings.Contains(stdout.String(), "SHA-256 content check") {
+		t.Fatalf("stdout lacks SHA-256 verification evidence:\n%s", stdout.String())
+	}
+	if strings.Contains(stderr.String(), "WAS NOT PERFORMED") {
+		t.Fatalf("successful SHA-256 run printed downgrade warning:\n%s", stderr.String())
+	}
+}
+
+func TestVerifyAutoFallsBackToSizeWithFinalWarning(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("big.bin", 2048)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("big.bin")))
+	h.scriptSSHFreshDest(post)
+	cfg := h.configNative()
+	cfg.Verify = state.VerifyAuto
+	var stdout, stderr bytes.Buffer
+	cfg.Stdout, cfg.Stderr = &stdout, &stderr
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if run.Status != state.StatusCompleted {
+		t.Fatalf("run status = %s", run.Status)
+	}
+	for _, want := range []string{"WARNING:", "SHA-256 CONTENT VERIFICATION WAS NOT PERFORMED", "Only file-size verification", "did not download", "Install"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("final warning lacks %q:\n%s", want, stderr.String())
+		}
+	}
+	if strings.Index(stderr.String(), "WAS NOT PERFORMED") < 0 || !strings.Contains(stdout.String(), "run "+run.ID+": completed") {
+		t.Fatalf("missing completion/warning output: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func TestVerifySHA256RequiresRemoteTool(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("big.bin", 2048)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("big.bin")))
+	h.scriptSSHFreshDest(post)
+	cfg := h.configNative()
+	cfg.Verify = state.VerifySHA256
+	run, err := Sync(context.Background(), cfg)
+	if err == nil || !strings.Contains(err.Error(), "no supported SHA-256 utility") {
+		t.Fatalf("Sync = %v, want missing remote SHA-256 tool failure", err)
+	}
+	if run.Tasks[0].Status != state.StatusFailed {
+		t.Fatalf("task = %s, want failed", run.Tasks[0].Status)
 	}
 }
 

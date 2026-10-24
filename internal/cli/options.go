@@ -30,8 +30,8 @@ type Options struct {
 	IPv6 bool
 	// StateDir holds run state used by resume and status.
 	StateDir string
-	// Verify selects the completion verification mode: none, size, or
-	// sha256. sha256 is accepted now and may fail as unimplemented later.
+	// Verify selects the completion verification mode: auto, none, size,
+	// or sha256.
 	Verify string
 	// Jobs caps parallel transfer jobs.
 	Jobs int
@@ -46,7 +46,7 @@ func defaultOptions() Options {
 	return Options{
 		Backend:        "auto",
 		StateDir:       defaultStateDir(),
-		Verify:         "size",
+		Verify:         "auto",
 		Jobs:           4,
 		Streams:        4,
 		LargeThreshold: bytesize.Size(512 * bytesize.MiB),
@@ -76,7 +76,7 @@ func (o *Options) bindSharedFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&o.Quiet, "quiet", o.Quiet, "suppress non-error output")
 	fs.BoolVar(&o.IPv6, "ipv6", o.IPv6, "restrict backend tools to IPv6")
 	fs.StringVar(&o.StateDir, "state-dir", o.StateDir, "directory holding catsync run state")
-	fs.StringVar(&o.Verify, "verify", o.Verify, "completion verification: none, size, or sha256")
+	fs.StringVar(&o.Verify, "verify", o.Verify, "completion verification: auto, none, size, or sha256")
 	fs.IntVar(&o.Jobs, "jobs", o.Jobs, "maximum parallel transfer jobs")
 	fs.IntVar(&o.Streams, "streams", o.Streams, "maximum parallel streams per job")
 	fs.Var(&o.LargeThreshold, "large-threshold", "size at or above which a file counts as large (e.g. 512MiB)")
@@ -104,9 +104,9 @@ func (o *Options) Validate() error {
 		return fmt.Errorf("--backend %q is not valid: want auto, fpsync, mscp, or rsync", o.Backend)
 	}
 	switch o.Verify {
-	case "none", "size", "sha256":
+	case "auto", "none", "size", "sha256":
 	default:
-		return fmt.Errorf("--verify %q is not valid: want none, size, or sha256", o.Verify)
+		return fmt.Errorf("--verify %q is not valid: want auto, none, size, or sha256", o.Verify)
 	}
 	if o.Jobs < 1 {
 		return fmt.Errorf("--jobs must be at least 1, got %d", o.Jobs)

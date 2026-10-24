@@ -43,7 +43,8 @@ func TestValidateFull(t *testing.T) {
 	}{
 		{"bad backend", func(c *Config) { c.Backend = "bogus" }, ErrInvalidConfig},
 		{"bad verify", func(c *Config) { c.Verify = "md5" }, ErrInvalidConfig},
-		{"sha256 not implemented", func(c *Config) { c.Verify = state.VerifySHA256 }, ErrVerifyNotImplemented},
+		{"sha256 accepted", func(c *Config) { c.Verify = state.VerifySHA256 }, nil},
+		{"auto accepted", func(c *Config) { c.Verify = state.VerifyAuto }, nil},
 		{"zero jobs", func(c *Config) { c.Jobs = 0 }, ErrInvalidConfig},
 		{"zero streams", func(c *Config) { c.Streams = 0 }, ErrInvalidConfig},
 		{"connection budget", func(c *Config) { c.Jobs = 16; c.Streams = 16 }, ErrInvalidConfig},

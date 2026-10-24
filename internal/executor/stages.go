@@ -43,8 +43,8 @@ func (e *Executor) localRoot() string {
 }
 
 // stageVerifyNone reports whether tasks complete immediately after their
-// stage (verify mode none) or stay running until the batched verification
-// stage (verify mode size).
+// stage (verify mode none) or stay running until the batched size/content
+// verification stage.
 func (e *Executor) stageVerifyNone() bool {
 	return e.run.Config.Verify == state.VerifyNone
 }
@@ -649,6 +649,7 @@ func (e *Executor) verifyStage(ctx context.Context) error {
 		return err
 	}
 	var failures []string
+	var sizeOK []*state.Task
 	for _, t := range candidates {
 		entry, ok := manifest[t.Path]
 		switch {
@@ -663,23 +664,107 @@ func (e *Executor) verifyStage(ctx context.Context) error {
 			}
 			failures = append(failures, t.Path)
 		default:
-			// Native large tasks: remember the temp path from the
-			// checkpoint before completeTask retires it, then remove the
-			// temp after the completed state is durable.
-			tempPath := ""
-			if t.Backend == state.BackendMSCP {
-				tempPath = e.nativeTempPath(t)
+			sizeOK = append(sizeOK, t)
+		}
+	}
+	if len(sizeOK) == 0 {
+		return fmt.Errorf("size verification failed for %d file(s): %s", len(failures), strings.Join(quoteAll(failures, 5), ", "))
+	}
+
+	if e.run.Config.Verify == state.VerifySize {
+		for _, t := range sizeOK {
+			if err := e.completeVerifiedTask(ctx, t); err != nil {
+				return err
 			}
-			if cerr := e.completeTask(t); cerr != nil {
-				return cerr
+		}
+		if len(failures) > 0 {
+			return fmt.Errorf("size verification failed for %d file(s): %s", len(failures), strings.Join(quoteAll(failures, 5), ", "))
+		}
+		return nil
+	}
+
+	tool, toolErr := e.detectRemoteHashTool(ctx)
+	if toolErr != nil {
+		for _, t := range sizeOK {
+			if ferr := e.failTask(t, fmt.Sprintf("SHA-256 capability detection failed: %v", toolErr)); ferr != nil {
+				return ferr
 			}
-			if tempPath != "" {
-				e.removeNativeTemp(ctx, tempPath)
+		}
+		return toolErr
+	}
+	if tool == "" {
+		if e.run.Config.Verify == state.VerifySHA256 {
+			err := errors.New("remote endpoint has no supported SHA-256 utility; install sha256sum, shasum, openssl, or busybox sha256sum")
+			for _, t := range sizeOK {
+				if ferr := e.failTask(t, err.Error()); ferr != nil {
+					return ferr
+				}
 			}
+			return err
+		}
+		// Default auto mode deliberately degrades to size only. It never
+		// reads remote file contents back through SFTP as a fallback.
+		e.finalWarnings = append(e.finalWarnings, noRemoteHashToolWarning)
+		for _, t := range sizeOK {
+			if err := e.completeVerifiedTask(ctx, t); err != nil {
+				return err
+			}
+		}
+		if len(failures) > 0 {
+			return fmt.Errorf("size verification failed for %d file(s): %s", len(failures), strings.Join(quoteAll(failures, 5), ", "))
+		}
+		return nil
+	}
+
+	e.logf("verify: SHA-256 content check of %d file(s) using remote %s", len(sizeOK), tool)
+	remote, err := e.remoteHashes(ctx, tool, sizeOK)
+	if err != nil {
+		for _, t := range sizeOK {
+			if ferr := e.failTask(t, fmt.Sprintf("SHA-256 verification failed: %v", err)); ferr != nil {
+				return ferr
+			}
+		}
+		return err
+	}
+	for _, t := range sizeOK {
+		local, lerr := e.localHash(t)
+		if lerr != nil {
+			if ferr := e.failTask(t, fmt.Sprintf("SHA-256 verification failed: hash local endpoint: %v", lerr)); ferr != nil {
+				return ferr
+			}
+			failures = append(failures, t.Path)
+			continue
+		}
+		if local != remote[t.Path] {
+			if ferr := e.failTask(t, fmt.Sprintf("SHA-256 verification failed: local %s, remote %s", local, remote[t.Path])); ferr != nil {
+				return ferr
+			}
+			failures = append(failures, t.Path)
+			continue
+		}
+		if err := e.completeVerifiedTask(ctx, t); err != nil {
+			return err
 		}
 	}
 	if len(failures) > 0 {
-		return fmt.Errorf("size verification failed for %d file(s): %s", len(failures), strings.Join(quoteAll(failures, 5), ", "))
+		return fmt.Errorf("verification failed for %d file(s): %s", len(failures), strings.Join(quoteAll(failures, 5), ", "))
+	}
+	return nil
+}
+
+func (e *Executor) completeVerifiedTask(ctx context.Context, t *state.Task) error {
+	// Native large tasks: remember the temp path from the checkpoint before
+	// completeTask retires it, then remove the temp only after completed is
+	// durable.
+	tempPath := ""
+	if t.Backend == state.BackendMSCP {
+		tempPath = e.nativeTempPath(t)
+	}
+	if err := e.completeTask(t); err != nil {
+		return err
+	}
+	if tempPath != "" {
+		e.removeNativeTemp(ctx, tempPath)
 	}
 	return nil
 }
