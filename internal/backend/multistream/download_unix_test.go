@@ -144,6 +144,19 @@ func TestDownloadDetectsRemoteSourceChange(t *testing.T) {
 	}
 }
 
+func TestDownloadRejectsSourceChangedSincePlanningBeforeCheckpoint(t *testing.T) {
+	env := newDownloadEnv(t, 8<<10, 8<<10)
+	env.opts.CheckpointPath = env.ckptPath
+	env.opts.ExpectedRemote = &RemoteIdentity{Size: 7 << 10, ModTime: mustStat(t, env.remoteSource).ModTime()}
+	_, err := Download(context.Background(), env.remoteSource, env.sourceRel, env.localFinal, env.opts)
+	if !errors.Is(err, ErrSourceChanged) {
+		t.Fatalf("Download = %v, want ErrSourceChanged", err)
+	}
+	if _, err := os.Lstat(env.ckptPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("checkpoint exists after pre-transfer identity rejection: %v", err)
+	}
+}
+
 func TestResumeDownloadBindingsBeforeSSH(t *testing.T) {
 	env := newDownloadEnv(t, 8<<10, 8<<10)
 	fi := mustStat(t, env.remoteSource)

@@ -55,6 +55,17 @@ type TransferOptions struct {
 	// OnChunkComplete is an optional progress hook invoked after each
 	// chunk's checkpoint save.
 	OnChunkComplete func(done, total int)
+	// ExpectedRemote, when non-nil, binds a fresh remote-to-local download
+	// to the size and nanosecond mtime observed by the planner. Uploads and
+	// resume (which is bound by its checkpoint) ignore this field.
+	ExpectedRemote *RemoteIdentity
+}
+
+// RemoteIdentity is the immutable source identity used to prevent a fresh
+// download from silently accepting a file that changed after planning.
+type RemoteIdentity struct {
+	Size    uint64
+	ModTime time.Time
 }
 
 func (o *TransferOptions) normalize() error {

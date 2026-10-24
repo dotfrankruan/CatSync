@@ -39,6 +39,10 @@ func Download(ctx context.Context, remoteSource, sourceRel, localFinal string, o
 	if err != nil {
 		return nil, err
 	}
+	if want := opts.ExpectedRemote; want != nil && (size != want.Size || !mtime.Equal(want.ModTime)) {
+		return nil, fmt.Errorf("%w: remote source changed since planning (size %d, mtime %s; planned size %d, mtime %s)",
+			ErrSourceChanged, size, mtime, want.Size, want.ModTime)
+	}
 	chunks, err := Plan(size, opts.ChunkSize)
 	if err != nil {
 		return nil, err
