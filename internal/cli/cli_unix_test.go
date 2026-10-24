@@ -227,6 +227,9 @@ func TestCLIRemoteToLocalRsyncRouting(t *testing.T) {
 	if runRec.Config.Direction != state.DirectionRemoteToLocal || runRec.Source.String() != "user@host:/remote/source" || runRec.Destination.Path != download {
 		t.Fatalf("download state endpoints: direction=%q source=%q destination=%q", runRec.Config.Direction, runRec.Source.String(), runRec.Destination.Path)
 	}
+	if runRec.Tasks[0].Backend != state.BackendFPSync {
+		t.Fatalf("new small download backend = %s, want native parallel-rsync compatibility backend", runRec.Tasks[0].Backend)
+	}
 	rs := h.invocations("rsync")
 	if len(rs) != 1 {
 		t.Fatalf("rsync invocations = %d, want 1", len(rs))

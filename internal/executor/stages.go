@@ -104,25 +104,35 @@ func (e *Executor) smallFileStage(ctx context.Context) error {
 		return fmt.Errorf("executor: partition small files: %w", err)
 	}
 
-	// Create every remote parent directory once, before any batch starts:
-	// batches share parents, and --no-implied-dirs assumes they exist.
-	parents := map[string]struct{}{}
-	for _, it := range items {
-		if slash := strings.LastIndexByte(it.Path, '/'); slash >= 0 {
-			parents[targetRemoteJoin(e.run.Destination.Path, it.Path[:slash])] = struct{}{}
-		}
-	}
-	if len(parents) > 0 {
-		dirs := make([]string, 0, len(parents))
-		for d := range parents {
-			dirs = append(dirs, d)
-		}
-		sort.Strings(dirs)
-		if err := e.mkdirRemoteParents(ctx, e.destTarget(), e.run.Config.IPv6, dirs); err != nil {
-			if ferr := e.failBatch(e.tasksAt(idxs), fmt.Sprintf("create remote parent directories: %v", err)); ferr != nil {
+	// --no-implied-dirs requires explicit safe parents on the receiving
+	// side. Uploads create them remotely in one batch; downloads create
+	// local components without following symlinks.
+	if e.run.Config.Direction.Effective() == state.DirectionRemoteToLocal {
+		if err := ensureLocalParents(e.run.Destination.Path, e.tasksAt(idxs)); err != nil {
+			if ferr := e.failBatch(e.tasksAt(idxs), fmt.Sprintf("prepare local destination parents: %v", err)); ferr != nil {
 				return ferr
 			}
 			return err
+		}
+	} else {
+		parents := map[string]struct{}{}
+		for _, it := range items {
+			if slash := strings.LastIndexByte(it.Path, '/'); slash >= 0 {
+				parents[targetRemoteJoin(e.run.Destination.Path, it.Path[:slash])] = struct{}{}
+			}
+		}
+		if len(parents) > 0 {
+			dirs := make([]string, 0, len(parents))
+			for d := range parents {
+				dirs = append(dirs, d)
+			}
+			sort.Strings(dirs)
+			if err := e.mkdirRemoteParents(ctx, e.destTarget(), e.run.Config.IPv6, dirs); err != nil {
+				if ferr := e.failBatch(e.tasksAt(idxs), fmt.Sprintf("create remote parent directories: %v", err)); ferr != nil {
+					return ferr
+				}
+				return err
+			}
 		}
 	}
 
@@ -226,22 +236,39 @@ func (e *Executor) runSmallBatch(ctx, stageCtx context.Context, batch partition.
 
 	// 1. Revalidate each source file immediately before this batch starts,
 	// catching changes that happened while the batch waited for a slot.
-	active := make([]*state.Task, 0, len(batch.Items))
+	requested := make([]*state.Task, 0, len(batch.Items))
 	for _, it := range batch.Items {
-		if stageCtx.Err() != nil {
-			// Stop mid-loop: remaining tasks are untouched and stay
-			// pending.
-			out.cancelled = true
-			return out
-		}
-		t := byPath[it.Path]
-		ok, err := e.recheckBefore(t)
+		requested = append(requested, byPath[it.Path])
+	}
+	var active []*state.Task
+	if e.run.Config.Direction.Effective() == state.DirectionRemoteToLocal {
+		var err error
+		active, err = e.recheckRemoteSource(stageCtx, requested, "before small-file batch")
 		if err != nil {
+			if stageCtx.Err() != nil {
+				out.cancelled = true
+				return out
+			}
 			out.err = err
 			return out
 		}
-		if ok {
-			active = append(active, t)
+	} else {
+		active = make([]*state.Task, 0, len(batch.Items))
+		for _, t := range requested {
+			if stageCtx.Err() != nil {
+				// Stop mid-loop: remaining tasks are untouched and stay
+				// pending.
+				out.cancelled = true
+				return out
+			}
+			ok, err := e.recheckBefore(t)
+			if err != nil {
+				out.err = err
+				return out
+			}
+			if ok {
+				active = append(active, t)
+			}
 		}
 	}
 	if len(active) == 0 {
@@ -317,14 +344,24 @@ func (e *Executor) runSmallBatch(ctx, stageCtx context.Context, batch partition.
 	// 4. Post-transfer source revalidation per task; verification=none
 	// completes the task, otherwise it stays running for the batched
 	// verification stage.
-	for _, t := range active {
-		ok, rerr := e.recheckAfter(t)
+	if e.run.Config.Direction.Effective() == state.DirectionRemoteToLocal {
+		var rerr error
+		active, rerr = e.recheckRemoteSource(stageCtx, active, "after small-file batch")
 		if rerr != nil {
 			out.err = rerr
 			return out
 		}
-		if !ok {
-			continue
+	}
+	for _, t := range active {
+		if e.run.Config.Direction.Effective() != state.DirectionRemoteToLocal {
+			ok, rerr := e.recheckAfter(t)
+			if rerr != nil {
+				out.err = rerr
+				return out
+			}
+			if !ok {
+				continue
+			}
 		}
 		if e.stageVerifyNone() {
 			if cerr := e.completeTask(t); cerr != nil {

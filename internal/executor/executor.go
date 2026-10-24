@@ -538,24 +538,9 @@ func (e *Executor) planPhase(ctx context.Context) (*PlanOutcome, error) {
 		if err != nil {
 			return nil, fmt.Errorf("executor: scan local destination: %w", err)
 		}
-		// Native multistream now supports confirmed-new large downloads.
-		// Small downloads stay on the conservative rsync stage until the
-		// parallel small-file scheduler is made direction-aware.
-		if e.cfg.Backend == state.BackendFPSync {
-			return nil, fmt.Errorf("%w: backend %q is not yet available for remote-to-local transfers; use auto, rsync, or mscp", ErrInvalidConfig, e.cfg.Backend)
-		}
 		result, err := planner.Plan(entries, dest, planner.Config{Backend: e.cfg.Backend, Threshold: e.cfg.LargeThreshold, Tools: tools})
 		if err != nil {
 			return nil, err
-		}
-		if e.cfg.Backend == state.BackendAuto {
-			for i := range result.Decisions {
-				d := &result.Decisions[i]
-				if d.Status == planner.StatusPending && d.Backend == state.BackendFPSync {
-					d.Backend = state.BackendRsync
-					d.Reason = "new remote file below threshold: conservative download rsync"
-				}
-			}
 		}
 		out := &PlanOutcome{Direction: e.cfg.direction(), Result: result, ManifestKnown: true, Tools: tools}
 		for _, d := range result.Decisions {
