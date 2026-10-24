@@ -147,6 +147,10 @@ type Config struct {
 	Backend Backend `json:"backend"`
 	// DryRun records a plan-only run that transfers nothing.
 	DryRun bool `json:"dry_run"`
+	// Mirror makes the destination an exact rsync archive mirror of the
+	// source after the disjoint transfer stages succeed. The zero value is
+	// the historical copy-only behavior and never deletes destination data.
+	Mirror bool `json:"mirror,omitempty"`
 	// IPv6 restricts backend tools to IPv6.
 	IPv6 bool `json:"ipv6"`
 	// Verify is the completion verification mode: auto, none, size, or sha256.
@@ -319,6 +323,10 @@ type Run struct {
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
 	// Error records the most recent run-level failure or interruption.
 	Error string `json:"error,omitempty"`
+	// MirrorReconciled records that the final full-tree rsync reconciliation
+	// completed. It lets a mirror run whose reconciliation failed remain
+	// resumable even when all per-file transfer tasks already completed.
+	MirrorReconciled bool `json:"mirror_reconciled,omitempty"`
 	// Tasks holds the per-file units of work.
 	Tasks []Task `json:"tasks"`
 }
@@ -410,6 +418,9 @@ func (r *Run) RecoverInterrupted() bool {
 func (r *Run) Resumable() bool {
 	if r.Status == StatusCompleted {
 		return false
+	}
+	if r.Config.Mirror && !r.MirrorReconciled {
+		return true
 	}
 	for _, t := range r.Tasks {
 		switch t.Status {

@@ -252,6 +252,50 @@ func TestLocalRealRsyncTransfer(t *testing.T) {
 	}
 }
 
+func TestLocalRealRsyncMirrorDeletesAfterTransferAndPreservesTree(t *testing.T) {
+	prog, err := exec.LookPath("rsync")
+	if err != nil {
+		t.Skip("rsync not installed; skipping real local mirror test")
+	}
+	src := t.TempDir()
+	dst := t.TempDir()
+	writeSourceFile(t, src, "kept/file.txt", []byte("new content"))
+	if err := os.Mkdir(filepath.Join(src, "empty"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("kept/file.txt", filepath.Join(src, "link")); err != nil {
+		t.Fatal(err)
+	}
+	writeSourceFile(t, dst, "stale.txt", []byte("delete me"))
+	writeSourceFile(t, dst, "kept/file.txt", []byte("old"))
+
+	cfg := MirrorConfig{Program: prog, SourceDir: src, Dest: testDest()}
+	argv, err := cfg.Command()
+	if err != nil {
+		t.Fatal(err)
+	}
+	argv[len(argv)-1] = dst + "/"
+	var stdout, stderr bytes.Buffer
+	if err := process.Run(context.Background(), process.Spec{
+		Name: argv[0], Args: argv[1:], Stdout: &stdout, Stderr: &stderr,
+	}); err != nil {
+		t.Fatalf("local mirror: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+	if _, err := os.Lstat(filepath.Join(dst, "stale.txt")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("destination-only file remains: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dst, "kept/file.txt"))
+	if err != nil || string(got) != "new content" {
+		t.Fatalf("mirrored file = %q, %v", got, err)
+	}
+	if fi, err := os.Stat(filepath.Join(dst, "empty")); err != nil || !fi.IsDir() {
+		t.Fatalf("empty directory not mirrored: %v", err)
+	}
+	if target, err := os.Readlink(filepath.Join(dst, "link")); err != nil || target != "kept/file.txt" {
+		t.Fatalf("symlink = %q, %v", target, err)
+	}
+}
+
 // runLocalRsync executes cfg against a local destination directory: the
 // argv is built exactly as the backend builds it and only the remote
 // destination operand is swapped for the local path. It returns the argv

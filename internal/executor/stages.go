@@ -545,6 +545,78 @@ func (e *Executor) rsyncStage(ctx context.Context) error {
 	return nil
 }
 
+// mirrorStage is the explicit destructive stage used only by `catsync sync`.
+// It runs after every disjoint transfer stage has succeeded. A durable false
+// intent is saved before launch so a crash or failure remains resumable; true
+// is persisted only after rsync exits zero. --delete-delay ensures rsync does
+// transfer work before removing destination-only entries.
+func (e *Executor) mirrorStage(ctx context.Context) error {
+	e.runMu.Lock()
+	previous := e.run.MirrorReconciled
+	e.run.MirrorReconciled = false
+	e.runMu.Unlock()
+	if err := e.saveRun(); err != nil {
+		e.runMu.Lock()
+		e.run.MirrorReconciled = previous
+		e.runMu.Unlock()
+		return err
+	}
+	e.logf("stage mirror-reconcile: exact archive mirror; destination-only entries will be deleted after transfer")
+	cfg := rsync.MirrorConfig{
+		Program: e.progs.rsync(), Direction: e.transferDirection(),
+		SourceDir: e.localRoot(), Dest: e.destTarget(),
+		SSH: e.sshOpts(e.run.Config.IPv6), Env: e.cfg.Env,
+		Stdout: e.stdout, Stderr: e.stderr,
+	}
+	if err := cfg.Run(ctx); err != nil {
+		return err
+	}
+	// The full-tree archive pass also handles directories, symlinks, and
+	// special entries that the optimized per-file planner does not own.
+	type priorTask struct {
+		index  int
+		status state.Status
+		err    string
+	}
+	var changed []priorTask
+	e.runMu.Lock()
+	for i := range e.run.Tasks {
+		if e.run.Tasks[i].Status == state.StatusUnsupported {
+			changed = append(changed, priorTask{i, e.run.Tasks[i].Status, e.run.Tasks[i].Error})
+			e.run.Tasks[i].Status = state.StatusCompleted
+			e.run.Tasks[i].Error = ""
+		}
+	}
+	e.run.MirrorReconciled = true
+	e.runMu.Unlock()
+	if err := e.saveRun(); err != nil {
+		e.runMu.Lock()
+		e.run.MirrorReconciled = false
+		for _, prior := range changed {
+			e.run.Tasks[prior.index].Status = prior.status
+			e.run.Tasks[prior.index].Error = prior.err
+		}
+		e.runMu.Unlock()
+		return err
+	}
+	return nil
+}
+
+// mirrorPreview runs rsync's own itemized dry-run so `sync --dry-run` shows
+// directory, symlink, metadata, content, and deletion changes that the
+// regular-file planner alone cannot represent. It never mutates run state or
+// either endpoint.
+func (e *Executor) mirrorPreview(ctx context.Context) error {
+	e.logf("mirror dry-run: itemizing exact archive changes and destination-only deletions")
+	cfg := rsync.MirrorConfig{
+		Program: e.progs.rsync(), Direction: e.transferDirection(),
+		SourceDir: e.localRoot(), Dest: e.destTarget(),
+		SSH: e.sshOpts(e.run.Config.IPv6), DryRun: true, Env: e.cfg.Env,
+		Stdout: e.stdout, Stderr: e.stderr,
+	}
+	return cfg.Run(ctx)
+}
+
 // recheckRemoteSource performs one batched remote source scan and retains
 // only tasks whose regular-file size and nanosecond mtime still match the
 // immutable plan.

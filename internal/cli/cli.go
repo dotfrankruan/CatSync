@@ -31,7 +31,8 @@ const usageText = `Usage: catsync <command> [options]
 Commands:
   doctor    check external tools (rsync, ssh)
   plan      build a transfer plan between one local and one remote endpoint
-  sync      transfer between one local and one remote endpoint
+  copy      copy source entries without deleting destination-only entries
+  sync      make destination an exact archive mirror of source
   resume    resume an interrupted run
   status    show the status of a run
   version   print the catsync version
@@ -51,7 +52,7 @@ func Run(args []string, stdout, stderr io.Writer, version string) int {
 	switch name {
 	case "doctor":
 		return runDoctorCommand(rest, stdout, stderr)
-	case "plan", "sync":
+	case "plan", "copy", "sync":
 		return runTransferCommand(name, rest, stdout, stderr)
 	case "resume", "status":
 		return runStateCommand(name, rest, stdout, stderr)
@@ -68,10 +69,9 @@ func Run(args []string, stdout, stderr io.Writer, version string) int {
 	}
 }
 
-// rejectDelete scans raw arguments for any spelling of rsync-style deletion
-// and rejects it explicitly. CatSync never deletes destination files, so a
-// clear error beats the generic "flag not defined" message. Scanning stops
-// at "--", after which tokens are positional operands.
+// rejectDelete rejects a raw rsync flag. Deletion is selected by the sync
+// command as a complete safety policy, never enabled by passing through an
+// implementation-specific option.
 func rejectDelete(args []string) error {
 	for _, a := range args {
 		if a == "--" {
@@ -79,7 +79,7 @@ func rejectDelete(args []string) error {
 		}
 		if a == "-delete" || a == "--delete" ||
 			strings.HasPrefix(a, "-delete=") || strings.HasPrefix(a, "--delete=") {
-			return errors.New("--delete is not supported: catsync never deletes destination files")
+			return errors.New("--delete is not a supported flag: use 'catsync sync' for an exact mirror or 'catsync copy' for non-deleting transfer")
 		}
 	}
 	return nil
@@ -166,9 +166,9 @@ func splitArgs(fs *flag.FlagSet, args []string) (operands []string, code int, ok
 	return operands, ExitOK, true
 }
 
-// runTransferCommand implements plan and sync. Both commands share the full
-// option set and operand validation; plan stops after the transfer plan
-// while sync executes it.
+// runTransferCommand implements plan, copy, and sync. They share the full
+// option set and operand validation; plan stops after the transfer plan,
+// copy never deletes, and sync performs final mirror reconciliation.
 func runTransferCommand(name string, args []string, stdout, stderr io.Writer) int {
 	if err := rejectDelete(args); err != nil {
 		fmt.Fprintf(stderr, "catsync: %s: %v\n", name, err)
@@ -196,12 +196,13 @@ func runTransferCommand(name string, args []string, stdout, stderr io.Writer) in
 		return ExitUsage
 	}
 	cfg := opts.executorConfig(transfer, stdout, stderr)
+	cfg.Mirror = name == "sync"
 	ctx, stop := signalContext()
 	defer stop()
 	if name == "plan" {
 		return runPlan(ctx, cfg, &opts, stdout, stderr)
 	}
-	return runSync(ctx, cfg, &opts, stdout, stderr)
+	return runSync(ctx, name, cfg, &opts, stdout, stderr)
 }
 
 // runStateCommand implements resume and status. Both operate on recorded
@@ -257,8 +258,10 @@ func transferUsage(name string) string {
 Exactly one endpoint must be local and one remote. Upload uses
 LOCAL_SOURCE [user@]host:/absolute/path; download uses
 [user@]host:/absolute/path LOCAL_DESTINATION. Remote paths must be absolute;
-bracketed IPv6 literals are accepted. CatSync never deletes destination files;
---delete is rejected.
+bracketed IPv6 literals are accepted. The copy command never deletes destination-only
+entries. The sync command performs a final exact archive reconciliation and deletes
+destination-only entries only after preceding transfer stages succeed.
+--delete is rejected; choose the command whose semantics you intend.
 
 Options may appear before, between, or after the operands: for example
 "catsync %s --jobs 8 SRC DEST" and "catsync %s SRC DEST --jobs 8" are

@@ -358,6 +358,80 @@ func TestSyncAutoFreshDest(t *testing.T) {
 	}
 }
 
+func TestMirrorRunsOnlyAfterTransferAndPersistsCompletion(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 10)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "match=--files-from=-\nexit=0\n---\nmatch=--delete-delay\nexit=0\n")
+	cfg := h.config()
+	cfg.Mirror = true
+	cfg.Verify = state.VerifyNone
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Sync mirror: %v", err)
+	}
+	if !run.MirrorReconciled || run.Status != state.StatusCompleted {
+		t.Fatalf("mirror state = reconciled %v, status %s", run.MirrorReconciled, run.Status)
+	}
+	rsyncInvs := toolInvocations(h.invocations(), "rsync")
+	if len(rsyncInvs) != 2 {
+		t.Fatalf("rsync invocations = %d, want transfer + mirror", len(rsyncInvs))
+	}
+	if strings.Contains(strings.Join(rsyncInvs[0].Args, "\x00"), "--delete-delay") {
+		t.Fatal("ordinary transfer unexpectedly enabled deletion")
+	}
+	if !strings.Contains(strings.Join(rsyncInvs[1].Args, "\x00"), "--delete-delay") {
+		t.Fatalf("mirror invocation lacks delayed deletion: %#v", rsyncInvs[1].Args)
+	}
+}
+
+func TestMirrorNeverStartsAfterTransferFailure(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 10)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "exit=23\n")
+	cfg := h.config()
+	cfg.Mirror = true
+	cfg.Verify = state.VerifyNone
+	run, err := Sync(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("Sync mirror with transfer failure = nil")
+	}
+	if run.MirrorReconciled {
+		t.Fatal("failed transfer recorded mirror reconciliation")
+	}
+	rsyncInvs := toolInvocations(h.invocations(), "rsync")
+	if len(rsyncInvs) != 1 {
+		t.Fatalf("rsync invocations = %d, want failed transfer only", len(rsyncInvs))
+	}
+	if strings.Contains(strings.Join(rsyncInvs[0].Args, "\x00"), "--delete-delay") {
+		t.Fatal("destructive mirror ran after transfer failure")
+	}
+}
+
+func TestMirrorFailureWithCompletedTasksRemainsResumable(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 10)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "match=--files-from=-\nexit=0\n---\nmatch=--delete-delay\nexit=23\n")
+	cfg := h.config()
+	cfg.Mirror = true
+	cfg.Verify = state.VerifyNone
+	run, err := Sync(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("Sync with mirror failure = nil")
+	}
+	if run.Tasks[0].Status != state.StatusCompleted || run.MirrorReconciled {
+		t.Fatalf("task/mirror state = %s/%v", run.Tasks[0].Status, run.MirrorReconciled)
+	}
+	if !run.Resumable() {
+		t.Fatal("mirror failure with completed transfer is not resumable")
+	}
+}
+
 func TestSyncNativeRemoteToLocalLargeFile(t *testing.T) {
 	if !mockexec.SFTPServerAvailable() {
 		t.Skip("real sftp-server is unavailable")

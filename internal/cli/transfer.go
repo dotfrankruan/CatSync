@@ -107,18 +107,18 @@ func printPlan(w io.Writer, out *executor.PlanOutcome, opts *Options) {
 	fmt.Fprintln(w, "no data was transferred (plan only)")
 }
 
-// runSync executes the sync command and prints the run summary.
-func runSync(ctx context.Context, cfg executor.Config, opts *Options, stdout, stderr io.Writer) int {
+// runSync executes copy or sync and prints the run summary.
+func runSync(ctx context.Context, command string, cfg executor.Config, opts *Options, stdout, stderr io.Writer) int {
 	run, err := executor.Sync(ctx, cfg)
 	if err != nil {
-		fmt.Fprintf(stderr, "catsync: sync: %v\n", err)
+		fmt.Fprintf(stderr, "catsync: %s: %v\n", command, err)
 		if run != nil {
-			fmt.Fprintf(stderr, "catsync: sync: run %s is recorded; inspect with 'catsync status %s'\n", run.ID, run.ID)
+			fmt.Fprintf(stderr, "catsync: %s: run %s is recorded; inspect with 'catsync status %s'\n", command, run.ID, run.ID)
 		}
 		return exitForError(err)
 	}
 	printRunSummary(stdout, run, opts)
-	warnUnsupported(stderr, "sync", run)
+	warnUnsupported(stderr, command, run)
 	return ExitOK
 }
 
@@ -232,7 +232,12 @@ func printRunStatus(w io.Writer, run *state.Run, verbose bool) {
 	if run.FinishedAt != nil {
 		fmt.Fprintf(w, "  finished:    %s\n", run.FinishedAt.Format("2006-01-02 15:04:05 UTC"))
 	}
-	fmt.Fprintf(w, "  config:      direction=%s backend=%s verify=%s jobs=%d streams=%d threshold=%d ipv6=%v dry_run=%v\n",
+	mode := "copy"
+	if run.Config.Mirror {
+		mode = "sync"
+	}
+	fmt.Fprintf(w, "  config:      mode=%s direction=%s backend=%s verify=%s jobs=%d streams=%d threshold=%d ipv6=%v dry_run=%v\n",
+		mode,
 		run.Config.Direction.Effective(), run.Config.Backend, run.Config.Verify, run.Config.Jobs, run.Config.Streams,
 		run.Config.LargeThreshold, run.Config.IPv6, run.Config.DryRun)
 	counts := map[state.Status]int{}

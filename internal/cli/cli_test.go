@@ -59,7 +59,7 @@ func TestHelpCommand(t *testing.T) {
 	if code != ExitOK {
 		t.Errorf("exit = %d, want %d", code, ExitOK)
 	}
-	for _, cmd := range []string{"doctor", "plan", "sync", "resume", "status", "version"} {
+	for _, cmd := range []string{"doctor", "plan", "copy", "sync", "resume", "status", "version"} {
 		if !strings.Contains(stdout, cmd) {
 			t.Errorf("usage text missing command %q:\n%s", cmd, stdout)
 		}
@@ -81,8 +81,8 @@ func TestDeleteIsRejectedExplicitly(t *testing.T) {
 		if code != ExitUsage {
 			t.Errorf("Run(%v) exit = %d, want %d", args, code, ExitUsage)
 		}
-		if !strings.Contains(stderr, "--delete is not supported") ||
-			!strings.Contains(stderr, "never deletes") {
+		if !strings.Contains(stderr, "--delete is not a supported flag") ||
+			!strings.Contains(stderr, "catsync sync") || !strings.Contains(stderr, "catsync copy") {
 			t.Errorf("Run(%v) stderr missing explicit --delete rejection:\n%s", args, stderr)
 		}
 	}

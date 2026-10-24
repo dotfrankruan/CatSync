@@ -103,6 +103,9 @@ type Config struct {
 	Backend state.Backend
 	// DryRun plans and persists the run without transferring data.
 	DryRun bool
+	// Mirror performs a final whole-tree archive reconciliation with delayed
+	// deletion. False is copy-only and never deletes destination entries.
+	Mirror bool
 	// IPv6 restricts backend tools and auxiliary SSH calls to IPv6.
 	IPv6 bool
 	// Verify is the completion verification mode: none or size.
@@ -604,6 +607,7 @@ func (e *Executor) buildRun(out *PlanOutcome) (*state.Run, error) {
 			Direction:      state.Direction(direction),
 			Backend:        e.cfg.Backend,
 			DryRun:         e.cfg.DryRun,
+			Mirror:         e.cfg.Mirror,
 			IPv6:           e.cfg.IPv6,
 			Verify:         e.cfg.Verify,
 			Jobs:           e.cfg.Jobs,
@@ -687,6 +691,11 @@ func syncWith(ctx context.Context, cfg Config, prepare func(*Executor)) (*state.
 	}
 	e.logf("run %s: planned %d task(s)", run.ID, len(run.Tasks))
 	if cfg.DryRun {
+		if cfg.Mirror {
+			if err := e.mirrorPreview(ctx); err != nil {
+				return run, err
+			}
+		}
 		now := time.Now().UTC()
 		run.Status = state.StatusCompleted
 		run.FinishedAt = &now
@@ -751,6 +760,7 @@ func resumeWith(ctx context.Context, cfg Config, id string, prepare func(*Execut
 		SourceDir:      localDir,
 		Dest:           remote,
 		Backend:        run.Config.Backend,
+		Mirror:         run.Config.Mirror,
 		Verify:         run.Config.Verify,
 		Jobs:           run.Config.Jobs,
 		Streams:        run.Config.Streams,
@@ -857,6 +867,21 @@ func (e *Executor) execute(ctx context.Context) error {
 			e.warnf("%s", errs[len(errs)-1])
 		}
 	}
+	// Deletion is a commit-like final reconciliation: never run it after a
+	// failed transfer stage. Copy runs do not enter this stage at all.
+	if len(errs) == 0 && e.run.Config.Mirror {
+		if err := e.mirrorStage(ctx); err != nil {
+			if ctx.Err() != nil {
+				ctxErr := fmt.Errorf("executor: mirror stage: %w", ctx.Err())
+				if ierr := e.interrupt(); ierr != nil {
+					return fmt.Errorf("%w; %v", ctxErr, ierr)
+				}
+				return ctxErr
+			}
+			errs = append(errs, fmt.Sprintf("mirror stage: %v", err))
+			e.warnf("%s", errs[len(errs)-1])
+		}
+	}
 	if err := e.verifyStage(ctx); err != nil {
 		if ctx.Err() != nil {
 			ctxErr := fmt.Errorf("executor: verification: %w", ctx.Err())
@@ -901,6 +926,9 @@ func (e *Executor) finalize(errs []string) error {
 	e.runMu.Unlock()
 
 	if len(errs) == 0 && failed == 0 {
+		if e.run.Config.Mirror && !e.run.MirrorReconciled {
+			return errors.New("executor: mirror reconciliation was not completed")
+		}
 		unsupported := 0
 		e.runMu.Lock()
 		now := time.Now().UTC()

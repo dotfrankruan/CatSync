@@ -158,7 +158,7 @@ func TestCLISyncEndToEnd(t *testing.T) {
 	h.scriptFreshDestSSH(post)
 	h.writeScript("rsync", "exit=0")
 
-	code, stdout, stderr := run(t, "sync", "--state-dir", h.stateDir,
+	code, stdout, stderr := run(t, "copy", "--state-dir", h.stateDir,
 		"--large-threshold", "1KiB", h.src, "user@host:"+h.remoteDir)
 	if code != ExitOK {
 		t.Fatalf("sync exit = %d, stderr:\n%s", code, stderr)
@@ -208,7 +208,7 @@ func TestCLIRemoteToLocalRsyncRouting(t *testing.T) {
 	h.writeScript("ssh", "match=-mindepth 1\nstdout_file="+manifest+"\n")
 	h.writeScript("rsync", "exit=0")
 
-	code, stdout, stderr := run(t, "sync", "--verify", "none", "--state-dir", h.stateDir,
+	code, stdout, stderr := run(t, "copy", "--verify", "none", "--state-dir", h.stateDir,
 		"user@host:/remote/source", download)
 	if code != ExitOK {
 		t.Fatalf("download sync exit = %d, stderr:\n%s", code, stderr)
@@ -303,7 +303,7 @@ func TestCLISyncFailureExitCode(t *testing.T) {
 	h.scriptFreshDestSSH(post)
 	h.writeScript("rsync", "exit=23")
 
-	code, _, stderr := run(t, "sync", "--state-dir", h.stateDir, "--backend", "rsync",
+	code, _, stderr := run(t, "copy", "--state-dir", h.stateDir, "--backend", "rsync",
 		h.src, "user@host:/data")
 	if code != ExitError {
 		t.Fatalf("sync exit = %d, want %d", code, ExitError)
@@ -336,7 +336,7 @@ func TestCLIIPv6CommandShapes(t *testing.T) {
 	post := h.writeManifest("post", h.record("big.bin"))
 	h.scriptFreshDestSSH(post)
 
-	code, _, stderr := run(t, "sync", "--state-dir", h.stateDir, "--ipv6", "--backend", "mscp",
+	code, _, stderr := run(t, "copy", "--state-dir", h.stateDir, "--ipv6", "--backend", "mscp",
 		"--large-threshold", "1KiB", h.src, "user@[2001:db8::1]:"+h.remoteDir)
 	if code != ExitOK {
 		t.Fatalf("sync exit = %d, stderr:\n%s", code, stderr)
@@ -397,7 +397,7 @@ func TestCLIResumeAfterInterrupt(t *testing.T) {
 
 	done := make(chan int, 1)
 	go func() {
-		code, _, _ := run(t, "sync", "--state-dir", h.stateDir, "--backend", "rsync", h.src, "user@host:/data")
+		code, _, _ := run(t, "copy", "--state-dir", h.stateDir, "--backend", "rsync", h.src, "user@host:/data")
 		done <- code
 	}()
 	// Wait until the mock rsync has actually started (its invocation is
@@ -486,7 +486,7 @@ func TestCLIReportsUnsupportedEntries(t *testing.T) {
 	h.scriptFreshDestSSH(post)
 	h.writeScript("rsync", "exit=0")
 
-	code, stdout, stderr := run(t, "sync", "--state-dir", h.stateDir, "--backend", "rsync",
+	code, stdout, stderr := run(t, "copy", "--state-dir", h.stateDir, "--backend", "rsync",
 		h.src, "user@host:/data")
 	if code != ExitOK {
 		t.Fatalf("sync exit = %d, stderr:\n%s", code, stderr)
@@ -558,7 +558,7 @@ func TestCLIInterspersedArgsEndToEnd(t *testing.T) {
 	h.writeScript("rsync", "exit=0")
 
 	// Every option trails the operands.
-	code, stdout, stderr := run(t, "sync", h.src, "user@host:"+h.remoteDir,
+	code, stdout, stderr := run(t, "copy", h.src, "user@host:"+h.remoteDir,
 		"--state-dir", h.stateDir, "--large-threshold", "1KiB",
 		"--jobs", "2", "--streams", "2")
 	if code != ExitOK {
@@ -612,7 +612,7 @@ func TestCLISSHOverrideReachesRsyncTransport(t *testing.T) {
 	h.scriptFreshDestSSH(post)
 	h.writeScript("rsync", "exit=0")
 
-	code, _, stderr := run(t, "sync", "--state-dir", h.stateDir, "--backend", "rsync",
+	code, _, stderr := run(t, "copy", "--state-dir", h.stateDir, "--backend", "rsync",
 		h.src, "user@host:/data")
 	if code != ExitOK {
 		t.Fatalf("sync exit = %d, stderr:\n%s", code, stderr)
@@ -663,7 +663,7 @@ func TestResumeInvalidSSHOverrideIsUsageError(t *testing.T) {
 	h.writeScript("rsync", "exit=23")
 
 	// Create a genuinely resumable run: the transfer fails.
-	code, _, stderr := run(t, "sync", "--state-dir", h.stateDir, "--backend", "rsync",
+	code, _, stderr := run(t, "copy", "--state-dir", h.stateDir, "--backend", "rsync",
 		"--verify", "none", h.src, "user@host:/data")
 	if code != ExitError {
 		t.Fatalf("setup sync exit = %d, stderr:\n%s", code, stderr)
@@ -715,7 +715,7 @@ func TestCATSYNCMSCPIgnored(t *testing.T) {
 	h.scriptFreshDestSSH(post)
 	t.Setenv("CATSYNC_MSCP", "/nonexistent/mscp-should-never-run")
 
-	code, _, stderr := run(t, "sync", "--state-dir", h.stateDir,
+	code, _, stderr := run(t, "copy", "--state-dir", h.stateDir,
 		"--large-threshold", "1KiB", h.src, "user@host:"+h.remoteDir)
 	if code != ExitOK {
 		t.Fatalf("sync exit = %d, stderr:\n%s", code, stderr)
@@ -751,7 +751,7 @@ func TestCLIPreEpochMtimeWithSizeVerify(t *testing.T) {
 	post := h.writeManifest("post", h.record("big.bin"))
 	h.scriptFreshDestSSH(post)
 
-	code, _, stderr := run(t, "sync", "--verify", "size", "--state-dir", h.stateDir,
+	code, _, stderr := run(t, "copy", "--verify", "size", "--state-dir", h.stateDir,
 		"--large-threshold", "1KiB", h.src, "user@host:"+h.remoteDir)
 	if code != ExitOK {
 		t.Fatalf("sync exit = %d, stderr:\n%s", code, stderr)

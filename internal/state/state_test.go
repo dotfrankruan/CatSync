@@ -217,6 +217,15 @@ func TestResumable(t *testing.T) {
 	if r.Resumable() {
 		t.Error("run with only completed work is resumable")
 	}
+	r.Config.Mirror = true
+	r.MirrorReconciled = false
+	if !r.Resumable() {
+		t.Error("failed mirror run awaiting reconciliation is not resumable")
+	}
+	r.MirrorReconciled = true
+	if r.Resumable() {
+		t.Error("fully reconciled mirror with completed work is resumable")
+	}
 	r.Status = state.StatusCompleted
 	r.Tasks[0].Status = state.StatusPending
 	if r.Resumable() {

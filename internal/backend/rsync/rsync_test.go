@@ -48,6 +48,55 @@ func TestCommandGolden(t *testing.T) {
 	}
 }
 
+func TestMirrorCommandGolden(t *testing.T) {
+	cfg := MirrorConfig{SourceDir: "/srv/source", Dest: testDest()}
+	argv, err := cfg.Command()
+	if err != nil {
+		t.Fatalf("Command: %v", err)
+	}
+	want := []string{
+		"rsync", "--archive", "--checksum", "--hard-links", "--acls", "--xattrs", "--delete-delay", "--partial",
+		"--partial-dir=.catsync-rsync-partial", "-e", "ssh", "--",
+		"/srv/source/", "alice@example.com:/data",
+	}
+	if !reflect.DeepEqual(argv, want) {
+		t.Errorf("argv mismatch:\n got %#v\nwant %#v", argv, want)
+	}
+}
+
+func TestMirrorCommandDryRunIsItemized(t *testing.T) {
+	cfg := MirrorConfig{SourceDir: "/srv/source", Dest: testDest(), DryRun: true}
+	argv, err := cfg.Command()
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(argv, "\x00")
+	for _, want := range []string{"--dry-run", "--itemize-changes", "--checksum", "--delete-delay"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("mirror dry-run lacks %s: %#v", want, argv)
+		}
+	}
+}
+
+func TestMirrorCommandDownloadGolden(t *testing.T) {
+	cfg := MirrorConfig{
+		Direction: target.RemoteToLocal, SourceDir: "/srv/download",
+		Dest: target.Destination{User: "alice", Host: "example.com", Path: "/remote source"},
+		SSH:  backend.SSH{IPv6: true},
+	}
+	argv, err := cfg.Command()
+	if err != nil {
+		t.Fatalf("Command: %v", err)
+	}
+	wantTail := []string{"-e", "ssh -6", "--", "alice@example.com:/remote source/", "/srv/download/"}
+	if !reflect.DeepEqual(argv[len(argv)-len(wantTail):], wantTail) {
+		t.Errorf("tail = %#v, want %#v", argv[len(argv)-len(wantTail):], wantTail)
+	}
+	if !strings.Contains(strings.Join(argv, "\x00"), "--delete-delay") {
+		t.Errorf("mirror argv lacks delayed deletion: %#v", argv)
+	}
+}
+
 func TestCommandDownloadGolden(t *testing.T) {
 	cfg := validConfig()
 	cfg.Direction = target.RemoteToLocal

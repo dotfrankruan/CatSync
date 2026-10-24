@@ -9,7 +9,10 @@
 //	      --files-from=- --from0 [--dry-run] -e <ssh transport> \
 //	      -- <source-root>/ <destination-root>/
 //
-// --whole-file, --inplace, and --delete are never emitted. File names travel
+// The per-file Config never emits --whole-file, --inplace, or --delete.
+// MirrorConfig is a separate, explicit whole-tree reconciliation used only by
+// the `sync` command after all ordinary transfer stages succeed; it uses
+// --delete-delay so removals happen after successful transfer work. File names travel
 // as NUL-delimited standard-input data, not as arguments, so spaces,
 // newlines, quotes, Unicode, and leading dashes are all safe; every path is
 // validated as a clean relative path first. The SSH transport is a fixed
@@ -203,4 +206,78 @@ func withTrailingSlash(dir string) string {
 		return dir
 	}
 	return dir + "/"
+}
+
+// MirrorConfig describes the explicit whole-tree archive reconciliation used
+// by `catsync sync`. Unlike Config, it intentionally permits destination
+// deletion. Callers must run it only after all preceding transfer stages have
+// succeeded; --delete-delay defers removals until rsync finishes its transfer
+// work.
+type MirrorConfig struct {
+	Program   string
+	Direction target.Direction
+	SourceDir string
+	Dest      target.Destination
+	SSH       backend.SSH
+	DryRun    bool
+	Env       []string
+	Stdout    io.Writer
+	Stderr    io.Writer
+}
+
+// Command validates and builds a full-tree mirror command.
+func (c *MirrorConfig) Command() ([]string, error) {
+	base := Config{
+		Program: c.Program, Direction: c.Direction, SourceDir: c.SourceDir,
+		Dest: c.Dest, SSH: c.SSH, PartialDir: DefaultPartialDir,
+	}
+	// Reuse endpoint and transport validation without using the resulting
+	// file-list command.
+	if _, _, err := base.Command(); err != nil {
+		return nil, err
+	}
+	program := c.Program
+	if program == "" {
+		program = "rsync"
+	}
+	args := []string{
+		program,
+		"--archive",
+		"--checksum",
+		"--hard-links",
+		"--acls",
+		"--xattrs",
+		"--delete-delay",
+		"--partial",
+		"--partial-dir=" + DefaultPartialDir,
+	}
+	if c.DryRun {
+		args = append(args, "--dry-run", "--itemize-changes")
+	}
+	args = append(args, "-e", c.SSH.RsyncTransport(), "--")
+	direction := c.Direction
+	if direction == "" {
+		direction = target.LocalToRemote
+	}
+	if direction == target.RemoteToLocal {
+		args = append(args, remoteWithTrailingSlash(c.Dest), withTrailingSlash(c.SourceDir))
+	} else {
+		args = append(args, withTrailingSlash(c.SourceDir), c.Dest.String())
+	}
+	return args, nil
+}
+
+// Run executes the full-tree mirror reconciliation.
+func (c *MirrorConfig) Run(ctx context.Context) error {
+	argv, err := c.Command()
+	if err != nil {
+		return err
+	}
+	if err := process.Run(ctx, process.Spec{
+		Name: argv[0], Args: argv[1:], Env: c.Env,
+		Stdout: c.Stdout, Stderr: c.Stderr,
+	}); err != nil {
+		return fmt.Errorf("rsync mirror: %w", err)
+	}
+	return nil
 }
