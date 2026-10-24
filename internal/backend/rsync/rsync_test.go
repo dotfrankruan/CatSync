@@ -1,6 +1,7 @@
 package rsync
 
 import (
+	"bytes"
 	"reflect"
 	"strings"
 	"testing"
@@ -75,6 +76,27 @@ func TestMirrorCommandDryRunIsItemized(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Errorf("mirror dry-run lacks %s: %#v", want, argv)
 		}
+	}
+}
+
+func TestProgressWriterReportsDeltasAndForwardsOtherOutput(t *testing.T) {
+	var deltas []uint64
+	var forwarded bytes.Buffer
+	w := &progressWriter{forward: &forwarded, report: func(n uint64) { deltas = append(deltas, n) }}
+	for _, part := range []string{
+		"file.txt\n  1,024  25%  1.0MB/s 0:00:01\r  2,",
+		"048  50%  2.0MB/s 0:00:01\r", "done\n",
+	} {
+		if _, err := w.Write([]byte(part)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w.Flush()
+	if !reflect.DeepEqual(deltas, []uint64{1024, 1024}) {
+		t.Fatalf("deltas = %#v", deltas)
+	}
+	if got := forwarded.String(); got != "file.txt\ndone\n" {
+		t.Fatalf("forwarded = %q", got)
 	}
 }
 

@@ -38,6 +38,7 @@ import (
 	"github.com/dotfrankruan/CatSync/internal/discovery"
 	"github.com/dotfrankruan/CatSync/internal/planner"
 	"github.com/dotfrankruan/CatSync/internal/process"
+	progressui "github.com/dotfrankruan/CatSync/internal/progress"
 	"github.com/dotfrankruan/CatSync/internal/state"
 	"github.com/dotfrankruan/CatSync/internal/target"
 )
@@ -126,6 +127,11 @@ type Config struct {
 	// Stdout and Stderr receive progress and diagnostics; nil discards.
 	Stdout io.Writer
 	Stderr io.Writer
+	// Progress enables aggregate transfer progress on Stderr.
+	Progress bool
+	// ProgressTerminal selects a single-line terminal redraw; false emits
+	// periodic newline snapshots suitable for redirected logs.
+	ProgressTerminal bool
 }
 
 // validateFull checks a Sync configuration.
@@ -208,11 +214,12 @@ func (w *lockedWriter) Write(p []byte) (int, error) {
 
 // Executor carries one run's shared machinery.
 type Executor struct {
-	cfg    Config
-	progs  Programs
-	store  *state.Store
-	stdout io.Writer
-	stderr io.Writer
+	cfg      Config
+	progs    Programs
+	store    *state.Store
+	stdout   io.Writer
+	stderr   io.Writer
+	progress *progressui.Reporter
 
 	// run is the active run document. runMu serializes task transitions
 	// and saves so concurrent mscp workers never corrupt the document.
@@ -256,11 +263,47 @@ func newExecutor(cfg Config) (*Executor, error) {
 }
 
 func (e *Executor) logf(format string, args ...any) {
+	if e.progress != nil {
+		e.progress.Clear()
+		defer e.progress.Redraw()
+	}
 	fmt.Fprintf(e.stdout, format+"\n", args...)
 }
 
 func (e *Executor) warnf(format string, args ...any) {
+	if e.progress != nil {
+		e.progress.Clear()
+		defer e.progress.Redraw()
+	}
 	fmt.Fprintf(e.stderr, "catsync: "+format+"\n", args...)
+}
+
+func (e *Executor) startProgress() {
+	if !e.cfg.Progress || e.run == nil || e.progress != nil {
+		return
+	}
+	var total uint64
+	for _, task := range e.run.Tasks {
+		switch task.Status {
+		case state.StatusPending, state.StatusFailed, state.StatusRunning:
+			if task.Size > 0 {
+				total += uint64(task.Size)
+			}
+		}
+	}
+	e.progress = progressui.New(e.stderr, total, e.cfg.ProgressTerminal)
+}
+
+func (e *Executor) addProgress(n uint64) {
+	if e.progress != nil {
+		e.progress.Add(n)
+	}
+}
+
+func (e *Executor) progressPhase(phase string) {
+	if e.progress != nil {
+		e.progress.Phase(phase)
+	}
 }
 
 // detectTools probes the configured programs for availability.
@@ -705,6 +748,7 @@ func syncWith(ctx context.Context, cfg Config, prepare func(*Executor)) (*state.
 		e.logf("run %s: dry run complete; no data was transferred", run.ID)
 		return run, nil
 	}
+	e.startProgress()
 	if cfg.direction() == target.RemoteToLocal {
 		if err := os.MkdirAll(cfg.SourceDir, 0o755); err != nil {
 			return run, fmt.Errorf("executor: create local destination: %w", err)
@@ -805,6 +849,7 @@ func resumeWith(ctx context.Context, cfg Config, id string, prepare func(*Execut
 		return run, err
 	}
 	e.logf("run %s: resuming", run.ID)
+	e.startProgress()
 	err = e.execute(ctx)
 	return run, err
 }
@@ -844,7 +889,12 @@ func (e *Executor) latestResumable() (*state.Run, error) {
 // execute runs the transfer stages sequentially, then verification, then
 // finalization. Stages are sequential so a destination path never has
 // concurrent writers.
-func (e *Executor) execute(ctx context.Context) error {
+func (e *Executor) execute(ctx context.Context) (retErr error) {
+	defer func() {
+		if e.progress != nil {
+			e.progress.Finish(retErr == nil)
+		}
+	}()
 	var errs []string
 	stages := []struct {
 		name string
@@ -855,6 +905,7 @@ func (e *Executor) execute(ctx context.Context) error {
 		{"rsync", e.rsyncStage},
 	}
 	for _, st := range stages {
+		e.progressPhase(st.name)
 		if err := st.fn(ctx); err != nil {
 			if ctx.Err() != nil {
 				ctxErr := fmt.Errorf("executor: %s stage: %w", st.name, ctx.Err())
@@ -870,6 +921,7 @@ func (e *Executor) execute(ctx context.Context) error {
 	// Deletion is a commit-like final reconciliation: never run it after a
 	// failed transfer stage. Copy runs do not enter this stage at all.
 	if len(errs) == 0 && e.run.Config.Mirror {
+		e.progressPhase("mirror-reconcile")
 		if err := e.mirrorStage(ctx); err != nil {
 			if ctx.Err() != nil {
 				ctxErr := fmt.Errorf("executor: mirror stage: %w", ctx.Err())
@@ -882,6 +934,7 @@ func (e *Executor) execute(ctx context.Context) error {
 			e.warnf("%s", errs[len(errs)-1])
 		}
 	}
+	e.progressPhase("verification")
 	if err := e.verifyStage(ctx); err != nil {
 		if ctx.Err() != nil {
 			ctxErr := fmt.Errorf("executor: verification: %w", ctx.Err())

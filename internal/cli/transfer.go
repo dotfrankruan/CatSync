@@ -23,21 +23,42 @@ func (o *Options) executorConfig(transfer target.Transfer, stdout, stderr io.Wri
 		execOut = nil
 	}
 	return executor.Config{
-		Direction:      transfer.Direction,
-		SourceDir:      transfer.LocalPath,
-		Dest:           transfer.Remote,
-		Backend:        state.Backend(o.Backend),
-		DryRun:         o.DryRun,
-		IPv6:           o.IPv6,
-		Verify:         o.Verify,
-		Jobs:           o.Jobs,
-		Streams:        o.Streams,
-		LargeThreshold: uint64(o.LargeThreshold),
-		StateDir:       o.StateDir,
-		Programs:       programsFromEnv(),
-		Stdout:         execOut,
-		Stderr:         stderr,
+		Direction:        transfer.Direction,
+		SourceDir:        transfer.LocalPath,
+		Dest:             transfer.Remote,
+		Backend:          state.Backend(o.Backend),
+		DryRun:           o.DryRun,
+		IPv6:             o.IPv6,
+		Verify:           o.Verify,
+		Jobs:             o.Jobs,
+		Streams:          o.Streams,
+		LargeThreshold:   uint64(o.LargeThreshold),
+		StateDir:         o.StateDir,
+		Programs:         programsFromEnv(),
+		Stdout:           execOut,
+		Stderr:           stderr,
+		Progress:         progressEnabled(o.Progress, o.Quiet, stderr),
+		ProgressTerminal: progressTerminal(o.Progress, o.Quiet, stderr),
 	}
+}
+
+func progressEnabled(mode string, quiet bool, w io.Writer) bool {
+	if quiet || mode == "never" {
+		return false
+	}
+	return mode == "always" || progressTerminal(mode, quiet, w)
+}
+
+func progressTerminal(mode string, quiet bool, w io.Writer) bool {
+	if quiet || mode == "never" {
+		return false
+	}
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
 
 // programsFromEnv reads the CATSYNC_<TOOL> program overrides for the
@@ -129,10 +150,12 @@ func runResume(ctx context.Context, opts *Options, id string, stdout, stderr io.
 		execOut = nil
 	}
 	cfg := executor.Config{
-		StateDir: opts.StateDir,
-		Programs: programsFromEnv(),
-		Stdout:   execOut,
-		Stderr:   stderr,
+		StateDir:         opts.StateDir,
+		Programs:         programsFromEnv(),
+		Stdout:           execOut,
+		Stderr:           stderr,
+		Progress:         progressEnabled(opts.Progress, opts.Quiet, stderr),
+		ProgressTerminal: progressTerminal(opts.Progress, opts.Quiet, stderr),
 	}
 	run, err := executor.Resume(ctx, cfg, id)
 	if err != nil {

@@ -43,6 +43,9 @@ type CopyOptions struct {
 	// error means the completion was not recorded, a later resume may
 	// safely rewrite the chunk. Nil is allowed.
 	OnComplete func(Chunk) error
+	// OnProgress receives successful write byte deltas. It is diagnostic
+	// only, may be called concurrently, and must not block transfer work.
+	OnProgress func(uint64)
 }
 
 // Copy copies every chunk of the plan that is not in opts.Completed from
@@ -160,7 +163,7 @@ func Copy(ctx context.Context, src io.ReaderAt, dst io.WriterAt, size uint64, ch
 					if workCtx.Err() != nil {
 						return
 					}
-					if err := copyChunkRange(workCtx, src, dst, j.chunk, buf); err != nil {
+					if err := copyChunkRange(workCtx, src, dst, j.chunk, buf, opts.OnProgress); err != nil {
 						// A worker torn down by a sibling's failure or by
 						// caller cancellation reports no error; the real
 						// cause is recorded by its originator or by the
@@ -239,7 +242,7 @@ func Copy(ctx context.Context, src io.ReaderAt, dst io.WriterAt, size uint64, ch
 // at c.Offset, using buf as scratch. Every destination write stays inside
 // [c.Offset, c.Offset+c.Length). Short reads and short writes are retried;
 // zero progress without an error and premature EOF are failures.
-func copyChunkRange(ctx context.Context, src io.ReaderAt, dst io.WriterAt, c Chunk, buf []byte) error {
+func copyChunkRange(ctx context.Context, src io.ReaderAt, dst io.WriterAt, c Chunk, buf []byte, onProgress func(uint64)) error {
 	off := c.Offset
 	remaining := c.Length
 	for remaining > 0 {
@@ -282,6 +285,9 @@ func copyChunkRange(ctx context.Context, src io.ReaderAt, dst io.WriterAt, c Chu
 				return fmt.Errorf("multistream: chunk %d: negative write count %d at %d", c.Index, wn, off+uint64(written))
 			}
 			written += wn
+			if onProgress != nil && wn > 0 {
+				onProgress(uint64(wn))
+			}
 			if werr != nil {
 				return fmt.Errorf("multistream: chunk %d: write at %d: %w", c.Index, off+uint64(written), werr)
 			}

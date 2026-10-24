@@ -27,7 +27,9 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/dotfrankruan/CatSync/internal/backend"
 	"github.com/dotfrankruan/CatSync/internal/discovery"
@@ -80,6 +82,9 @@ type Config struct {
 	// Stdout and Stderr receive rsync's output; nil discards it.
 	Stdout io.Writer
 	Stderr io.Writer
+	// Progress receives successful-byte deltas parsed from rsync progress2.
+	// When set, Command enables machine-stable progress output.
+	Progress func(uint64)
 }
 
 // Command validates the configuration and returns the argument vector
@@ -153,6 +158,9 @@ func (c *Config) Command() (argv []string, stdin []byte, err error) {
 	if c.NoImpliedDirs {
 		args = append(args, "--no-implied-dirs")
 	}
+	if c.Progress != nil {
+		args = append(args, "--info=progress2", "--outbuf=L")
+	}
 	if c.DryRun {
 		args = append(args, "--dry-run")
 	}
@@ -186,17 +194,79 @@ func (c *Config) Run(ctx context.Context) error {
 	if len(c.Paths) == 0 {
 		return nil
 	}
+	stdout := c.Stdout
+	var pw *progressWriter
+	if c.Progress != nil {
+		pw = &progressWriter{forward: c.Stdout, report: c.Progress}
+		stdout = pw
+		defer pw.Flush()
+	}
 	if err := process.Run(ctx, process.Spec{
 		Name:   argv[0],
 		Args:   argv[1:],
 		Env:    c.Env,
 		Stdin:  bytes.NewReader(stdin),
-		Stdout: c.Stdout,
+		Stdout: stdout,
 		Stderr: c.Stderr,
 	}); err != nil {
 		return fmt.Errorf("rsync: %w", err)
 	}
 	return nil
+}
+
+// progressWriter consumes rsync --info=progress2 carriage-return records,
+// reports monotonic byte deltas, and forwards non-progress output.
+type progressWriter struct {
+	mu      sync.Mutex
+	buf     strings.Builder
+	last    uint64
+	forward io.Writer
+	report  func(uint64)
+}
+
+func (w *progressWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, b := range p {
+		if b == '\r' || b == '\n' {
+			w.consume(w.buf.String(), b)
+			w.buf.Reset()
+			continue
+		}
+		w.buf.WriteByte(b)
+	}
+	return len(p), nil
+}
+
+func (w *progressWriter) Flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.buf.Len() > 0 {
+		w.consume(w.buf.String(), '\n')
+		w.buf.Reset()
+	}
+}
+
+func (w *progressWriter) consume(line string, delimiter byte) {
+	fields := strings.Fields(line)
+	if len(fields) >= 2 && strings.HasSuffix(fields[1], "%") {
+		n, err := strconv.ParseUint(strings.ReplaceAll(fields[0], ",", ""), 10, 64)
+		if err == nil {
+			if n > w.last && w.report != nil {
+				w.report(n - w.last)
+			}
+			if n > w.last {
+				w.last = n
+			}
+			return
+		}
+	}
+	if w.forward != nil {
+		fmt.Fprint(w.forward, line)
+		if delimiter != 0 {
+			fmt.Fprintf(w.forward, "%c", delimiter)
+		}
+	}
 }
 
 // withTrailingSlash appends the slash marking the source as the directory
@@ -223,6 +293,7 @@ type MirrorConfig struct {
 	Env       []string
 	Stdout    io.Writer
 	Stderr    io.Writer
+	Progress  func(uint64)
 }
 
 // Command validates and builds a full-tree mirror command.
@@ -254,6 +325,9 @@ func (c *MirrorConfig) Command() ([]string, error) {
 	if c.DryRun {
 		args = append(args, "--dry-run", "--itemize-changes")
 	}
+	if c.Progress != nil {
+		args = append(args, "--info=progress2", "--outbuf=L")
+	}
 	args = append(args, "-e", c.SSH.RsyncTransport(), "--")
 	direction := c.Direction
 	if direction == "" {
@@ -273,9 +347,15 @@ func (c *MirrorConfig) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	stdout := c.Stdout
+	if c.Progress != nil {
+		pw := &progressWriter{forward: c.Stdout, report: c.Progress}
+		defer pw.Flush()
+		stdout = pw
+	}
 	if err := process.Run(ctx, process.Spec{
 		Name: argv[0], Args: argv[1:], Env: c.Env,
-		Stdout: c.Stdout, Stderr: c.Stderr,
+		Stdout: stdout, Stderr: c.Stderr,
 	}); err != nil {
 		return fmt.Errorf("rsync mirror: %w", err)
 	}

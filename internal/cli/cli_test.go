@@ -139,6 +139,24 @@ func TestVerificationDefaultsAndValidation(t *testing.T) {
 	}
 }
 
+func TestProgressDefaultsAndValidation(t *testing.T) {
+	if got := defaultOptions().Progress; got != "auto" {
+		t.Fatalf("default progress = %q, want auto", got)
+	}
+	for _, mode := range []string{"auto", "always", "never"} {
+		opts := defaultOptions()
+		opts.Progress = mode
+		if err := opts.Validate(); err != nil {
+			t.Errorf("progress mode %q rejected: %v", mode, err)
+		}
+	}
+	opts := defaultOptions()
+	opts.Progress = "sometimes"
+	if err := opts.Validate(); err == nil || !strings.Contains(err.Error(), "--progress") {
+		t.Fatalf("invalid progress = %v", err)
+	}
+}
+
 func TestStateCommandsRejectExtraOperands(t *testing.T) {
 	for _, name := range []string{"resume", "status"} {
 		code, _, _ := run(t, name, "one", "two")

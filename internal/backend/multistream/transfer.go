@@ -55,6 +55,8 @@ type TransferOptions struct {
 	// OnChunkComplete is an optional progress hook invoked after each
 	// chunk's checkpoint save.
 	OnChunkComplete func(done, total int)
+	// OnProgress receives successful transferred-byte deltas.
+	OnProgress func(uint64)
 	// ExpectedRemote, when non-nil, binds a fresh remote-to-local download
 	// to the size and nanosecond mtime observed by the planner. Uploads and
 	// resume (which is bound by its checkpoint) ignore this field.
@@ -321,8 +323,9 @@ func copyAndPublish(ctx context.Context, sourceAbs string, size uint64, mtime ti
 		return fmt.Errorf("multistream: open source: %w", err)
 	}
 	copyErr := Copy(ctx, src, pool, size, chunks, CopyOptions{
-		Workers:   opts.Workers,
-		Completed: ckpt.CompletedSet(),
+		Workers:    opts.Workers,
+		Completed:  ckpt.CompletedSet(),
+		OnProgress: opts.OnProgress,
 		OnComplete: func(chunk Chunk) error {
 			// Durability first: the chunk's bytes must be fsync'd on the
 			// server before the checkpoint may claim them.

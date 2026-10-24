@@ -26,6 +26,8 @@ type Options struct {
 	Verbose bool
 	// Quiet suppresses non-error output.
 	Quiet bool
+	// Progress controls progress rendering: auto, always, or never.
+	Progress string
 	// IPv6 restricts backend tools to IPv6.
 	IPv6 bool
 	// StateDir holds run state used by resume and status.
@@ -45,6 +47,7 @@ type Options struct {
 func defaultOptions() Options {
 	return Options{
 		Backend:        "auto",
+		Progress:       "auto",
 		StateDir:       defaultStateDir(),
 		Verify:         "auto",
 		Jobs:           4,
@@ -74,6 +77,7 @@ func (o *Options) bindSharedFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&o.DryRun, "dry-run", o.DryRun, "plan and report without transferring data")
 	fs.BoolVar(&o.Verbose, "verbose", o.Verbose, "increase output detail")
 	fs.BoolVar(&o.Quiet, "quiet", o.Quiet, "suppress non-error output")
+	fs.StringVar(&o.Progress, "progress", o.Progress, "progress display: auto, always, or never")
 	fs.BoolVar(&o.IPv6, "ipv6", o.IPv6, "restrict backend tools to IPv6")
 	fs.StringVar(&o.StateDir, "state-dir", o.StateDir, "directory holding catsync run state")
 	fs.StringVar(&o.Verify, "verify", o.Verify, "completion verification: auto, none, size, or sha256")
@@ -86,6 +90,11 @@ func (o *Options) bindSharedFlags(fs *flag.FlagSet) {
 func (o *Options) validateOutput() error {
 	if o.Quiet && o.Verbose {
 		return errors.New("--quiet and --verbose cannot be used together")
+	}
+	switch o.Progress {
+	case "auto", "always", "never":
+	default:
+		return fmt.Errorf("--progress %q is not valid: want auto, always, or never", o.Progress)
 	}
 	if strings.TrimSpace(o.StateDir) == "" {
 		return errors.New("--state-dir must not be empty")

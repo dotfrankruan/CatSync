@@ -207,6 +207,31 @@ func TestCopyMultiChunkContent(t *testing.T) {
 	checkWritesWithinChunks(t, chunks, dst.ops())
 }
 
+func TestCopyProgressReportsExactWrittenBytes(t *testing.T) {
+	const size = uint64(700000)
+	reader := &testReader{data: patternBytes(size)}
+	writer := newWriter(size)
+	chunks := mustPlan(t, size, 200000)
+	var mu sync.Mutex
+	var reported uint64
+	err := Copy(context.Background(), reader, writer, size, chunks, CopyOptions{
+		Workers: 3,
+		OnProgress: func(n uint64) {
+			mu.Lock()
+			reported += n
+			mu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if reported != size {
+		t.Fatalf("reported bytes = %d, want %d", reported, size)
+	}
+}
+
 func TestCopySkipsCompletedChunks(t *testing.T) {
 	size := uint64(256)
 	chunks := mustPlan(t, size, 64)

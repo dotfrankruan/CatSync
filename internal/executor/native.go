@@ -245,6 +245,7 @@ func (e *Executor) nativeLargeDownloadTask(ctx context.Context, t *state.Task, c
 		ChunkSize:      nativeChunkSize,
 		CheckpointPath: checkpoint,
 		ExpectedRemote: &multistream.RemoteIdentity{Size: uint64(t.Size), ModTime: t.ModTime},
+		OnProgress:     e.addProgress,
 	}
 	if err := e.markRunning(t); err != nil {
 		return err
@@ -451,6 +452,7 @@ func (e *Executor) nativeLargeTask(ctx context.Context, t *state.Task, ckptDir s
 		Workers:        e.run.Config.Streams,
 		ChunkSize:      nativeChunkSize,
 		CheckpointPath: checkpoint,
+		OnProgress:     e.addProgress,
 	}
 
 	// The running intent must be durable before any remote write.

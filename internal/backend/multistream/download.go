@@ -149,7 +149,7 @@ func copyAndPublishDownload(ctx context.Context, remoteSource string, mode os.Fi
 		return err
 	}
 	copyErr := Copy(ctx, readers, local, ckpt.Size, chunks, CopyOptions{
-		Workers: opts.Workers, Completed: ckpt.CompletedSet(),
+		Workers: opts.Workers, Completed: ckpt.CompletedSet(), OnProgress: opts.OnProgress,
 		OnComplete: func(chunk Chunk) error {
 			if err := local.Sync(); err != nil {
 				return fmt.Errorf("multistream: sync local chunk %d: %w", chunk.Index, err)

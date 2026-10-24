@@ -218,6 +218,7 @@ func runStateCommand(name string, args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&opts.StateDir, "state-dir", opts.StateDir, "directory holding catsync run state")
 	fs.BoolVar(&opts.Verbose, "verbose", false, "increase output detail")
 	fs.BoolVar(&opts.Quiet, "quiet", false, "suppress non-error output")
+	fs.StringVar(&opts.Progress, "progress", opts.Progress, "progress display: auto, always, or never")
 	operands, code, ok := splitArgs(fs, args)
 	if !ok {
 		return code

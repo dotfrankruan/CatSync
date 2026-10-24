@@ -201,6 +201,25 @@ func TestCLISyncEndToEnd(t *testing.T) {
 	}
 }
 
+func TestCLIProgressAlwaysReportsSpeedAndTimes(t *testing.T) {
+	h := newCLIHarness(t)
+	h.writeSrc("small.txt", 10)
+	post := h.writeManifest("post", h.record("small.txt"))
+	h.scriptFreshDestSSH(post)
+	progressOut := h.writeManifest("rsync-progress", "  10  100%  1.0kB/s 0:00:00\r\n")
+	h.writeScript("rsync", "stdout_file="+progressOut+"\nexit=0\n")
+	code, _, stderr := run(t, "copy", "--progress", "always", "--verify", "none",
+		"--state-dir", h.stateDir, h.src, "user@host:"+h.remoteDir)
+	if code != ExitOK {
+		t.Fatalf("copy exit = %d, stderr:\n%s", code, stderr)
+	}
+	for _, want := range []string{"Current Speed", "Elapsed", "ETA", "ETD", "completed"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("progress output lacks %q:\n%s", want, stderr)
+		}
+	}
+}
+
 func TestCLIRemoteToLocalRsyncRouting(t *testing.T) {
 	h := newCLIHarness(t)
 	download := filepath.Join(t.TempDir(), "download")

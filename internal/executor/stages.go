@@ -319,6 +319,7 @@ func (e *Executor) runSmallBatch(ctx, stageCtx context.Context, batch partition.
 		Env:           e.cfg.Env,
 		Stdout:        &stdout,
 		Stderr:        &stderr,
+		Progress:      e.addProgress,
 	}
 	if err := cfg.Run(stageCtx); err != nil {
 		out.stderr = stderr.String()
@@ -505,6 +506,7 @@ func (e *Executor) rsyncStage(ctx context.Context) error {
 		Env:       e.cfg.Env,
 		Stdout:    e.stdout,
 		Stderr:    e.stderr,
+		Progress:  e.addProgress,
 	}
 	if e.run.Config.Direction.Effective() == state.DirectionRemoteToLocal {
 		cfg.NoImpliedDirs = true
@@ -566,7 +568,7 @@ func (e *Executor) mirrorStage(ctx context.Context) error {
 		Program: e.progs.rsync(), Direction: e.transferDirection(),
 		SourceDir: e.localRoot(), Dest: e.destTarget(),
 		SSH: e.sshOpts(e.run.Config.IPv6), Env: e.cfg.Env,
-		Stdout: e.stdout, Stderr: e.stderr,
+		Stdout: e.stdout, Stderr: e.stderr, Progress: e.addProgress,
 	}
 	if err := cfg.Run(ctx); err != nil {
 		return err
