@@ -432,6 +432,27 @@ func TestMirrorFailureWithCompletedTasksRemainsResumable(t *testing.T) {
 	}
 }
 
+func TestMirrorPromotesMetadataSkippedTaskToCompleted(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("same-meta.txt", 5)
+	manifest := h.writeManifest("dest", manifestContent(h.newFileRecord("same-meta.txt")))
+	h.writeScript("ssh", "match=if [ -d\nstdout_file="+manifest+"\n")
+	h.writeScript("rsync", "match=--delete-delay\nexit=0\n")
+	cfg := h.config()
+	cfg.Mirror = true
+	cfg.Verify = state.VerifyNone
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Sync mirror: %v", err)
+	}
+	if got := run.Tasks[0].Status; got != state.StatusCompleted {
+		t.Fatalf("metadata-skipped task after checksum mirror = %s, want completed", got)
+	}
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 1 {
+		t.Fatalf("rsync invocations = %d, want mirror only", got)
+	}
+}
+
 func TestSyncNativeRemoteToLocalLargeFile(t *testing.T) {
 	if !mockexec.SFTPServerAvailable() {
 		t.Skip("real sftp-server is unavailable")

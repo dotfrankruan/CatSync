@@ -583,7 +583,7 @@ func (e *Executor) mirrorStage(ctx context.Context) error {
 	var changed []priorTask
 	e.runMu.Lock()
 	for i := range e.run.Tasks {
-		if e.run.Tasks[i].Status == state.StatusUnsupported {
+		if e.run.Tasks[i].Status == state.StatusUnsupported || e.run.Tasks[i].Status == state.StatusSkipped {
 			changed = append(changed, priorTask{i, e.run.Tasks[i].Status, e.run.Tasks[i].Error})
 			e.run.Tasks[i].Status = state.StatusCompleted
 			e.run.Tasks[i].Error = ""

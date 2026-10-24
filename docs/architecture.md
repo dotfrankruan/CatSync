@@ -177,6 +177,8 @@ reported for `copy`. A successful full-tree `sync` reconciliation owns them
 through rsync and atomically changes their task status to completed; if rsync
 cannot reproduce them, reconciliation fails and the run never claims an exact
 mirror.
+Metadata-skipped regular files are likewise promoted to completed after the
+checksum reconciliation proves or repairs their contents.
 
 A task is completed only after subprocess success, unchanged-source checks,
 and requested verification. On startup, `running` becomes `pending` with an

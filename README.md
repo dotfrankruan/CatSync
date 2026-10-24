@@ -203,6 +203,10 @@ plan. If that reconciliation succeeds they are recorded completed; if rsync
 cannot reproduce one because of platform or privilege limits, the entire sync
 fails instead of claiming an exact mirror.
 
+Files initially marked `skipped` because size and mtime matched are also
+promoted to `completed` after a successful checksum reconciliation: sync has
+then content-checked the full tree rather than trusting the planning hint.
+
 Size and mtime are planning *hints*, not proof of content equality; the
 verification stage is the completion gate. Forced backends must preserve
 the safety policy: `--backend mscp` rejects files that exist at the
