@@ -140,7 +140,7 @@ Prints the version.
 | --- | --- | --- |
 | `--backend` | `auto` | `auto`, `fpsync` (native parallel-rsync; does not invoke fpsync/fpart), `mscp` (native multistream; never invokes external mscp), or `rsync` |
 | `--dry-run` | off | plan and persist the run, transfer nothing |
-| `--verify` | `size` | `none` or `size` (`sha256` is not implemented, see below) |
+| `--verify` | `auto` | `auto`, `none`, `size`, or `sha256` (see verification policy below) |
 | `--jobs` | 4 | max concurrent rsync batches (small-file stage) or concurrent large-file transfers |
 | `--streams` | 4 | SFTP sessions per large-file transfer |
 | `--large-threshold` | `512MiB` | size at or above which a file counts as large |
@@ -315,12 +315,26 @@ stay enabled), never `--inplace` (atomic rename into place stays enabled).
 
 - `--verify none`: a task completes when its backend exits zero and the
   source file is unchanged before and after the transfer.
-- `--verify size` (default): after all stages, CatSync scans the receiving
+- `--verify size`: after all stages, CatSync scans the receiving
   side (one remote manifest for uploads, one local walk for downloads) and
   compares every transferred file's size with the source size. A mismatch
   fails the task and the run. **Size equality is not content proof.**
-- `--verify sha256`: **not implemented in this MVP.** It fails fast with a
-  clear error instead of silently degrading to a size check.
+- `--verify auto` (default): first performs the size check, then asks the
+  remote endpoint to compute SHA-256 using the first available utility from
+  `sha256sum`, `shasum`, `openssl`, or `busybox sha256sum`; CatSync computes
+  the local endpoint's digest itself and compares the two. If the remote has
+  none of those tools, the run is allowed to complete using size verification
+  only and prints a prominent warning **after** the completion line saying
+  that content verification was not performed and that an administrator must
+  install a supported remote utility to enable it.
+- `--verify sha256`: uses the same size-then-SHA-256 gate, but fails the run
+  when the remote endpoint has no supported SHA-256 utility.
+
+CatSync never downloads a remote file to hash it locally. Remote content is
+read only by the remote hashing utility, and SSH returns only NUL-delimited
+path/digest records. There is intentionally no readback fallback: install one
+of the supported utilities on the remote endpoint if content verification is
+required.
 
 ## Examples
 
@@ -453,7 +467,11 @@ CatSync never runs or probes those tools.
   non-empty.
 - **Manifest buffering**: the remote manifest is buffered in memory during
   collection (tens of bytes per remote file).
-- **sha256 verification** is not implemented in this MVP.
+- **Hash-tool availability**: default `--verify auto` falls back to size-only
+  verification when the remote endpoint has no supported SHA-256 utility and
+  prints a prominent post-completion warning. Use `--verify sha256` when this
+  absence must fail the run. CatSync never downloads remote file contents as
+  a verification fallback.
 - Remote endpoints must run a POSIX shell and GNU findutils. Upload
   destination-manifest failure has a conservative rsync-only fallback;
   remote source discovery for a download cannot safely fall back and fails.

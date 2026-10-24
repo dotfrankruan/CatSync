@@ -58,7 +58,13 @@ temporary-file plus rename and a destination lock prevents overlapping runs.
    `--files-from` lists. Then run native multistream new-large-file tasks
    (checkpoint per chunk, exclusive temp, hardlink publish), then the rsync
    conservative/delta stage.
-5. Verify successful tasks and atomically save their terminal state.
+5. Verify successful tasks and atomically save their terminal state. The
+   default `auto` policy always checks size, then compares SHA-256 digests when
+   the remote endpoint provides `sha256sum`, `shasum`, `openssl`, or BusyBox.
+   If none is installed, it completes with size verification and emits a
+   prominent warning after the completion line. Strict `sha256` mode fails
+   instead. The remote utility reads remote content and returns only digest
+   records; CatSync never downloads remote files as a hashing fallback.
 
 If remote manifest collection fails, auto mode routes all regular files to
 rsync. Forced backends fail when they cannot preserve the safety policy.

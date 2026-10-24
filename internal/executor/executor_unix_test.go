@@ -460,8 +460,8 @@ func TestVerifyAutoFallsBackToSizeWithFinalWarning(t *testing.T) {
 	h.scriptSSHFreshDest(post)
 	cfg := h.configNative()
 	cfg.Verify = state.VerifyAuto
-	var stdout, stderr bytes.Buffer
-	cfg.Stdout, cfg.Stderr = &stdout, &stderr
+	var output synchronizedBuffer
+	cfg.Stdout, cfg.Stderr = &output, &output
 	run, err := Sync(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Sync: %v", err)
@@ -469,14 +469,34 @@ func TestVerifyAutoFallsBackToSizeWithFinalWarning(t *testing.T) {
 	if run.Status != state.StatusCompleted {
 		t.Fatalf("run status = %s", run.Status)
 	}
+	combined := output.String()
 	for _, want := range []string{"WARNING:", "SHA-256 CONTENT VERIFICATION WAS NOT PERFORMED", "Only file-size verification", "did not download", "Install"} {
-		if !strings.Contains(stderr.String(), want) {
-			t.Errorf("final warning lacks %q:\n%s", want, stderr.String())
+		if !strings.Contains(combined, want) {
+			t.Errorf("final warning lacks %q:\n%s", want, combined)
 		}
 	}
-	if strings.Index(stderr.String(), "WAS NOT PERFORMED") < 0 || !strings.Contains(stdout.String(), "run "+run.ID+": completed") {
-		t.Fatalf("missing completion/warning output: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	completedAt := strings.Index(combined, "run "+run.ID+": completed")
+	warningAt := strings.Index(combined, "SHA-256 CONTENT VERIFICATION WAS NOT PERFORMED")
+	if completedAt < 0 || warningAt < 0 || warningAt < completedAt {
+		t.Fatalf("warning must follow the completion line:\n%s", combined)
 	}
+}
+
+type synchronizedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *synchronizedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *synchronizedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
 }
 
 func TestVerifySHA256RequiresRemoteTool(t *testing.T) {

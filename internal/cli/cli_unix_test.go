@@ -735,7 +735,8 @@ func TestCATSYNCMSCPIgnored(t *testing.T) {
 
 // TestCLIPreEpochMtimeWithSizeVerify: a pre-epoch nanosecond mtime must
 // survive the whole pipeline — manifest record parsing, the native metadata
-// command, and the final verification — with the default verify=size.
+// command, and the final verification — with an explicit size check so this
+// metadata regression test is independent of remote hash-tool availability.
 func TestCLIPreEpochMtimeWithSizeVerify(t *testing.T) {
 	h := newCLIHarness(t)
 	h.armNative()
@@ -750,8 +751,7 @@ func TestCLIPreEpochMtimeWithSizeVerify(t *testing.T) {
 	post := h.writeManifest("post", h.record("big.bin"))
 	h.scriptFreshDestSSH(post)
 
-	// No --verify flag: the default is size.
-	code, _, stderr := run(t, "sync", "--state-dir", h.stateDir,
+	code, _, stderr := run(t, "sync", "--verify", "size", "--state-dir", h.stateDir,
 		"--large-threshold", "1KiB", h.src, "user@host:"+h.remoteDir)
 	if code != ExitOK {
 		t.Fatalf("sync exit = %d, stderr:\n%s", code, stderr)
