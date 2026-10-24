@@ -248,6 +248,9 @@ func (w *progressWriter) Flush() {
 }
 
 func (w *progressWriter) consume(line string, delimiter byte) {
+	if strings.TrimSpace(line) == "" && delimiter == '\r' {
+		return
+	}
 	fields := strings.Fields(line)
 	if len(fields) >= 2 && strings.HasSuffix(fields[1], "%") {
 		n, err := strconv.ParseUint(strings.ReplaceAll(fields[0], ",", ""), 10, 64)

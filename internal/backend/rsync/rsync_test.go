@@ -84,7 +84,7 @@ func TestProgressWriterReportsDeltasAndForwardsOtherOutput(t *testing.T) {
 	var forwarded bytes.Buffer
 	w := &progressWriter{forward: &forwarded, report: func(n uint64) { deltas = append(deltas, n) }}
 	for _, part := range []string{
-		"file.txt\n  1,024  25%  1.0MB/s 0:00:01\r  2,",
+		"file.txt\n  1,024  25%  1.0MB/s 0:00:01\r\r  2,",
 		"048  50%  2.0MB/s 0:00:01\r", "done\n",
 	} {
 		if _, err := w.Write([]byte(part)); err != nil {

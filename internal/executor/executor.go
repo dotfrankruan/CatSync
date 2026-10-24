@@ -284,6 +284,12 @@ func (e *Executor) startProgress() {
 	}
 	var total uint64
 	for _, task := range e.run.Tasks {
+		if e.run.Config.Mirror {
+			if task.Size > 0 {
+				total += uint64(task.Size)
+			}
+			continue
+		}
 		switch task.Status {
 		case state.StatusPending, state.StatusFailed, state.StatusRunning:
 			if task.Size > 0 {
