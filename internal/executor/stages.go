@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -619,11 +620,22 @@ func (e *Executor) mirrorPreview(ctx context.Context) error {
 	return cfg.Run(ctx)
 }
 
+// remoteSourceOperand is the remote path to probe for source revalidation:
+// the tree root, or the single file of a point-to-point run, so a resume
+// never rescans a large parent directory.
+func (e *Executor) remoteSourceOperand() target.Destination {
+	d := e.destTarget()
+	if e.run.Source.File != "" {
+		d.Path = path.Join(d.Path, e.run.Source.File)
+	}
+	return d
+}
+
 // recheckRemoteSource performs one batched remote source scan and retains
 // only tasks whose regular-file size and nanosecond mtime still match the
 // immutable plan.
 func (e *Executor) recheckRemoteSource(ctx context.Context, tasks []*state.Task, phase string) ([]*state.Task, error) {
-	entries, err := e.collectRemoteSource(ctx, e.destTarget(), e.run.Config.IPv6)
+	_, _, entries, err := e.collectRemoteSource(ctx, e.remoteSourceOperand(), e.run.Config.IPv6)
 	if err != nil {
 		return nil, fmt.Errorf("remote source revalidation %s: %w", phase, err)
 	}

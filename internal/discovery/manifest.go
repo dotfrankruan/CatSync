@@ -54,50 +54,78 @@ type RemoteEntry struct {
 	ModTime time.Time
 }
 
-// ParseRemoteSourceManifest streams NUL-delimited remote source records:
-// path, GNU find %y type byte, size, and mtime. Directories are omitted by
-// the producer. Regular files, symlinks, and other special entries map to
-// the same Entry model used by local discovery, so planning is symmetric.
-func ParseRemoteSourceManifest(r io.Reader, emit func(Entry) error) error {
+// SourceMode reports what the remote source operand itself is.
+type SourceMode byte
+
+const (
+	// SourceModeDir is a source tree: records are relative to the root.
+	SourceModeDir SourceMode = 'D'
+	// SourceModeFile is a single remote file: the one record's path is the
+	// file's base name and the transfer root is its parent directory.
+	SourceModeFile SourceMode = 'F'
+)
+
+// ParseRemoteSourceManifest streams the remote source manifest: one mode
+// record ("D" or "F"), then NUL-delimited records of path, GNU find %y type
+// byte, size, and mtime. For a directory the records are relative to the
+// root and directories are omitted by the producer; for a single file the
+// one record's path is its base name. Regular files, symlinks, and other
+// special entries map to the same Entry model used by local discovery, so
+// planning is symmetric.
+func ParseRemoteSourceManifest(r io.Reader, emit func(Entry) error) (SourceMode, error) {
 	if emit == nil {
-		return errors.New("discovery: emit callback is nil")
+		return 0, errors.New("discovery: emit callback is nil")
 	}
 	br := bufio.NewReader(r)
+	modeField, eof, err := readManifestField(br, 1)
+	if eof {
+		return 0, malformedf(0, "missing source mode record")
+	}
+	if err != nil {
+		return 0, malformedf(0, "source mode: %v", err)
+	}
+	mode := SourceMode(modeField[0])
+	if mode != SourceModeDir && mode != SourceModeFile {
+		return 0, malformedf(0, "invalid source mode %q", modeField)
+	}
 	seen := make(map[string]struct{})
 	for rec := 1; ; rec++ {
 		path, eof, err := readManifestField(br, MaxManifestPathBytes)
 		if err != nil {
-			return malformedf(rec, "path: %v", err)
+			return 0, malformedf(rec, "path: %v", err)
 		}
 		if eof {
-			return nil
+			return mode, nil
 		}
 		typeField, eof, err := readManifestField(br, 1)
 		if err != nil || eof {
-			return malformedf(rec, "type: invalid or truncated field")
+			return 0, malformedf(rec, "type: invalid or truncated field")
 		}
 		sizeField, eof, err := readManifestField(br, maxManifestNumBytes)
 		if err != nil || eof {
-			return malformedf(rec, "size: invalid or truncated field")
+			return 0, malformedf(rec, "size: invalid or truncated field")
 		}
 		mtimeField, eof, err := readManifestField(br, maxManifestNumBytes)
 		if err != nil || eof {
-			return malformedf(rec, "mtime: invalid or truncated field")
+			return 0, malformedf(rec, "mtime: invalid or truncated field")
 		}
 		if err := ValidateRelPath(path); err != nil {
-			return malformedf(rec, "path: %v", err)
+			return 0, malformedf(rec, "path: %v", err)
 		}
 		if _, dup := seen[path]; dup {
-			return malformedf(rec, "duplicate record for path %q", path)
+			return 0, malformedf(rec, "duplicate record for path %q", path)
 		}
 		seen[path] = struct{}{}
+		if mode == SourceModeFile && rec > 1 {
+			return 0, malformedf(rec, "single-file source produced more than one record")
+		}
 		size, err := parseManifestSize(sizeField)
 		if err != nil {
-			return malformedf(rec, "size: %v", err)
+			return 0, malformedf(rec, "size: %v", err)
 		}
 		mtime, err := parseManifestTime(mtimeField)
 		if err != nil {
-			return malformedf(rec, "mtime: %v", err)
+			return 0, malformedf(rec, "mtime: %v", err)
 		}
 		entry := Entry{Path: path, Size: size, ModTime: mtime}
 		switch typeField {
@@ -107,24 +135,31 @@ func ParseRemoteSourceManifest(r io.Reader, emit func(Entry) error) error {
 			entry.Kind = KindSymlink
 		default:
 			if len(typeField) != 1 {
-				return malformedf(rec, "invalid type %q", typeField)
+				return 0, malformedf(rec, "invalid type %q", typeField)
 			}
 			entry.Kind = KindSpecial
 		}
 		if err := emit(entry); err != nil {
-			return err
+			return 0, err
 		}
 	}
 }
 
-// CollectRemoteSourceManifest collects the source records in producer order.
-func CollectRemoteSourceManifest(r io.Reader) ([]Entry, error) {
+// CollectRemoteSourceManifest collects the source mode and records in
+// producer order.
+func CollectRemoteSourceManifest(r io.Reader) (SourceMode, []Entry, error) {
 	var entries []Entry
-	err := ParseRemoteSourceManifest(r, func(entry Entry) error {
+	mode, err := ParseRemoteSourceManifest(r, func(entry Entry) error {
 		entries = append(entries, entry)
 		return nil
 	})
-	return entries, err
+	if err != nil {
+		return 0, nil, err
+	}
+	if mode == SourceModeFile && len(entries) != 1 {
+		return 0, nil, malformedf(0, "single-file source must produce exactly one record, got %d", len(entries))
+	}
+	return mode, entries, nil
 }
 
 // ParseManifest streams manifest records from r, delivering each to emit.
@@ -352,8 +387,12 @@ func SourceManifestCommandProgPort(prog string, source target.Destination, ipv6 
 		return nil, err
 	}
 	q := shellQuote(source.Path)
-	script := "if [ -d " + q + " ]; then find " + q + " -mindepth 1 ! -type d -printf '%P\\0%y\\0%s\\0%T@\\0'; else exit " +
-		strconv.Itoa(ManifestExitNoSuchDir) + "; fi"
+	// The leading mode record tells the caller whether the operand is a tree
+	// ("D", records relative to it) or a single file ("F", one record whose
+	// path is the file's base name).
+	script := "if [ -d " + q + " ]; then printf 'D\\0'; find " + q + " -mindepth 1 ! -type d -printf '%P\\0%y\\0%s\\0%T@\\0'; " +
+		"elif [ -f " + q + " ]; then printf 'F\\0'; find " + q + " -maxdepth 0 ! -type d -printf '%f\\0%y\\0%s\\0%T@\\0'; " +
+		"else exit " + strconv.Itoa(ManifestExitNoSuchDir) + "; fi"
 	return append(argv, script), nil
 }
 

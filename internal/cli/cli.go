@@ -259,7 +259,10 @@ func transferUsage(name string) string {
 Exactly one endpoint must be local and one remote. Upload uses
 LOCAL_SOURCE [user@]host:/absolute/path; download uses
 [user@]host:/absolute/path LOCAL_DESTINATION. Remote paths must be absolute;
-bracketed IPv6 literals are accepted. The copy command never deletes destination-only
+bracketed IPv6 literals are accepted. A source may be one regular file
+instead of a directory: it is copied point-to-point and keeps its name at the
+destination directory (files at or above --large-threshold still use the
+native multistream backend). The copy command never deletes destination-only
 entries. The sync command performs a final exact archive reconciliation and deletes
 destination-only entries only after preceding transfer stages succeed.
 --delete is rejected; choose the command whose semantics you intend.

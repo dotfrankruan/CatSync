@@ -2,7 +2,6 @@ package cli
 
 import (
 	"bytes"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -176,17 +175,15 @@ func TestTransferCommandsValidateSource(t *testing.T) {
 		t.Errorf("stderr should describe the source problem:\n%s", stderr)
 	}
 
-	// A regular file is not a usable source directory.
-	file := filepath.Join(t.TempDir(), "file")
-	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	code, _, stderr = run(t, "sync", file, "user@host:/data")
+	// A single regular file is a valid point-to-point source now, so an
+	// unreadable source path is the remaining usage failure.
+	unreadable := filepath.Join(t.TempDir(), "gone")
+	code, _, stderr = run(t, "sync", unreadable, "user@host:/data")
 	if code != ExitUsage {
 		t.Errorf("exit = %d, want %d", code, ExitUsage)
 	}
-	if !strings.Contains(stderr, "not a directory") {
-		t.Errorf("stderr should report the non-directory source:\n%s", stderr)
+	if !strings.Contains(stderr, "source") {
+		t.Errorf("stderr should describe the source problem:\n%s", stderr)
 	}
 }
 

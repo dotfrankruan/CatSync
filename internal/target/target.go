@@ -18,10 +18,14 @@ const (
 
 // Transfer is a validated pair containing exactly one local endpoint and
 // one remote endpoint. LocalPath is the local source root for LocalToRemote
-// and the local destination root for RemoteToLocal.
+// and the local destination root for RemoteToLocal. LocalFile is the
+// basename of the single local source file when the source operand names a
+// regular file (uploads only); LocalPath is then that file's parent
+// directory, so the transfer is a point-to-point copy of one file.
 type Transfer struct {
 	Direction Direction
 	LocalPath string
+	LocalFile string
 	Remote    Destination
 }
 
@@ -47,7 +51,7 @@ func ParseTransfer(source, destination string) (Transfer, error) {
 		}
 		return Transfer{Direction: RemoteToLocal, LocalPath: local, Remote: remote}, nil
 	}
-	local, err := ValidateSource(source)
+	local, file, err := ClassifyLocalSource(source)
 	if err != nil {
 		return Transfer{}, err
 	}
@@ -55,7 +59,7 @@ func ParseTransfer(source, destination string) (Transfer, error) {
 	if err != nil {
 		return Transfer{}, err
 	}
-	return Transfer{Direction: LocalToRemote, LocalPath: local, Remote: remote}, nil
+	return Transfer{Direction: LocalToRemote, LocalPath: local, LocalFile: file, Remote: remote}, nil
 }
 
 // looksRemote recognizes an intended rsync/SSH operand without treating an
@@ -245,31 +249,69 @@ func isUserChar(r rune) bool {
 // returns its absolute form. Symlinks to directories are accepted; the
 // returned path preserves the caller's spelling, made absolute.
 func ValidateSource(path string) (string, error) {
+	dir, file, err := ClassifyLocalSource(path)
+	if err != nil {
+		return "", err
+	}
+	if file != "" {
+		return "", fmt.Errorf("source %q is a regular file, not a directory", path)
+	}
+	return dir, nil
+}
+
+// ClassifyLocalSource resolves a local source operand to the absolute root
+// directory it transfers from. A directory is its own root. A regular file
+// is a single-file source: the root is its parent directory and the
+// returned base name identifies the one file, so every downstream stage
+// works on exactly that file (point-to-point copy).
+func ClassifyLocalSource(path string) (dir, file string, err error) {
 	if path == "" {
-		return "", fmt.Errorf("source path is empty")
+		return "", "", fmt.Errorf("source path is empty")
 	}
 	if strings.ContainsRune(path, 0) {
-		return "", fmt.Errorf("source path %q: NUL bytes are not allowed", path)
+		return "", "", fmt.Errorf("source path %q: NUL bytes are not allowed", path)
 	}
 	info, err := os.Stat(path)
 	if err != nil {
-		return "", fmt.Errorf("source %q: %w", path, err)
+		return "", "", fmt.Errorf("source %q: %w", path, err)
 	}
-	if !info.IsDir() {
-		return "", fmt.Errorf("source %q is not a directory", path)
-	}
-	// Opening proves the directory is readable by this user, which the
-	// discovery stage depends on.
-	f, err := os.Open(path)
-	if err != nil {
-		return "", fmt.Errorf("source %q is not readable: %w", path, err)
-	}
-	if err := f.Close(); err != nil {
-		return "", fmt.Errorf("source %q: close: %w", path, err)
+	switch {
+	case info.IsDir():
+		// Opening proves the directory is readable by this user, which the
+		// discovery stage depends on.
+		f, err := os.Open(path)
+		if err != nil {
+			return "", "", fmt.Errorf("source %q is not readable: %w", path, err)
+		}
+		if err := f.Close(); err != nil {
+			return "", "", fmt.Errorf("source %q: close: %w", path, err)
+		}
+	case info.Mode().IsRegular():
+		if err := checkReadableFile(path); err != nil {
+			return "", "", err
+		}
+	default:
+		return "", "", fmt.Errorf("source %q is neither a directory nor a regular file", path)
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		return "", fmt.Errorf("source %q: resolve absolute path: %w", path, err)
+		return "", "", fmt.Errorf("source %q: resolve absolute path: %w", path, err)
 	}
-	return abs, nil
+	if info.IsDir() {
+		return abs, "", nil
+	}
+	return filepath.Dir(abs), filepath.Base(abs), nil
+}
+
+// checkReadableFile proves a single-file source can be opened; the transfer
+// stages depend on it.
+func checkReadableFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("source %q is not readable: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("source %q: close: %w", path, err)
+	}
+	return nil
 }

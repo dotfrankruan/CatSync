@@ -29,6 +29,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -96,8 +97,13 @@ type Config struct {
 	// local-to-remote behavior.
 	Direction target.Direction
 	// SourceDir is the absolute local endpoint: source directory for uploads
-	// and destination directory for downloads.
+	// and destination directory for downloads. For a single-file upload it
+	// is the file's parent directory and SourceFile names the file.
 	SourceDir string
+	// SourceFile is the base name of the single source file when the upload
+	// source operand names a regular file; the plan contains exactly that
+	// one file. Empty means a directory-tree transfer.
+	SourceFile string
 	// Dest is the remote endpoint: destination for uploads, source for downloads.
 	Dest target.Destination
 	// Backend is the requested backend selection (auto or concrete).
@@ -167,6 +173,9 @@ func (c *Config) validateFull() error {
 	}
 	if c.SourceDir == "" || !filepath.IsAbs(c.SourceDir) {
 		return fmt.Errorf("%w: local endpoint %q is not absolute", ErrInvalidConfig, c.SourceDir)
+	}
+	if c.Mirror && c.SourceFile != "" {
+		return fmt.Errorf("%w: mirror sync needs a directory source; a single file is copied point-to-point (use copy)", ErrInvalidConfig)
 	}
 	if err := backend.ValidateDestination(c.Dest); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidConfig, err)
@@ -458,32 +467,45 @@ func (e *Executor) collectManifest(ctx context.Context, dest target.Destination,
 	return m, true, nil
 }
 
-// collectRemoteSource discovers every non-directory remote source entry in
-// one SSH call. A missing source is a hard error, unlike a missing upload
-// destination, which is an authoritative empty destination.
-func (e *Executor) collectRemoteSource(ctx context.Context, source target.Destination, ipv6 bool) ([]discovery.Entry, error) {
+// collectRemoteSource discovers the remote source in one SSH call: either
+// every non-directory entry under a directory root, or the single file the
+// operand names. It returns the normalized root (the tree, or a single
+// file's parent directory) and the file base name for single-file sources.
+// A missing source is a hard error, unlike a missing upload destination,
+// which is an authoritative empty destination.
+func (e *Executor) collectRemoteSource(ctx context.Context, source target.Destination, ipv6 bool) (root, file string, entries []discovery.Entry, err error) {
 	argv, err := discovery.SourceManifestCommandProgPort(e.progs.ssh(), source, ipv6, e.sshPort())
 	if err != nil {
-		return nil, err
+		return "", "", nil, err
 	}
 	var stdout, stderr strings.Builder
-	err = process.Run(ctx, process.Spec{Name: argv[0], Args: argv[1:], Env: e.cfg.Env, Stdout: &stdout, Stderr: &stderr})
-	if err != nil {
+	runErr := process.Run(ctx, process.Spec{Name: argv[0], Args: argv[1:], Env: e.cfg.Env, Stdout: &stdout, Stderr: &stderr})
+	if runErr != nil {
 		var exitErr *process.ExitError
-		if errors.As(err, &exitErr) && exitErr.Code == discovery.ManifestExitNoSuchDir {
-			return nil, fmt.Errorf("executor: remote source directory %q does not exist", source.Path)
+		if errors.As(runErr, &exitErr) && exitErr.Code == discovery.ManifestExitNoSuchDir {
+			if detail := strings.TrimSpace(stderr.String()); detail != "" {
+				return "", "", nil, fmt.Errorf("executor: remote source %q: %s", source.Path, firstLine(detail))
+			}
+			return "", "", nil, fmt.Errorf("executor: remote source %q does not exist", source.Path)
 		}
 		detail := strings.TrimSpace(stderr.String())
 		if detail != "" {
-			return nil, fmt.Errorf("executor: remote source discovery failed: %w (%s)", err, firstLine(detail))
+			return "", "", nil, fmt.Errorf("executor: remote source discovery failed: %w (%s)", runErr, firstLine(detail))
 		}
-		return nil, fmt.Errorf("executor: remote source discovery failed: %w", err)
+		return "", "", nil, fmt.Errorf("executor: remote source discovery failed: %w", runErr)
 	}
-	entries, err := discovery.CollectRemoteSourceManifest(strings.NewReader(stdout.String()))
-	if err != nil {
-		return nil, fmt.Errorf("executor: remote source discovery failed: %w", err)
+	mode, entries, perr := discovery.CollectRemoteSourceManifest(strings.NewReader(stdout.String()))
+	if perr != nil {
+		return "", "", nil, fmt.Errorf("executor: remote source discovery failed: %w", perr)
 	}
-	return entries, nil
+	if mode == discovery.SourceModeFile {
+		base := path.Base(source.Path)
+		if len(entries) != 1 || entries[0].Path != base {
+			return "", "", nil, fmt.Errorf("executor: remote single-file source %q reported an unexpected entry set", source.Path)
+		}
+		return path.Dir(source.Path), base, entries, nil
+	}
+	return source.Path, "", entries, nil
 }
 
 // collectLocalManifest gathers local destination metadata for download
@@ -558,6 +580,11 @@ func firstLine(s string) string {
 type PlanOutcome struct {
 	// Direction identifies upload or download for accurate reporting.
 	Direction target.Direction
+	// SourceRoot is the normalized absolute source root: the tree root, or
+	// the parent directory of a single-file source.
+	SourceRoot string
+	// SourceFile is the single-file source base name, empty for tree runs.
+	SourceFile string
 	// Result is the planner assignment.
 	Result *planner.Result
 	// ManifestKnown reports whether the destination metadata is
@@ -596,10 +623,12 @@ func (e *Executor) planPhase(ctx context.Context) (*PlanOutcome, error) {
 	tools := e.detectTools()
 	var entries []discovery.Entry
 	if e.cfg.direction() == target.RemoteToLocal {
-		var err error
-		entries, err = e.collectRemoteSource(ctx, e.cfg.Dest, e.cfg.IPv6)
+		root, file, entries, err := e.collectRemoteSource(ctx, e.cfg.Dest, e.cfg.IPv6)
 		if err != nil {
 			return nil, err
+		}
+		if e.cfg.Mirror && file != "" {
+			return nil, fmt.Errorf("%w: mirror sync needs a directory source; a single remote file is copied point-to-point (use copy)", ErrInvalidConfig)
 		}
 		dest, err := collectLocalManifest(e.cfg.SourceDir)
 		if err != nil {
@@ -609,7 +638,7 @@ func (e *Executor) planPhase(ctx context.Context) (*PlanOutcome, error) {
 		if err != nil {
 			return nil, err
 		}
-		out := &PlanOutcome{Direction: e.cfg.direction(), Result: result, ManifestKnown: true, Tools: tools}
+		out := &PlanOutcome{Direction: e.cfg.direction(), Result: result, ManifestKnown: true, Tools: tools, SourceRoot: root, SourceFile: file}
 		for _, d := range result.Decisions {
 			if d.Status == planner.StatusPending {
 				out.LogicalBytes += d.Size
@@ -617,7 +646,24 @@ func (e *Executor) planPhase(ctx context.Context) (*PlanOutcome, error) {
 		}
 		return out, nil
 	}
-	if err := discovery.Walk(e.cfg.SourceDir, func(en discovery.Entry) error {
+	srcAbs, err := filepath.Abs(e.cfg.SourceDir)
+	if err != nil {
+		return nil, fmt.Errorf("executor: resolve source path: %w", err)
+	}
+	if e.cfg.SourceFile != "" {
+		// A single-file source: the plan contains exactly that one file,
+		// relative to its parent directory (the normalized root).
+		fi, err := os.Stat(filepath.Join(srcAbs, e.cfg.SourceFile))
+		if err != nil {
+			return nil, fmt.Errorf("executor: source %q: %w", filepath.Join(srcAbs, e.cfg.SourceFile), err)
+		}
+		entries = append(entries, discovery.Entry{
+			Path:    e.cfg.SourceFile,
+			Size:    fi.Size(),
+			ModTime: fi.ModTime().UTC(),
+			Kind:    discovery.KindFile,
+		})
+	} else if err := discovery.Walk(srcAbs, func(en discovery.Entry) error {
 		entries = append(entries, en)
 		return nil
 	}); err != nil {
@@ -644,7 +690,7 @@ func (e *Executor) planPhase(ctx context.Context) (*PlanOutcome, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := &PlanOutcome{Direction: e.cfg.direction(), Result: result, ManifestKnown: known, ManifestErr: merr, Tools: tools}
+	out := &PlanOutcome{Direction: e.cfg.direction(), Result: result, ManifestKnown: known, ManifestErr: merr, Tools: tools, SourceRoot: srcAbs, SourceFile: e.cfg.SourceFile}
 	for _, d := range result.Decisions {
 		if d.Status == planner.StatusPending {
 			out.LogicalBytes += d.Size
@@ -682,11 +728,15 @@ func (e *Executor) buildRun(out *PlanOutcome) (*state.Run, error) {
 		Status:    state.StatusPending,
 		CreatedAt: time.Now().UTC(),
 	}
+	root := out.SourceRoot
+	if root == "" {
+		root = srcAbs
+	}
 	if direction == target.RemoteToLocal {
-		run.Source = state.Source{User: e.cfg.Dest.User, Host: e.cfg.Dest.Host, Path: e.cfg.Dest.Path}
+		run.Source = state.Source{User: e.cfg.Dest.User, Host: e.cfg.Dest.Host, Path: root, File: out.SourceFile}
 		run.Destination = state.Destination{Path: srcAbs}
 	} else {
-		run.Source = state.Source{Path: srcAbs}
+		run.Source = state.Source{Path: root, File: out.SourceFile}
 		run.Destination = state.Destination{User: e.cfg.Dest.User, Host: e.cfg.Dest.Host, Path: e.cfg.Dest.Path}
 	}
 	for _, d := range out.Result.Decisions {

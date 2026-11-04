@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -130,6 +131,10 @@ optionsDone:
 			}
 		}
 		return 0, true
+	case len(cmd) == 1 && strings.Contains(cmd[0], "-mindepth 1") && strings.HasPrefix(cmd[0], "if [ -d "):
+		// Source discovery (a destination manifest lacks -mindepth and
+		// keeps the scripted behavior).
+		return emulateSourceManifest(cmd[0]), true
 	case len(cmd) == 1 && strings.HasPrefix(cmd[0], "if [ -f "):
 		return emulateSourceIdentity(cmd[0]), true
 	case len(cmd) == 1 && strings.HasPrefix(cmd[0], "set -e; out=$("):
@@ -144,6 +149,85 @@ optionsDone:
 		return 0, true
 	}
 	return 0, false
+}
+
+// emulateSourceManifest implements the remote source discovery script over
+// the local filesystem: a directory produces the "D" mode record and every
+// non-directory entry relative to it, a regular file produces the "F" mode
+// record and that one file's base name. Anything else exits with the
+// no-such-directory status the production script uses.
+func emulateSourceManifest(script string) int {
+	const prefix = "if [ -d "
+	end := strings.Index(script, " ]; then")
+	if end < 0 {
+		fmt.Fprintln(os.Stderr, "mockexec: malformed source manifest probe")
+		return 2
+	}
+	p := unquoteShellWord(script[len(prefix):end])
+	fi, err := os.Lstat(p)
+	if err != nil {
+		return 42
+	}
+	if fi.Mode().IsRegular() {
+		fmt.Fprintf(os.Stdout, "F%c", 0)
+		fmt.Fprintf(os.Stdout, "%s%c%c%c%d%c%s%c", filepath.Base(p), 0, typeLetter(fi), 0, fi.Size(), 0, epochtime.Format(fi.ModTime()), 0)
+		return 0
+	}
+	if !fi.IsDir() {
+		fmt.Fprintln(os.Stderr, "catsync: source exists but is not a regular file or directory")
+		return 42
+	}
+	fmt.Fprintf(os.Stdout, "D%c", 0)
+	return walkSourceManifest(p, "")
+}
+
+// walkSourceManifest emits the records for dir, relative to root, in sorted
+// order (find's order is not reproducible; the parser is order-agnostic).
+func walkSourceManifest(dir, rel string) int {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mockexec: read %s: %v\n", dir, err)
+		return 1
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	for _, entry := range entries {
+		childRel := entry.Name()
+		if rel != "" {
+			childRel = rel + "/" + childRel
+		}
+		info, err := entry.Info()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "mockexec: stat %s: %v\n", childRel, err)
+			return 1
+		}
+		if info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+			if code := walkSourceManifest(filepath.Join(dir, entry.Name()), childRel); code != 0 {
+				return code
+			}
+			continue
+		}
+		fmt.Fprintf(os.Stdout, "%s%c%c%c%d%c%s%c", childRel, 0, typeLetter(info), 0, info.Size(), 0, epochtime.Format(info.ModTime()), 0)
+	}
+	return 0
+}
+
+// typeLetter renders GNU find's %y letter for a file mode.
+func typeLetter(fi os.FileInfo) byte {
+	switch {
+	case fi.Mode()&os.ModeSymlink != 0:
+		return 'l'
+	case fi.Mode().IsRegular():
+		return 'f'
+	case fi.Mode()&os.ModeNamedPipe != 0:
+		return 'p'
+	case fi.Mode()&os.ModeSocket != 0:
+		return 's'
+	case fi.Mode()&os.ModeDevice != 0 && fi.Mode()&os.ModeCharDevice != 0:
+		return 'c'
+	case fi.Mode()&os.ModeDevice != 0:
+		return 'b'
+	}
+	return '?'
 }
 
 func emulateSourceIdentity(script string) int {

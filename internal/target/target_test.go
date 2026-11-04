@@ -216,3 +216,67 @@ func TestValidateLocalDestination(t *testing.T) {
 		t.Fatal("regular-file destination accepted")
 	}
 }
+
+// TestClassifyLocalSource: a directory is its own root; a regular file is a
+// single-file source rooted at its parent.
+func TestClassifyLocalSource(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "tree")
+	if err := os.MkdirAll(filepath.Join(dir, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(base, "one.bin")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	root, single, err := ClassifyLocalSource(dir)
+	if err != nil {
+		t.Fatalf("ClassifyLocalSource(dir): %v", err)
+	}
+	if root != dir || single != "" {
+		t.Errorf("dir -> root %q file %q, want %q and empty", root, single, dir)
+	}
+
+	root, single, err = ClassifyLocalSource(file)
+	if err != nil {
+		t.Fatalf("ClassifyLocalSource(file): %v", err)
+	}
+	if root != filepath.Dir(file) || single != "one.bin" {
+		t.Errorf("file -> root %q file %q, want %q and one.bin", root, single, filepath.Dir(file))
+	}
+
+	// The directory-only wrapper keeps refusing a file.
+	if _, err := ValidateSource(file); err == nil {
+		t.Error("ValidateSource(file) = nil error, want a directory-only rejection")
+	}
+	if _, _, err := ClassifyLocalSource(filepath.Join(base, "missing")); err == nil {
+		t.Error("ClassifyLocalSource(missing) = nil error")
+	}
+}
+
+// TestParseTransferSingleFileSource: a file source is a point-to-point
+// transfer whose local root is the parent directory.
+func TestParseTransferSingleFileSource(t *testing.T) {
+	base := t.TempDir()
+	file := filepath.Join(base, "big.zip")
+	if err := os.WriteFile(file, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tr, err := ParseTransfer(file, "user@host:/data")
+	if err != nil {
+		t.Fatalf("ParseTransfer: %v", err)
+	}
+	if tr.Direction != LocalToRemote || tr.LocalPath != base || tr.LocalFile != "big.zip" {
+		t.Fatalf("transfer = %+v, want file big.zip rooted at %q", tr, base)
+	}
+
+	// A directory source keeps the tree semantics.
+	tr, err = ParseTransfer(base, "user@host:/data")
+	if err != nil {
+		t.Fatalf("ParseTransfer(dir): %v", err)
+	}
+	if tr.LocalPath != base || tr.LocalFile != "" {
+		t.Fatalf("dir transfer = %+v", tr)
+	}
+}

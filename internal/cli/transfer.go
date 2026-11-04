@@ -25,6 +25,7 @@ func (o *Options) executorConfig(transfer target.Transfer, stdout, stderr io.Wri
 	return executor.Config{
 		Direction:        transfer.Direction,
 		SourceDir:        transfer.LocalPath,
+		SourceFile:       transfer.LocalFile,
 		Dest:             transfer.Remote,
 		Backend:          state.Backend(o.Backend),
 		DryRun:           o.DryRun,
@@ -101,6 +102,9 @@ func printPlan(w io.Writer, out *executor.PlanOutcome, opts *Options) {
 		}
 	}
 	fmt.Fprintf(w, "plan: %d source entry(ies)\n", len(out.Result.Decisions))
+	if out.SourceFile != "" {
+		fmt.Fprintf(w, "source: single file %s (root %s)\n", out.SourceFile, out.SourceRoot)
+	}
 	if out.ManifestKnown {
 		if out.Direction == target.RemoteToLocal {
 			fmt.Fprintln(w, "destination metadata: authoritative (local destination scanned)")

@@ -3,7 +3,9 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -223,7 +225,7 @@ func TestCLIProgressAlwaysReportsSpeedAndTimes(t *testing.T) {
 func TestCLIRemoteToLocalRsyncRouting(t *testing.T) {
 	h := newCLIHarness(t)
 	download := filepath.Join(t.TempDir(), "download")
-	manifest := h.writeManifest("remote-source", "dir/file.txt\x00f\x0012\x001700000000.25\x00link\x00l\x003\x001700000001\x00")
+	manifest := h.writeManifest("remote-source", "D\x00dir/file.txt\x00f\x0012\x001700000000.25\x00link\x00l\x003\x001700000001\x00")
 	h.writeScript("ssh", "match=-mindepth 1\nstdout_file="+manifest+"\n")
 	h.writeScript("rsync", "exit=0")
 
@@ -826,5 +828,113 @@ func TestCLIPreEpochMtimeWithSizeVerify(t *testing.T) {
 	}
 	if !fi.ModTime().Equal(preEpoch) {
 		t.Errorf("final mtime = %v, want %v (pre-epoch nanosecond exact)", fi.ModTime(), preEpoch)
+	}
+}
+
+// TestCLISingleFileUploadEndToEnd: naming one local file transfers exactly
+// that file, and the persisted run names it.
+func TestCLISingleFileUploadEndToEnd(t *testing.T) {
+	h := newCLIHarness(t)
+	h.armNative()
+	h.writeSrc("one.bin", 2048)
+	srcFile := filepath.Join(h.src, "one.bin")
+	post := h.writeManifest("post", h.record("one.bin"))
+	h.scriptFreshDestSSH(post)
+
+	code, stdout, stderr := run(t, "copy", "--state-dir", h.stateDir,
+		"--large-threshold", "1KiB", srcFile, "user@host:"+h.remoteDir)
+	if code != ExitOK {
+		t.Fatalf("copy exit = %d, stderr:\n%s", code, stderr)
+	}
+	if !strings.Contains(stdout, "completed 1") {
+		t.Fatalf("summary should report one completed file:\n%s", stdout)
+	}
+	got, err := os.ReadFile(filepath.Join(h.remoteDir, "one.bin"))
+	if err != nil {
+		t.Fatalf("published final missing: %v", err)
+	}
+	want, err := os.ReadFile(srcFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Error("single-file upload content mismatch")
+	}
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := store.Latest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Source.File != "one.bin" || rec.Source.Path != h.src {
+		t.Errorf("recorded source = %+v, want one.bin under %q", rec.Source, h.src)
+	}
+	if !strings.HasSuffix(rec.Source.String(), "/one.bin") {
+		t.Errorf("source string = %q", rec.Source.String())
+	}
+}
+
+// TestCLIPlanSingleFileRemoteSource: `plan host:/path/file .` accepts a
+// remote file operand, reports single-file mode, and transfers nothing.
+func TestCLIPlanSingleFileRemoteSource(t *testing.T) {
+	h := newCLIHarness(t)
+	h.armNative()
+	const name = "dataset.zip"
+	if err := os.WriteFile(filepath.Join(h.remoteDir, name), bytes.Repeat([]byte("z"), 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	local := filepath.Join(t.TempDir(), "dest")
+	code, stdout, stderr := run(t, "plan", "--state-dir", h.stateDir,
+		"--large-threshold", "1KiB", "user@host:"+filepath.Join(h.remoteDir, name), local)
+	if code != ExitOK {
+		t.Fatalf("plan exit = %d, stderr:\n%s", code, stderr)
+	}
+	if !strings.Contains(stdout, "source: single file "+name) {
+		t.Errorf("plan output should name the single file:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "mscp (large new, native multistream): 1") {
+		t.Errorf("plan should route the large single file to native multistream:\n%s", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(local, name)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("plan must not transfer anything: %v", err)
+	}
+}
+
+// TestCLISingleFileDownloadEndToEnd: `copy host:/path/file .` downloads
+// exactly that file with the native backend.
+func TestCLISingleFileDownloadEndToEnd(t *testing.T) {
+	h := newCLIHarness(t)
+	h.armNative()
+	const name = "dataset.zip"
+	remote := filepath.Join(h.remoteDir, name)
+	want := bytes.Repeat([]byte("payload-"), 512)
+	if err := os.WriteFile(remote, want, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(t.TempDir(), "download")
+	code, _, stderr := run(t, "copy", "--verify", "none", "--state-dir", h.stateDir,
+		"--large-threshold", "1KiB", "user@host:"+remote, dest)
+	if code != ExitOK {
+		t.Fatalf("copy exit = %d, stderr:\n%s", code, stderr)
+	}
+	got, err := os.ReadFile(filepath.Join(dest, name))
+	if err != nil {
+		t.Fatalf("downloaded file missing: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Error("single-file download content mismatch")
+	}
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := store.Latest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Source.File != name || rec.Source.Path != h.remoteDir {
+		t.Errorf("recorded source = %+v, want %q under %q", rec.Source, name, h.remoteDir)
 	}
 }

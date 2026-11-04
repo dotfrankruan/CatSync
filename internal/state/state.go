@@ -195,11 +195,27 @@ func (c *Config) validate() error {
 type Source struct {
 	User string `json:"user,omitempty"`
 	Host string `json:"host,omitempty"`
+	// Path is the absolute source root directory. For a single-file source
+	// it is the file's parent directory.
 	Path string `json:"path"`
+	// File is the base name of the one source file when the run copies a
+	// single file (point-to-point); empty for directory-tree runs. Path
+	// plus File identifies the file, so Source.String renders it exactly.
+	File string `json:"file,omitempty"`
 }
 
-// String renders the source endpoint.
-func (s Source) String() string { return endpointString(s.User, s.Host, s.Path) }
+// String renders the source endpoint, including the single-file component
+// when the run transfers one named file.
+func (s Source) String() string { return endpointString(s.User, s.Host, s.sourcePath()) }
+
+// sourcePath is the full source path: the root, or root/file for a
+// single-file run.
+func (s Source) sourcePath() string {
+	if s.File == "" {
+		return s.Path
+	}
+	return strings.TrimSuffix(s.Path, "/") + "/" + s.File
+}
 
 // Destination describes the tree a run writes to. User and Host are empty
 // for a remote-to-local run whose destination is an absolute local path.

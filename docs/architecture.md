@@ -229,3 +229,17 @@ Primary references:
 
 - <https://github.com/pkg/sftp>
 - <https://github.com/RsyncProject/rsync/blob/master/rsync.1.md>
+
+### Single-file sources
+
+A source operand that names one regular file is normalized to a
+point-to-point transfer: the source root becomes the file's parent directory
+and the plan contains exactly that file's base name. Both endpoints still use
+the directory-root model, so every downstream stage (planner, native
+multistream, checkpoint, verification, rsync `--files-from`) works unchanged
+and the file keeps its name at the destination. Local operands are classified
+with `os.Stat`; the remote source manifest script reports a leading mode
+record (`D` for a tree, `F` for one file) so a remote file operand produces
+the same single-entry plan. Resume revalidates the named file only, not its
+parent directory, and the persisted run records the file so `status` renders
+the exact source.

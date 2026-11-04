@@ -96,6 +96,25 @@ or copy `bin/catsync` into your `PATH`.
 Probes rsync and ssh with bounded version probes; both are required. No
 secrets or environment contents are printed.
 
+### Single-file sources
+
+An operand may name one regular file instead of a directory tree. A
+single-file source is a point-to-point copy: the file keeps its base name at
+the destination, and a file at or above `--large-threshold` still goes
+through the native multistream backend (so a multi-gigabyte download runs
+over several SFTP sessions, with a checkpoint and resumability exactly like a
+tree transfer).
+
+```sh
+catsync plan user@host:/data/dataset.zip ./downloads
+catsync copy user@host:/data/dataset.zip ./downloads
+catsync copy ./dataset.zip user@host:/data
+```
+
+Both directions accept the form. The destination is always a directory; a
+single-file source never renames the file, and a resumable run revalidates
+only that file rather than rescanning its parent directory.
+
 ### `catsync plan SOURCE DESTINATION`
 
 Discovers the source, collects the remote manifest (or announces the

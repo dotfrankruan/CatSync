@@ -20,13 +20,16 @@ func sourceManifestRecord(path, kind, size, mtime string) string {
 }
 
 func TestParseRemoteSourceManifest(t *testing.T) {
-	in := sourceManifestRecord("plain.txt", "f", "10", "1700000000.25") +
+	in := "D\x00" + sourceManifestRecord("plain.txt", "f", "10", "1700000000.25") +
 		sourceManifestRecord("link", "l", "3", "1700000001") +
 		sourceManifestRecord("fifo", "p", "0", "1700000002") +
 		sourceManifestRecord("line\nbreak", "f", "7", "-0.5")
-	entries, err := CollectRemoteSourceManifest(strings.NewReader(in))
+	mode, entries, err := CollectRemoteSourceManifest(strings.NewReader(in))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if mode != SourceModeDir {
+		t.Fatalf("mode = %q, want dir", mode)
 	}
 	if len(entries) != 4 {
 		t.Fatalf("entries = %d, want 4", len(entries))
@@ -41,14 +44,34 @@ func TestParseRemoteSourceManifest(t *testing.T) {
 
 func TestParseRemoteSourceManifestRejectsMalformed(t *testing.T) {
 	for _, in := range []string{
-		sourceManifestRecord("dup", "f", "1", "1") + sourceManifestRecord("dup", "f", "1", "1"),
-		sourceManifestRecord("../escape", "f", "1", "1"),
-		sourceManifestRecord("file", "ff", "1", "1"),
-		"file\x00f\x001\x00",
+		"",
+		"X\x00" + sourceManifestRecord("a", "f", "1", "1"),
+		"D\x00" + sourceManifestRecord("dup", "f", "1", "1") + sourceManifestRecord("dup", "f", "1", "1"),
+		"D\x00" + sourceManifestRecord("../escape", "f", "1", "1"),
+		"D\x00" + sourceManifestRecord("file", "ff", "1", "1"),
+		"D\x00file\x00f\x001\x00",
+		"F\x00" + sourceManifestRecord("a", "f", "1", "1") + sourceManifestRecord("b", "f", "1", "1"),
+		"F\x00",
 	} {
-		if _, err := CollectRemoteSourceManifest(strings.NewReader(in)); err == nil || !errors.Is(err, ErrMalformedManifest) {
+		if _, _, err := CollectRemoteSourceManifest(strings.NewReader(in)); err == nil || !errors.Is(err, ErrMalformedManifest) {
 			t.Fatalf("manifest %q error = %v, want ErrMalformedManifest", in, err)
 		}
+	}
+}
+
+// TestParseRemoteSourceManifestSingleFile: a file operand yields exactly one
+// record whose path is the file's base name.
+func TestParseRemoteSourceManifestSingleFile(t *testing.T) {
+	in := "F\x00" + sourceManifestRecord("archive.zip", "f", "3145728", "1700000000.5")
+	mode, entries, err := CollectRemoteSourceManifest(strings.NewReader(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode != SourceModeFile {
+		t.Fatalf("mode = %q, want file", mode)
+	}
+	if len(entries) != 1 || entries[0].Path != "archive.zip" || entries[0].Kind != KindFile || entries[0].Size != 3145728 {
+		t.Fatalf("entries = %+v", entries)
 	}
 }
 
@@ -57,7 +80,9 @@ func TestSourceManifestCommandProg(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"/opt/ssh", "-6", "u@h", "if [ -d '/source tree' ]; then find '/source tree' -mindepth 1 ! -type d -printf '%P\\0%y\\0%s\\0%T@\\0'; else exit 42; fi"}
+	want := []string{"/opt/ssh", "-6", "u@h",
+		"if [ -d '/source tree' ]; then printf 'D\\0'; find '/source tree' -mindepth 1 ! -type d -printf '%P\\0%y\\0%s\\0%T@\\0'; " +
+			"elif [ -f '/source tree' ]; then printf 'F\\0'; find '/source tree' -maxdepth 0 ! -type d -printf '%f\\0%y\\0%s\\0%T@\\0'; else exit 42; fi"}
 	if len(got) != len(want) {
 		t.Fatalf("argv = %q, want %q", got, want)
 	}

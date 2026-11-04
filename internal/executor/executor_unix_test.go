@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -475,7 +476,7 @@ func TestSyncNativeRemoteToLocalLargeFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifest := h.writeManifest("remote-source", sourceManifestRecord(rel, fi.Size(), fi.ModTime()))
+	manifest := h.writeManifest("remote-source", "D\x00"+sourceManifestRecord(rel, fi.Size(), fi.ModTime()))
 	h.writeScript("ssh", "match=if [ -d\nstdout_file="+manifest+"\n")
 	h.writeScript("rsync", "exit=0")
 	cfg := h.configNative()
@@ -3330,5 +3331,264 @@ func TestNativeResumeLegacyCheckpointWithoutHardlink(t *testing.T) {
 	}
 	if _, err := os.Stat(derived); err != nil {
 		t.Errorf("legacy checkpoint removed: %v", err)
+	}
+}
+
+// TestSyncSingleFileUploadSmall: a single-file source produces a one-entry
+// plan through the conservative small-file stage.
+func TestSyncSingleFileUploadSmall(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("only.txt", 10)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("only.txt")))
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "exit=0")
+	cfg := h.config()
+	cfg.SourceFile = "only.txt"
+
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if len(run.Tasks) != 1 || run.Tasks[0].Path != "only.txt" {
+		t.Fatalf("tasks = %+v, want exactly only.txt", run.Tasks)
+	}
+	if run.Source.File != "only.txt" || run.Source.Path != h.src {
+		t.Fatalf("run source = %+v, want file only.txt under %q", run.Source, h.src)
+	}
+	if !strings.HasSuffix(run.Source.String(), "/only.txt") {
+		t.Errorf("source string = %q, want it to name the file", run.Source.String())
+	}
+	rs := toolInvocations(h.invocations(), "rsync")
+	if len(rs) != 1 {
+		t.Fatalf("rsync invocations = %d, want 1", len(rs))
+	}
+	payload, err := base64.StdEncoding.DecodeString(rs[0].Stdin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimRight(string(payload), "\x00"); got != "only.txt" {
+		t.Errorf("rsync file list = %q, want only.txt", got)
+	}
+}
+
+// TestSyncSingleFileUploadLarge: a large single-file source is a
+// point-to-point native multistream transfer to <dest>/<basename>.
+func TestSyncSingleFileUploadLarge(t *testing.T) {
+	if !mockexec.SFTPServerAvailable() {
+		t.Skip("real sftp-server is unavailable")
+	}
+	h := newHarness(t)
+	h.writeSrc("huge.bin", 2048)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("huge.bin")))
+	h.scriptSSHFreshDest(post)
+	cfg := h.configNative()
+	cfg.SourceFile = "huge.bin"
+
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if len(run.Tasks) != 1 || run.Tasks[0].Backend != state.BackendMSCP || run.Tasks[0].Status != state.StatusCompleted {
+		t.Fatalf("tasks = %+v", run.Tasks)
+	}
+	got, err := os.ReadFile(filepath.Join(h.remoteDir, "huge.bin"))
+	if err != nil {
+		t.Fatalf("published final missing: %v", err)
+	}
+	want, err := os.ReadFile(filepath.Join(h.src, "huge.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Error("single-file upload content mismatch")
+	}
+	if len(toolInvocations(h.invocations(), "rsync")) != 0 {
+		t.Errorf("rsync ran for a single large file")
+	}
+}
+
+// TestSyncSingleFileDownloadLarge: a remote file operand downloads exactly
+// that file to <localDest>/<basename> with the native backend.
+func TestSyncSingleFileDownloadLarge(t *testing.T) {
+	if !mockexec.SFTPServerAvailable() {
+		t.Skip("real sftp-server is unavailable")
+	}
+	h := newHarness(t)
+	const name = "archive.bin"
+	remote := filepath.Join(h.remoteDir, name)
+	want := bytes.Repeat([]byte("single-file-download-"), 256)
+	if err := os.WriteFile(remote, want, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	mtime := time.Unix(1_700_200_300, 123456789)
+	if err := os.Chtimes(remote, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := h.writeManifest("remote-source", "F\x00"+sourceManifestRecord(name, fi.Size(), fi.ModTime()))
+	h.writeScript("ssh", "match=if [ -d\nstdout_file="+manifest+"\n")
+	h.writeScript("rsync", "exit=0")
+
+	cfg := h.configNative()
+	cfg.Direction = target.RemoteToLocal
+	cfg.SourceDir = h.src
+	cfg.Dest.Path = remote // the remote operand names one file
+	cfg.Backend = state.BackendMSCP
+	cfg.Verify = state.VerifySize
+
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Sync download: %v", err)
+	}
+	if len(run.Tasks) != 1 || run.Tasks[0].Path != name || run.Tasks[0].Backend != state.BackendMSCP {
+		t.Fatalf("tasks = %+v", run.Tasks)
+	}
+	if run.Source.File != name || run.Source.Path != h.remoteDir {
+		t.Fatalf("source = %+v, want file %q under %q", run.Source, name, h.remoteDir)
+	}
+	if !strings.HasSuffix(run.Source.String(), "/"+name) {
+		t.Errorf("source string = %q", run.Source.String())
+	}
+	got, err := os.ReadFile(filepath.Join(h.src, name))
+	if err != nil {
+		t.Fatalf("downloaded file missing: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Error("single-file download content mismatch")
+	}
+	fi2, err := os.Stat(filepath.Join(h.src, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi2.Mode().Perm() != 0o640 || !fi2.ModTime().Equal(mtime) {
+		t.Errorf("downloaded metadata = %o %v, want %o %v", fi2.Mode().Perm(), fi2.ModTime(), 0o640, mtime)
+	}
+}
+
+// TestSyncSingleFileSourceMissing: a vanished single-file source fails the
+// run instead of producing an empty plan.
+func TestSyncSingleFileSourceMissing(t *testing.T) {
+	h := newHarness(t)
+	cfg := h.config()
+	cfg.SourceFile = "not-there.bin"
+	if _, err := Sync(context.Background(), cfg); err == nil {
+		t.Fatal("Sync with a missing single-file source = nil, want an error")
+	}
+}
+
+// TestResumeSingleFileDownload: resuming a point-to-point download
+// revalidates the single remote file (not its whole parent directory) and
+// completes it.
+func TestResumeSingleFileDownload(t *testing.T) {
+	if !mockexec.SFTPServerAvailable() {
+		t.Skip("real sftp-server is unavailable")
+	}
+	h := newHarness(t)
+	const name = "resume-me.bin"
+	remote := filepath.Join(h.remoteDir, name)
+	want := bytes.Repeat([]byte("resume-single-"), 512)
+	if err := os.WriteFile(remote, want, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	mtime := time.Unix(1_700_300_400, 111222333)
+	if err := os.Chtimes(remote, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := h.writeManifest("remote-source", "F\x00"+sourceManifestRecord(name, fi.Size(), fi.ModTime()))
+	h.writeScript("ssh", "match=if [ -d\nstdout_file="+manifest+"\n")
+	h.writeScript("rsync", "exit=0")
+
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := state.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &state.Run{
+		ID:        id,
+		Status:    state.StatusFailed,
+		CreatedAt: time.Now().UTC(),
+		Config: state.Config{
+			Direction:      state.DirectionRemoteToLocal,
+			Backend:        state.BackendMSCP,
+			Verify:         state.VerifyNone,
+			Jobs:           1,
+			Streams:        2,
+			LargeThreshold: 1024,
+		},
+		Source:      state.Source{User: "u", Host: "h", Path: h.remoteDir, File: name},
+		Destination: state.Destination{Path: h.src},
+		WorkDir:     h.src,
+		Tasks: []state.Task{{
+			Path:    name,
+			Size:    fi.Size(),
+			ModTime: fi.ModTime(),
+			Backend: state.BackendMSCP,
+			Status:  state.StatusPending,
+		}},
+	}
+	if err := store.Save(run); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = Resume(context.Background(), Config{
+		StateDir: h.stateDir,
+		Programs: h.config().Programs,
+		Env:      h.nativeEnv(),
+	}, run.ID)
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(h.src, name))
+	if err != nil {
+		t.Fatalf("downloaded file missing: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Error("resumed single-file download content mismatch")
+	}
+}
+
+// TestMirrorRefusesSingleFileSource: mirror sync deletes destination-only
+// entries across a whole tree, so a single-file source is refused instead of
+// mirroring the file's parent directory.
+func TestMirrorRefusesSingleFileSource(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("one.bin", 2048)
+	cfg := h.config()
+	cfg.Mirror = true
+	cfg.SourceFile = "one.bin"
+	if _, err := Sync(context.Background(), cfg); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("Sync mirror with a single-file source = %v, want ErrInvalidConfig", err)
+	}
+	// The remote (download) form is refused after the probe reveals a file.
+	const name = "remote.bin"
+	remote := filepath.Join(h.remoteDir, name)
+	if err := os.WriteFile(remote, make([]byte, 16), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := h.writeManifest("remote-source", "F\x00"+sourceManifestRecord(name, fi.Size(), fi.ModTime()))
+	h.writeScript("ssh", "match=if [ -d\nstdout_file="+manifest+"\n")
+	dcfg := h.config()
+	dcfg.Mirror = true
+	dcfg.Direction = target.RemoteToLocal
+	dcfg.Dest.Path = remote
+	if _, err := Sync(context.Background(), dcfg); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("Sync mirror with a single remote file = %v, want ErrInvalidConfig", err)
+	}
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 0 {
+		t.Errorf("rsync invocations = %d, want 0 (refused before any transfer)", got)
 	}
 }
