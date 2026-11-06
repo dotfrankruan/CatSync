@@ -193,12 +193,18 @@ current smoothed speed, elapsed time, ETA, ETD (estimated local completion
 clock time), and the active stage. It redraws one line on a terminal and is
 silent when redirected unless `--progress always` is selected.
 
-**SSH connection budget.** A run's estimated worst-case connection count is
-`jobs × streams` (each of up to `jobs` large-file transfers holds `streams`
-SFTP sessions; the native small-file stage uses up to `jobs` rsync+ssh
-processes; the manifest and verification phases use one). Configurations
-with `jobs × streams > 64` are rejected, so a typo cannot open hundreds of
-connections.
+**Parallelism and the SSH connection budget.** `--jobs` bounds how many files
+transfer concurrently and `--streams` bounds how many parallel SFTP sessions
+one large-file transfer holds (both default to 4). The stages run
+sequentially, so the peak connection count of a plan is the largest of
+`min(jobs, large files) × streams`, `min(jobs, small files)` (one ssh per
+concurrent rsync batch), and the conservative rsync stage — capped at 64.
+The budget is validated against the actual plan, so a single file (or a
+handful of large files) can use many streams: `--streams 32` with the default
+`--jobs 4` transfers one file over 32 sessions and is accepted, while a wide
+plan that would genuinely hold more than 64 connections is refused before
+anything is transferred. `--jobs` above 64 or `--streams` above 64 is always
+rejected.
 
 ## Backend selection
 

@@ -22,6 +22,7 @@ import (
 
 	"github.com/dotfrankruan/CatSync/internal/backend/multistream"
 	"github.com/dotfrankruan/CatSync/internal/epochtime"
+	"github.com/dotfrankruan/CatSync/internal/planner"
 	"github.com/dotfrankruan/CatSync/internal/state"
 	"github.com/dotfrankruan/CatSync/internal/target"
 	"github.com/dotfrankruan/CatSync/internal/testutil/mockexec"
@@ -3590,5 +3591,131 @@ func TestMirrorRefusesSingleFileSource(t *testing.T) {
 	}
 	if got := len(toolInvocations(h.invocations(), "rsync")); got != 0 {
 		t.Errorf("rsync invocations = %d, want 0 (refused before any transfer)", got)
+	}
+}
+
+// TestConnectionBudgetUsesPlannedConcurrency: the budget is checked against
+// what actually runs concurrently, so one file may use many streams while a
+// wide large-file tree is still refused.
+func TestConnectionBudgetUsesPlannedConcurrency(t *testing.T) {
+	mkPlan := func(backend state.Backend, n int) *PlanOutcome {
+		out := &PlanOutcome{Result: &planner.Result{}}
+		for i := 0; i < n; i++ {
+			out.Result.Decisions = append(out.Result.Decisions, planner.Decision{
+				Path:    fmt.Sprintf("f%d", i),
+				Backend: backend,
+				Status:  planner.StatusPending,
+			})
+		}
+		return out
+	}
+	h := newHarness(t)
+	newExec := func(jobs, streams int) *Executor {
+		cfg := h.config()
+		cfg.Jobs = jobs
+		cfg.Streams = streams
+		e, err := newExecutor(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+
+	// One large file with 32 streams: peak 32, allowed.
+	if err := newExec(4, 32).checkConnectionBudget(mkPlan(state.BackendMSCP, 1)); err != nil {
+		t.Errorf("single large file with 32 streams = %v, want allowed", err)
+	}
+	// Exactly at the boundary: 2 large files × 32 streams = 64.
+	if err := newExec(4, 32).checkConnectionBudget(mkPlan(state.BackendMSCP, 2)); err != nil {
+		t.Errorf("2 large files × 32 streams = %v, want allowed", err)
+	}
+	// 3 × 32 = 96 with only 4 jobs: only 3 run at once, so it is still 96.
+	if err := newExec(4, 32).checkConnectionBudget(mkPlan(state.BackendMSCP, 3)); !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("3 large files × 32 streams = %v, want ErrInvalidConfig", err)
+	}
+	// A wide tree with 16 jobs × 16 streams exceeds the budget.
+	if err := newExec(16, 16).checkConnectionBudget(mkPlan(state.BackendMSCP, 100)); !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("16 × 16 wide tree = %v, want ErrInvalidConfig", err)
+	}
+	// Small files only: one ssh per concurrent rsync batch.
+	if err := newExec(8, 64).checkConnectionBudget(mkPlan(state.BackendFPSync, 100)); err != nil {
+		t.Errorf("small-file-only plan = %v, want allowed", err)
+	}
+}
+
+// TestSyncSingleFileHighStreams: one file can use more streams than --jobs
+// (only one job ever runs), and those sessions are really opened.
+func TestSyncSingleFileHighStreams(t *testing.T) {
+	if !mockexec.SFTPServerAvailable() {
+		t.Skip("real sftp-server is unavailable")
+	}
+	h := newHarness(t)
+	const name = "many-streams.bin"
+	remote := filepath.Join(h.remoteDir, name)
+	want := bytes.Repeat([]byte("streams-"), 4096)
+	if err := os.WriteFile(remote, want, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	mtime := time.Unix(1_700_400_500, 0)
+	if err := os.Chtimes(remote, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := h.writeManifest("remote-source", "F\x00"+sourceManifestRecord(name, fi.Size(), fi.ModTime()))
+	h.writeScript("ssh", "match=if [ -d\nstdout_file="+manifest+"\n")
+	h.writeScript("rsync", "exit=0")
+
+	cfg := h.configNative()
+	cfg.Direction = target.RemoteToLocal
+	cfg.SourceDir = h.src
+	cfg.Dest.Path = remote
+	cfg.Backend = state.BackendMSCP
+	cfg.Verify = state.VerifyNone
+	cfg.Jobs = 4
+	cfg.Streams = 32
+
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Sync with 32 streams: %v", err)
+	}
+	if run.Status != state.StatusCompleted {
+		t.Fatalf("run = %s (%q)", run.Status, run.Error)
+	}
+	got, err := os.ReadFile(filepath.Join(h.src, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Error("content mismatch")
+	}
+	if sessions := len(sftpSessionInvocations(h.invocations())); sessions != 32 {
+		t.Errorf("sftp sessions = %d, want 32 (one per --streams)", sessions)
+	}
+}
+
+// TestSyncWideLargeTreeExceedsBudget: a plan that really would hold more than
+// the SSH budget fails before any transfer.
+func TestSyncWideLargeTreeExceedsBudget(t *testing.T) {
+	h := newHarness(t)
+	for i := 0; i < 8; i++ {
+		h.writeSrc(fmt.Sprintf("big%d.bin", i), 4096)
+	}
+	post := h.writeManifest("post", manifestContent())
+	h.scriptSSHFreshDest(post)
+	cfg := h.config()
+	cfg.Jobs = 8
+	cfg.Streams = 16 // 8 × 16 = 128 > 64
+
+	if _, err := Sync(context.Background(), cfg); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("Sync wide large tree = %v, want ErrInvalidConfig", err)
+	}
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 0 {
+		t.Errorf("rsync invocations = %d, want 0 (refused at plan time)", got)
+	}
+	if got := len(sftpSessionInvocations(h.invocations())); got != 0 {
+		t.Errorf("sftp sessions = %d, want 0 (refused at plan time)", got)
 	}
 }

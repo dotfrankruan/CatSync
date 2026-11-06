@@ -85,7 +85,7 @@ func (o *Options) bindSharedFlags(fs *flag.FlagSet) {
 	fs.StringVar(&o.StateDir, "state-dir", o.StateDir, "directory holding catsync run state")
 	fs.StringVar(&o.Verify, "verify", o.Verify, "completion verification: auto, none, size, or sha256")
 	fs.IntVar(&o.Jobs, "jobs", o.Jobs, "maximum parallel transfer jobs")
-	fs.IntVar(&o.Streams, "streams", o.Streams, "maximum parallel streams per job")
+	fs.IntVar(&o.Streams, "streams", o.Streams, "maximum parallel streams per job (for a single file: parallel SFTP sessions)")
 	fs.Var(&o.LargeThreshold, "large-threshold", "size at or above which a file counts as large (e.g. 512MiB)")
 }
 
@@ -126,8 +126,14 @@ func (o *Options) Validate() error {
 	if o.Streams < 1 {
 		return fmt.Errorf("--streams must be at least 1, got %d", o.Streams)
 	}
-	if o.Jobs*o.Streams > executor.MaxSSHConnections {
-		return fmt.Errorf("--jobs × --streams = %d exceeds the SSH connection budget of %d; lower one of them", o.Jobs*o.Streams, executor.MaxSSHConnections)
+	// The real concurrency depends on the plan (how many large files actually
+	// run at once), so the executor validates the peak after planning. Only
+	// the per-dimension sanity bounds are enforceable here.
+	if o.Jobs > executor.MaxSSHConnections {
+		return fmt.Errorf("--jobs = %d exceeds the SSH connection budget of %d", o.Jobs, executor.MaxSSHConnections)
+	}
+	if o.Streams > executor.MaxSSHConnections {
+		return fmt.Errorf("--streams = %d exceeds the SSH connection budget of %d", o.Streams, executor.MaxSSHConnections)
 	}
 	if o.Port < 0 || o.Port > 65535 {
 		return fmt.Errorf("--port must be between 1 and 65535, got %d", o.Port)

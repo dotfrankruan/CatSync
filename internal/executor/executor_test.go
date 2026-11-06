@@ -47,7 +47,11 @@ func TestValidateFull(t *testing.T) {
 		{"auto accepted", func(c *Config) { c.Verify = state.VerifyAuto }, nil},
 		{"zero jobs", func(c *Config) { c.Jobs = 0 }, ErrInvalidConfig},
 		{"zero streams", func(c *Config) { c.Streams = 0 }, ErrInvalidConfig},
-		{"connection budget", func(c *Config) { c.Jobs = 16; c.Streams = 16 }, ErrInvalidConfig},
+		// The peak depends on the plan, so high streams are accepted here
+		// and validated after planning (checkConnectionBudget).
+		{"high streams accepted at config time", func(c *Config) { c.Jobs = 4; c.Streams = 32 }, nil},
+		{"jobs over budget", func(c *Config) { c.Jobs = 65 }, ErrInvalidConfig},
+		{"streams over budget", func(c *Config) { c.Streams = 65 }, ErrInvalidConfig},
 		{"budget boundary", func(c *Config) { c.Jobs = 64; c.Streams = 1 }, nil},
 		{"negative port", func(c *Config) { c.Port = -1 }, ErrInvalidConfig},
 		{"port too large", func(c *Config) { c.Port = 65536 }, ErrInvalidConfig},

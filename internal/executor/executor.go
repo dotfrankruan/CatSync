@@ -162,8 +162,11 @@ func (c *Config) validateFull() error {
 	if c.Streams < 1 {
 		return fmt.Errorf("%w: streams must be at least 1, got %d", ErrInvalidConfig, c.Streams)
 	}
-	if c.Jobs*c.Streams > MaxSSHConnections {
-		return fmt.Errorf("%w: jobs × streams = %d exceeds the SSH connection budget %d", ErrInvalidConfig, c.Jobs*c.Streams, MaxSSHConnections)
+	if c.Jobs > MaxSSHConnections {
+		return fmt.Errorf("%w: jobs = %d exceeds the SSH connection budget %d", ErrInvalidConfig, c.Jobs, MaxSSHConnections)
+	}
+	if c.Streams > MaxSSHConnections {
+		return fmt.Errorf("%w: streams = %d exceeds the SSH connection budget %d", ErrInvalidConfig, c.Streams, MaxSSHConnections)
 	}
 	if c.Port < 0 || c.Port > 65535 {
 		return fmt.Errorf("%w: SSH port %d is outside 1..65535", ErrInvalidConfig, c.Port)
@@ -615,6 +618,69 @@ func Plan(ctx context.Context, cfg Config) (*PlanOutcome, error) {
 	return e.planPhase(ctx)
 }
 
+// checkConnectionBudget validates the planned peak number of concurrent SSH
+// connections against MaxSSHConnections. The stages run sequentially, so the
+// peak is the largest of:
+//
+//   - the native large-file stage: min(Jobs, large files) transfers, each
+//     holding Streams sessions;
+//   - the parallel-rsync small-file stage: min(Jobs, small files) rsync
+//     processes, each with one SSH connection;
+//   - the conservative rsync stage: likewise.
+//
+// Using the planned work instead of Jobs × Streams means a single-file or
+// few-large-file run is not penalized by a --jobs value that never runs
+// concurrently: one file can use up to MaxSSHConnections streams.
+func (e *Executor) checkConnectionBudget(out *PlanOutcome) error {
+	large, small, conservative := 0, 0, 0
+	for _, d := range out.Result.Decisions {
+		if d.Status != planner.StatusPending {
+			continue
+		}
+		switch d.Backend {
+		case state.BackendMSCP:
+			large++
+		case state.BackendFPSync:
+			small++
+		case state.BackendRsync:
+			conservative++
+		}
+	}
+	jobs := e.cfg.Jobs
+	if jobs < 1 {
+		jobs = 1
+	}
+	streams := e.cfg.Streams
+	if streams < 1 {
+		streams = 1
+	}
+	nativePeak := jobs
+	if large < nativePeak {
+		nativePeak = large
+	}
+	nativePeak *= streams
+	smallPeak := jobs
+	if small < smallPeak {
+		smallPeak = small
+	}
+	conservativePeak := jobs
+	if conservative < conservativePeak {
+		conservativePeak = conservative
+	}
+	peak := nativePeak
+	if smallPeak > peak {
+		peak = smallPeak
+	}
+	if conservativePeak > peak {
+		peak = conservativePeak
+	}
+	if peak > MaxSSHConnections {
+		return fmt.Errorf("%w: the plan can hold up to %d concurrent SSH connections (%d large file(s) × %d stream(s) per job), exceeding the budget %d; lower --streams or --jobs",
+			ErrInvalidConfig, peak, nativePeak/streams, streams, MaxSSHConnections)
+	}
+	return nil
+}
+
 // planPhase performs discovery, manifest collection, and planning.
 func (e *Executor) planPhase(ctx context.Context) (*PlanOutcome, error) {
 	if err := e.requireSSH(); err != nil {
@@ -643,6 +709,9 @@ func (e *Executor) planPhase(ctx context.Context) (*PlanOutcome, error) {
 			if d.Status == planner.StatusPending {
 				out.LogicalBytes += d.Size
 			}
+		}
+		if err := e.checkConnectionBudget(out); err != nil {
+			return nil, err
 		}
 		return out, nil
 	}
@@ -695,6 +764,9 @@ func (e *Executor) planPhase(ctx context.Context) (*PlanOutcome, error) {
 		if d.Status == planner.StatusPending {
 			out.LogicalBytes += d.Size
 		}
+	}
+	if err := e.checkConnectionBudget(out); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

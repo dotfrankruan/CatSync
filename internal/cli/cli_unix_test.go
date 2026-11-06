@@ -483,8 +483,8 @@ func TestCLIUsageAndRuntimeExitCodes(t *testing.T) {
 	if code, _, _ := run(t, "sync", "--bogus", h.src, "u@h:/d"); code != ExitUsage {
 		t.Errorf("unknown flag exit = %d, want %d", code, ExitUsage)
 	}
-	// Usage: jobs x streams over budget.
-	if code, _, _ := run(t, "sync", "--jobs", "64", "--streams", "64", h.src, "u@h:/d"); code != ExitUsage {
+	// Usage: one dimension over the SSH connection budget.
+	if code, _, _ := run(t, "sync", "--streams", "65", h.src, "u@h:/d"); code != ExitUsage {
 		t.Errorf("over-budget exit = %d, want %d", code, ExitUsage)
 	}
 	for _, value := range []string{"-1", "65536"} {
@@ -914,8 +914,10 @@ func TestCLISingleFileDownloadEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	dest := filepath.Join(t.TempDir(), "download")
+	// --streams may exceed --jobs for a single file: only one job runs.
 	code, _, stderr := run(t, "copy", "--verify", "none", "--state-dir", h.stateDir,
-		"--large-threshold", "1KiB", "user@host:"+remote, dest)
+		"--large-threshold", "1KiB", "--jobs", "4", "--streams", "16",
+		"user@host:"+remote, dest)
 	if code != ExitOK {
 		t.Fatalf("copy exit = %d, stderr:\n%s", code, stderr)
 	}

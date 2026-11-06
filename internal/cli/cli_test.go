@@ -245,7 +245,8 @@ func TestSharedOptionValidation(t *testing.T) {
 		{"quiet and verbose", []string{"--quiet", "--verbose"}, "cannot be used together"},
 		{"zero jobs", []string{"--jobs", "0"}, "--jobs"},
 		{"negative streams", []string{"--streams=-1"}, "--streams"},
-		{"budget exceeded", []string{"--jobs", "64", "--streams", "64"}, "budget"},
+		{"jobs over budget", []string{"--jobs", "65"}, "budget"},
+		{"streams over budget", []string{"--streams", "65"}, "budget"},
 		{"bad threshold", []string{"--large-threshold", "ten"}, "invalid value"},
 		{"empty state dir", []string{"--state-dir", ""}, "--state-dir"},
 	}
