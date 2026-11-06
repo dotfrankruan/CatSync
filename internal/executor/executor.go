@@ -340,7 +340,7 @@ func (e *Executor) startProgress() {
 		// the interrupted figure: bytes written but not fsynced before the
 		// interruption are not durable and get transferred again.
 		e.logf("resume: continuing from %s of %s already durable (chunks confirmed by checkpoints)",
-			bytesize.Size(baseline), bytesize.Size(total))
+			bytesize.Human(baseline), bytesize.Human(total))
 	}
 }
 

@@ -153,3 +153,18 @@ func ExampleParse() {
 	fmt.Println(strings.TrimSuffix(n.String(), "B")) // print to keep example simple
 	// Output: 1536Mi
 }
+
+func TestHumanRendering(t *testing.T) {
+	cases := map[uint64]string{
+		0:                 "0 B",
+		1023:              "1023 B",
+		1024:              "1.0 KiB",
+		640 * 1024 * 1024: "640.0 MiB",
+		19_700_000_000:    "18.3 GiB",
+	}
+	for n, want := range cases {
+		if got := Human(n); got != want {
+			t.Errorf("Human(%d) = %q, want %q", n, got, want)
+		}
+	}
+}

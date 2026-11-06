@@ -154,6 +154,22 @@ func (s Size) String() string {
 	return fmt.Sprintf("%dB", n)
 }
 
+// Human renders n with one decimal place in the largest IEC unit that keeps
+// it at least 1.0, e.g. "640.0 MiB" or "18.3 GiB". It is for user-facing
+// messages; Size.String stays exact so flag values round-trip.
+func Human(n uint64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := uint64(unit), 0
+	for q := n / unit; q >= unit && exp < 5; q /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
 // Bytes returns the size as a plain uint64 byte count.
 func (s Size) Bytes() uint64 { return uint64(s) }
 
