@@ -93,6 +93,8 @@ func (o *Options) bindSharedFlags(fs *flag.FlagSet) {
 	fs.IntVar(&o.Jobs, "jobs", o.Jobs, "maximum parallel transfer jobs")
 	fs.IntVar(&o.Streams, "streams", o.Streams, "maximum parallel streams per job (for a single file: parallel SFTP sessions)")
 	fs.Var(&o.LargeThreshold, "large-threshold", "size at or above which a file counts as large (e.g. 512MiB)")
+	fs.StringVar(&o.OnAuthFailure, "on-auth-failure", o.OnAuthFailure,
+		"behavior when ssh authentication is rejected: fail (run stays resumable) or retry (ask to renew credentials, then retry the stage)")
 }
 
 // validateOutput checks the options shared by every command.
