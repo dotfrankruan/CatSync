@@ -86,8 +86,21 @@ make cross     # dist/ binaries: linux/amd64, linux/arm64, darwin/arm64
 make clean     # remove bin/ and dist/
 ```
 
-Install with `go install github.com/dotfrankruan/CatSync/cmd/catsync@latest`
-or copy `bin/catsync` into your `PATH`.
+### Installing
+
+```sh
+make install             # build and install to ~/.local/bin/catsync
+make install PREFIX=/usr/local   # or another prefix (needs write access)
+make uninstall           # remove it again
+```
+
+`make install` needs no sudo by default: `PREFIX` defaults to `$(HOME)/.local`
+and the binary lands in `$(PREFIX)/bin`. Use `DESTDIR=/tmp/stage` to stage a
+package build. If the target directory is not in `PATH`, the target prints the
+`export PATH=...` line to add.
+
+Alternatively `go install github.com/dotfrankruan/CatSync/cmd/catsync@latest`,
+or copy `bin/catsync` anywhere in your `PATH`.
 
 ## Commands
 
