@@ -4302,11 +4302,12 @@ func TestResumeProgressStartsAtDurableBytes(t *testing.T) {
 				Status: state.StatusPending, Checkpoint: ckptPath},
 		},
 	}
-	var stderr strings.Builder
+	var stderr, stdout strings.Builder
 	cfg := h.config()
 	cfg.Progress = true
 	cfg.ProgressTerminal = false
 	cfg.Stderr = &stderr
+	cfg.Stdout = &stdout
 	e, err := newExecutor(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -4321,5 +4322,8 @@ func TestResumeProgressStartsAtDurableBytes(t *testing.T) {
 	// Completed file (1000) + two durable chunks of the native file (2000).
 	if got, want := e.progress.Done(), uint64(3000); got != want {
 		t.Errorf("baseline = %d, want %d (durable bytes)", got, want)
+	}
+	if !strings.Contains(stdout.String(), "already durable") {
+		t.Errorf("resume should announce the durable fast-forward:\n%s", stdout.String())
 	}
 }

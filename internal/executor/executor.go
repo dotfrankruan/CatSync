@@ -37,6 +37,7 @@ import (
 
 	"github.com/dotfrankruan/CatSync/internal/backend"
 	"github.com/dotfrankruan/CatSync/internal/backend/multistream"
+	"github.com/dotfrankruan/CatSync/internal/bytesize"
 	"github.com/dotfrankruan/CatSync/internal/discovery"
 	"github.com/dotfrankruan/CatSync/internal/planner"
 	"github.com/dotfrankruan/CatSync/internal/process"
@@ -334,6 +335,13 @@ func (e *Executor) startProgress() {
 		}
 	}
 	e.progress = progressui.NewWithBaseline(e.stderr, total, baseline, e.cfg.ProgressTerminal)
+	if baseline > 0 {
+		// Say what the fast-forward means, and why it can be slightly below
+		// the interrupted figure: bytes written but not fsynced before the
+		// interruption are not durable and get transferred again.
+		e.logf("resume: continuing from %s of %s already durable (chunks confirmed by checkpoints)",
+			bytesize.Size(baseline), bytesize.Size(total))
+	}
 }
 
 // nativeCompletedBytes reports how many bytes of a native large-file task are
