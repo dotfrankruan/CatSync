@@ -1427,12 +1427,13 @@ func (e *Executor) retireCheckpoint(t *state.Task) error {
 // connection dropped during verification — and re-running the stage would
 // transfer it again.
 //
-// This is the resume analogue of rsync's quick check, and it is restricted to
-// the rsync-driven backends where that check is already the acceptance
-// criterion. Native large-file tasks are deliberately excluded: their
-// checkpoint plus the same-inode publish probe are the authoritative recovery
-// path, and claiming completion from metadata alone could accept a foreign
-// file that merely matches.
+// This is the resume analogue of rsync's quick check and applies to every
+// backend, including the native large-file stage: the immutable plan recorded
+// the file as absent at planning time, so a destination entry that now matches
+// the planned size and nanosecond mtime can only be this run's own interrupted
+// write. A native task reconciled this way also has its leftover checkpoint and
+// temporary object retired, because the published file is already live and no
+// transfer remains.
 //
 // A failure to read the destination manifest is a warning, not a resume
 // failure: the stages then simply do their normal work.
@@ -1441,9 +1442,6 @@ func (e *Executor) reconcileAlreadyPresent(ctx context.Context) {
 	var candidates []*state.Task
 	for i := range e.run.Tasks {
 		t := &e.run.Tasks[i]
-		if t.Backend == state.BackendMSCP {
-			continue
-		}
 		if t.Status != state.StatusPending && t.Status != state.StatusFailed {
 			continue
 		}
@@ -1476,6 +1474,10 @@ func (e *Executor) reconcileAlreadyPresent(ctx context.Context) {
 		}
 		// Native temp objects and rsync partials are not destination
 		// entries, so a matching entry here means the file itself is done.
+		tempPath := ""
+		if t.Backend == state.BackendMSCP {
+			tempPath = e.nativeTempPath(t)
+		}
 		e.runMu.Lock()
 		prevStatus, prevErr := t.Status, t.Error
 		t.Status = state.StatusCompleted
@@ -1486,6 +1488,14 @@ func (e *Executor) reconcileAlreadyPresent(ctx context.Context) {
 			t.Status, t.Error = prevStatus, prevErr
 			e.runMu.Unlock()
 			return
+		}
+		// The published file is live and completion is durable: retire the
+		// remaining resume artifacts, best effort.
+		if t.Backend == state.BackendMSCP {
+			if err := e.retireCheckpoint(t); err != nil {
+				e.warnf("resume reconciliation: retire checkpoint for %s: %v", t.Path, err)
+			}
+			e.removeNativeTemp(ctx, tempPath)
 		}
 		reconciled++
 	}

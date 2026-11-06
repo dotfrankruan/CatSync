@@ -273,11 +273,14 @@ instead of blocking, and without a terminal the retry loop never runs.
 
 ### Resume reconciliation
 
-Before any stage runs, a resume compares pending or failed rsync-driven tasks
-with the destination manifest and marks a task completed when its destination
-entry already has the planned size and nanosecond mtime. An interrupted run can
-have written a file completely while its completion was never recorded — for
-example when the connection dropped during verification — and this avoids
-transferring it again. Native large-file tasks are excluded: their checkpoint
-and the same-inode publish probe are the authoritative recovery path, and a
-metadata match alone could accept a foreign file.
+Before any stage runs, a resume compares pending or failed tasks with the
+destination manifest and marks a task completed when its destination entry
+already has the planned size and nanosecond mtime. An interrupted run can have
+written a file completely while its completion was never recorded — for example
+when the connection dropped during verification — and this avoids transferring
+it again. The immutable plan recorded the file as absent at planning time, so a
+matching entry can only be this run's own interrupted write. A reconciled native
+large-file task also retires its leftover checkpoint and temporary object, since
+the published file is already live. Files whose metadata differs are never
+claimed: they keep their normal stage, and the no-clobber publish still refuses
+to overwrite them.

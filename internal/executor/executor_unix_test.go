@@ -1088,8 +1088,9 @@ func TestSyncSizeMismatchFails(t *testing.T) {
 func TestResumeReusesCheckpoint(t *testing.T) {
 	h := newHarness(t)
 	h.writeSrc("big.bin", 1<<20) // 1 MiB — several chunks at 256 KiB windows
-	post := h.writeManifest("post", manifestContent(h.newFileRecord("big.bin")))
-	h.scriptSSHFreshDest(post)
+	// The destination stays empty: resume must continue from the checkpoint,
+	// not reconcile anything.
+	h.writeScript("ssh", "match=if [ -d\nexit=42\n")
 
 	// Session #1 is the hardlink probe; session #2 (first transfer
 	// session) fails. The checkpoint exists with no completed chunk and
@@ -1161,8 +1162,8 @@ func TestResumeReusesCheckpoint(t *testing.T) {
 func TestResumeWithoutCheckpointRestartsFresh(t *testing.T) {
 	h := newHarness(t)
 	h.writeSrc("big.bin", 1<<20)
-	post := h.writeManifest("post", manifestContent(h.newFileRecord("big.bin")))
-	h.scriptSSHFreshDest(post)
+	// The destination stays empty: resume must restart the transfer.
+	h.writeScript("ssh", "match=if [ -d\nexit=42\n")
 
 	cfg := h.configNative()
 	cfg.Verify = state.VerifyNone
@@ -3276,18 +3277,26 @@ func TestNativeResumePublishedCrashWindowProbeFailure(t *testing.T) {
 	crafted := craftNativeRun(t, h, first.Tasks[0].Checkpoint)
 	_ = first.Tasks[0].Checkpoint
 
-	// The probe session now fails: not "unsupported", a real error.
+	// The destination already holds the published file with the planned size
+	// and nanosecond mtime, so resume reconciles it: no probe session is
+	// needed, no rsync may run, and the final must not be touched. (Before
+	// resume reconciliation this scenario exercised the probe-error fail-closed
+	// path; reconciliation is the safer shortcut for an already-published
+	// file.)
 	env := h.nativeEnv("MOCKEXEC_SFTP_FAILNTH=1")
-	_, rerr := Resume(context.Background(), Config{
+	sessionsBefore := len(sftpSessionInvocations(h.invocations()))
+	if _, rerr := Resume(context.Background(), Config{
 		StateDir: h.stateDir,
 		Programs: h.config().Programs,
 		Env:      env,
-	}, crafted.ID)
-	if rerr == nil {
-		t.Fatal("Resume = nil, want the probe failure")
+	}, crafted.ID); rerr != nil {
+		t.Fatalf("Resume of an already-published file: %v", rerr)
 	}
 	if got := len(toolInvocations(h.invocations(), "rsync")); got != 0 {
-		t.Errorf("rsync invocations = %d, want 0 (a probe error never falls back)", got)
+		t.Errorf("rsync invocations = %d, want 0", got)
+	}
+	if got := len(sftpSessionInvocations(h.invocations())) - sessionsBefore; got > 1 {
+		t.Errorf("sftp sessions opened by the resume = %d, want at most 1 (cleanup only, no probe)", got)
 	}
 	got, err := os.ReadFile(final)
 	if err != nil {
@@ -4087,5 +4096,167 @@ func TestReauthenticationDeclinedStopsRetrying(t *testing.T) {
 	}
 	if got := len(toolInvocations(h.invocations(), "rsync")); got != 1 {
 		t.Errorf("rsync invocations = %d, want 1 (declined, no retry)", got)
+	}
+}
+
+// TestResumeReconcilesNativeFile: a native large file already published at the
+// destination (the connection dropped before completion was recorded) is marked
+// completed on resume without opening a transfer session, and its checkpoint and
+// temporary object are retired.
+func TestResumeReconcilesNativeFile(t *testing.T) {
+	if !mockexec.SFTPServerAvailable() {
+		t.Skip("real sftp-server is unavailable")
+	}
+	h := newHarness(t)
+	h.writeSrc("big.bin", 4096)
+	const name = "big.bin"
+	final := filepath.Join(h.remoteDir, name)
+	payload, err := os.ReadFile(filepath.Join(h.src, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The published file: exactly the planned size and nanosecond mtime.
+	if err := os.WriteFile(final, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	size, mt := h.srcMeta(name)
+	if err := os.Chtimes(final, mt, mt); err != nil {
+		t.Fatal(err)
+	}
+	// The leftover temporary object from the interrupted transfer.
+	tempPath := filepath.Join(h.remoteDir, ".catsync-tmp-"+name+"-deadbeef")
+	if err := os.WriteFile(tempPath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Its checkpoint, which recorded the temporary path.
+	ckptDir := filepath.Join(h.stateDir, "checkpoints", "crafted")
+	if err := os.MkdirAll(ckptDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ckptPath := filepath.Join(ckptDir, "big.nativeckpt")
+	ckpt, err := multistream.NewCheckpoint(name, uint64(size), mt, "u@h:"+final, tempPath, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ckpt.Save(ckptPath); err != nil {
+		t.Fatal(err)
+	}
+	// The destination manifest reports the published file.
+	post := h.writeManifest("post", manifestContent(h.newFileRecord(name)))
+	h.writeScript("ssh", "match=if [ -d\nstdout_file="+post+"\n")
+
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := state.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &state.Run{
+		ID:        id,
+		Status:    state.StatusFailed,
+		CreatedAt: time.Now().UTC(),
+		Config: state.Config{
+			Backend: state.BackendMSCP, Verify: state.VerifyNone,
+			Jobs: 1, Streams: 2, LargeThreshold: 1024,
+		},
+		Source:      state.Source{Path: h.src},
+		Destination: state.Destination{User: "u", Host: "h", Path: h.remoteDir},
+		WorkDir:     h.src,
+		Tasks: []state.Task{{
+			Path: name, Size: size, ModTime: mt,
+			Backend: state.BackendMSCP, Status: state.StatusPending,
+			Checkpoint: ckptPath,
+		}},
+	}
+	if err := store.Save(run); err != nil {
+		t.Fatal(err)
+	}
+
+	_, rerr := Resume(context.Background(), Config{
+		StateDir: h.stateDir,
+		Programs: h.config().Programs,
+		Env:      h.nativeEnv(),
+	}, run.ID)
+	if rerr != nil {
+		t.Fatalf("Resume: %v", rerr)
+	}
+	// Only the best-effort temp cleanup may open a session; no transfer may.
+	if got := len(sftpSessionInvocations(h.invocations())); got > 1 {
+		t.Errorf("sftp sessions = %d, want at most 1 (cleanup only)", got)
+	}
+	if _, err := os.Stat(ckptPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("checkpoint left behind after reconciliation: %v", err)
+	}
+	if _, err := os.Stat(tempPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("temporary object left behind after reconciliation: %v", err)
+	}
+	if _, err := os.Stat(final); err != nil {
+		t.Errorf("published final must survive reconciliation: %v", err)
+	}
+	loaded, err := store.Load(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Status != state.StatusCompleted || loaded.Tasks[0].Status != state.StatusCompleted {
+		t.Errorf("run/task = %s/%s, want completed", loaded.Status, loaded.Tasks[0].Status)
+	}
+}
+
+// TestResumeDoesNotReconcileDifferentNativeFile: a destination file that does
+// not match the plan is never claimed; the native stage runs and the existing
+// file is left untouched by the no-clobber publish.
+func TestResumeDoesNotReconcileDifferentNativeFile(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("big.bin", 4096)
+	size, mt := h.srcMeta("big.bin")
+	// A real destination file that differs from the plan.
+	if err := os.WriteFile(filepath.Join(h.remoteDir, "big.bin"), []byte("different"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	post := h.writeManifest("post", manifestContent())
+	h.writeScript("ssh", "match=if [ -d\nstdout_file="+post+"\n")
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := state.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &state.Run{
+		ID:        id,
+		Status:    state.StatusFailed,
+		CreatedAt: time.Now().UTC(),
+		Config: state.Config{
+			Backend: state.BackendMSCP, Verify: state.VerifyNone,
+			Jobs: 1, Streams: 2, LargeThreshold: 1024,
+		},
+		Source:      state.Source{Path: h.src},
+		Destination: state.Destination{User: "u", Host: "h", Path: h.remoteDir},
+		WorkDir:     h.src,
+		Tasks: []state.Task{{
+			Path: "big.bin", Size: size, ModTime: mt,
+			Backend: state.BackendMSCP, Status: state.StatusPending,
+		}},
+	}
+	if err := store.Save(run); err != nil {
+		t.Fatal(err)
+	}
+	_, rerr := Resume(context.Background(), Config{
+		StateDir: h.stateDir,
+		Programs: h.config().Programs,
+		Env:      h.nativeEnv(),
+	}, run.ID)
+	if rerr == nil {
+		t.Fatal("Resume = nil, want the native stage to attempt the transfer")
+	}
+	loaded, err := store.Load(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Tasks[0].Status == state.StatusCompleted {
+		t.Error("a mismatched destination file must not be marked completed")
 	}
 }
