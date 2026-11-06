@@ -34,18 +34,48 @@ type Reporter struct {
 
 // New starts a reporter. A nil writer disables reporting and returns nil.
 func New(w io.Writer, total uint64, terminal bool) *Reporter {
+	return NewWithBaseline(w, total, 0, terminal)
+}
+
+// NewWithBaseline starts a reporter whose already-completed byte count is
+// known. A resumed transfer uses it so the bar, percentage, and ETA describe
+// the whole run instead of only the bytes this process moves.
+func NewWithBaseline(w io.Writer, total, baseline uint64, terminal bool) *Reporter {
 	if w == nil {
 		return nil
 	}
+	if baseline > total {
+		baseline = total
+	}
 	now := time.Now()
 	r := &Reporter{
-		w: w, total: total, start: now, lastSample: now,
+		w: w, total: total, done: baseline, start: now, lastSample: now, lastBytes: baseline,
 		phase: "starting", terminal: terminal,
 		stop: make(chan struct{}), stopped: make(chan struct{}),
 	}
 	r.draw(now, true)
 	go r.loop()
 	return r
+}
+
+// Total returns the planned byte count.
+func (r *Reporter) Total() uint64 {
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.total
+}
+
+// Done returns the bytes transferred or already known complete.
+func (r *Reporter) Done() uint64 {
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.done
 }
 
 func (r *Reporter) loop() {

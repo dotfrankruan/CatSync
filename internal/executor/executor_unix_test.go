@@ -4260,3 +4260,66 @@ func TestResumeDoesNotReconcileDifferentNativeFile(t *testing.T) {
 		t.Error("a mismatched destination file must not be marked completed")
 	}
 }
+
+// TestResumeProgressStartsAtDurableBytes: a resumed run's progress display
+// starts at the bytes its checkpoints already confirm, so it fast-forwards
+// over the transferred part instead of restarting at zero.
+func TestResumeProgressStartsAtDurableBytes(t *testing.T) {
+	h := newHarness(t)
+	ckptDir := filepath.Join(h.stateDir, "checkpoints", "crafted")
+	if err := os.MkdirAll(ckptDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// 4 chunks of 1000 bytes, the first two durable.
+	ckptPath := filepath.Join(ckptDir, "big.nativeckpt")
+	mt := time.Unix(1_700_700_800, 0)
+	ckpt, err := multistream.NewCheckpoint("big.bin", 4000, mt, "u@h:/data/big.bin", "/data/.catsync-tmp-big", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, idx := range []int{0, 1} {
+		if err := ckpt.MarkComplete(idx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := ckpt.Save(ckptPath); err != nil {
+		t.Fatal(err)
+	}
+	run := &state.Run{
+		ID:        "progress-run",
+		Status:    state.StatusFailed,
+		CreatedAt: time.Now().UTC(),
+		Config: state.Config{
+			Backend: state.BackendMSCP, Verify: state.VerifyNone,
+			Jobs: 1, Streams: 1, LargeThreshold: 1024,
+		},
+		Source:      state.Source{Path: h.src},
+		Destination: state.Destination{User: "u", Host: "h", Path: "/data"},
+		WorkDir:     h.src,
+		Tasks: []state.Task{
+			{Path: "done.bin", Size: 1000, ModTime: mt, Backend: state.BackendFPSync, Status: state.StatusCompleted},
+			{Path: "big.bin", Size: 4000, ModTime: mt, Backend: state.BackendMSCP,
+				Status: state.StatusPending, Checkpoint: ckptPath},
+		},
+	}
+	var stderr strings.Builder
+	cfg := h.config()
+	cfg.Progress = true
+	cfg.ProgressTerminal = false
+	cfg.Stderr = &stderr
+	e, err := newExecutor(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.run = run
+	e.startProgress()
+	defer e.progress.Finish(false)
+
+	if got, want := e.progress.Total(), uint64(5000); got != want {
+		t.Errorf("total = %d, want %d (completed + transferable)", got, want)
+	}
+	// Completed file (1000) + two durable chunks of the native file (2000).
+	if got, want := e.progress.Done(), uint64(3000); got != want {
+		t.Errorf("baseline = %d, want %d (durable bytes)", got, want)
+	}
+}

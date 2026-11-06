@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"github.com/dotfrankruan/CatSync/internal/backend"
+	"github.com/dotfrankruan/CatSync/internal/backend/multistream"
 	"github.com/dotfrankruan/CatSync/internal/discovery"
 	"github.com/dotfrankruan/CatSync/internal/planner"
 	"github.com/dotfrankruan/CatSync/internal/process"
@@ -307,22 +308,61 @@ func (e *Executor) startProgress() {
 	if !e.cfg.Progress || e.run == nil || e.progress != nil {
 		return
 	}
-	var total uint64
+	var total, baseline uint64
 	for _, task := range e.run.Tasks {
+		if task.Size <= 0 {
+			continue
+		}
+		size := uint64(task.Size)
 		if e.run.Config.Mirror {
-			if task.Size > 0 {
-				total += uint64(task.Size)
-			}
+			// The mirror reconciliation re-examines the whole tree.
+			total += size
 			continue
 		}
 		switch task.Status {
-		case state.StatusPending, state.StatusFailed, state.StatusRunning:
-			if task.Size > 0 {
-				total += uint64(task.Size)
-			}
+		case state.StatusPending, state.StatusFailed, state.StatusRunning, state.StatusCompleted:
+			// The planned transfer set: completed files still count so a
+			// resumed run's bar describes the whole transfer.
+			total += size
+		}
+		if task.Status == state.StatusCompleted {
+			baseline += size
+			continue
+		}
+		if task.Status == state.StatusPending || task.Status == state.StatusFailed || task.Status == state.StatusRunning {
+			baseline += e.nativeCompletedBytes(&task)
 		}
 	}
-	e.progress = progressui.New(e.stderr, total, e.cfg.ProgressTerminal)
+	e.progress = progressui.NewWithBaseline(e.stderr, total, baseline, e.cfg.ProgressTerminal)
+}
+
+// nativeCompletedBytes reports how many bytes of a native large-file task are
+// already durably transferred according to its checkpoint, so a resumed run's
+// progress starts where the interrupted one stopped. Unknown or unreadable
+// state contributes nothing.
+func (e *Executor) nativeCompletedBytes(t *state.Task) uint64 {
+	if t.Backend != state.BackendMSCP || t.Checkpoint == "" {
+		return 0
+	}
+	ck, err := multistream.LoadCheckpoint(t.Checkpoint)
+	if err != nil {
+		return 0
+	}
+	chunks, err := multistream.Plan(ck.Size, ck.ChunkSize)
+	if err != nil {
+		return 0
+	}
+	completed := ck.CompletedSet()
+	var done uint64
+	for _, chunk := range chunks {
+		if _, ok := completed[chunk.Index]; ok {
+			done += uint64(chunk.Length)
+		}
+	}
+	if done > ck.Size {
+		done = ck.Size
+	}
+	return done
 }
 
 func (e *Executor) addProgress(n uint64) {

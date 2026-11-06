@@ -26,3 +26,35 @@ func TestReporterClampsAndFinishes(t *testing.T) {
 		t.Fatalf("final output: %s", got)
 	}
 }
+
+// TestBaselineShapesTheWholeRun: a resumed reporter starts at the bytes that
+// are already durable, so the bar and percentage describe the whole transfer.
+func TestBaselineShapesTheWholeRun(t *testing.T) {
+	var buf strings.Builder
+	r := NewWithBaseline(&buf, 1000, 250, false)
+	defer r.Finish(false)
+	if got := r.Total(); got != 1000 {
+		t.Errorf("Total = %d, want 1000", got)
+	}
+	if got := r.Done(); got != 250 {
+		t.Errorf("Done = %d, want the 250-byte baseline", got)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "25.00%") {
+		t.Errorf("first snapshot should report 25.0%%:\n%s", out)
+	}
+	if !strings.Contains(out, "250 B/1000 B") {
+		t.Errorf("first snapshot should report the seeded bytes:\n%s", out)
+	}
+	// Newly transferred bytes add on top of the baseline.
+	r.Add(750)
+	if got := r.Done(); got != 1000 {
+		t.Errorf("Done after Add = %d, want 1000", got)
+	}
+	// A baseline larger than the total is clamped.
+	r2 := NewWithBaseline(&strings.Builder{}, 100, 500, false)
+	defer r2.Finish(false)
+	if got := r2.Done(); got != 100 {
+		t.Errorf("clamped Done = %d, want 100", got)
+	}
+}
