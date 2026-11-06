@@ -5,13 +5,17 @@ package multistream
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -264,14 +268,107 @@ func runFakeSSH() int {
 	return 0
 }
 
-// helperConfig builds an SFTPConfig running the test binary as fake ssh,
-// recording into recordDir, with cfgExtra environment additions.
+// helperProgram returns the fake-ssh program: a copy of this package's test
+// binary built *without* -race. Executing the race-instrumented test binary as
+// the fake ssh made every simulated session pay race-runtime startup (~1.5 s),
+// which dominated the race suite. It falls back to the running test binary when
+// the extra build is not possible.
+func helperProgram(t *testing.T) string {
+	t.Helper()
+	if p := os.Getenv("CATSYNC_TEST_SFTP_HELPER_BIN"); p != "" {
+		return p
+	}
+	helperOnce.Do(func() {
+		helperProg, helperErr = buildPlainTestBinary()
+	})
+	if helperErr != nil {
+		p, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	return helperProg
+}
+
+var (
+	helperOnce sync.Once
+	helperProg string
+	helperErr  error
+)
+
+// buildPlainTestBinary compiles this package's test binary without race
+// instrumentation into a content-addressed cache directory.
+func buildPlainTestBinary() (string, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	root := dir
+	for {
+		if _, err := os.Stat(filepath.Join(root, "go.mod")); err == nil {
+			break
+		}
+		parent := filepath.Dir(root)
+		if parent == root {
+			return "", fmt.Errorf("module root not found from %s", dir)
+		}
+		root = parent
+	}
+	key, err := packageDigest(dir)
+	if err != nil {
+		return "", err
+	}
+	outDir := filepath.Join(os.TempDir(), "catsync-multistream-helper-"+key)
+	out := filepath.Join(outDir, "multistream.test")
+	if fi, err := os.Stat(out); err == nil && fi.Mode().IsRegular() {
+		return out, nil
+	}
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return "", err
+	}
+	tmp := out + ".tmp"
+	cmd := exec.Command("go", "test", "-c", "-o", tmp, "./internal/backend/multistream")
+	cmd.Dir = root
+	if combined, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("build fake-ssh helper: %v (%s)", err, strings.TrimSpace(string(combined)))
+	}
+	if err := os.Rename(tmp, out); err != nil {
+		return "", err
+	}
+	return out, nil
+}
+
+// packageDigest hashes this package's Go sources so a change rebuilds the helper.
+func packageDigest(dir string) (string, error) {
+	h := sha256.New()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", err
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".go") {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			return "", err
+		}
+		h.Write([]byte(name))
+		h.Write(data)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16], nil
+}
+
+// helperConfig builds an SFTPConfig running the fake-ssh helper, recording into
+// recordDir, with cfgExtra environment additions.
 func helperConfig(t *testing.T, recordDir string, extra ...string) SFTPConfig {
 	t.Helper()
-	prog, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
+	prog := helperProgram(t)
 	env := []string{envHelper + "=1"}
 	if recordDir != "" {
 		env = append(env, envRecord+"="+recordDir)
