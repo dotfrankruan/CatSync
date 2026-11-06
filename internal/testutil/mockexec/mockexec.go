@@ -34,15 +34,20 @@
 package mockexec
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -709,11 +714,115 @@ func record(dir string, stdin []byte) {
 // Program returns the running test binary's path, for use as the mock
 // executable (a backend's program override or a process.Spec name).
 func Program() (string, error) {
+	return helperBinary()
+}
+
+// helperBinary returns the standalone mock helper binary, building it once per
+// machine into a content-addressed temp directory. Tests used to hard-link the
+// test binary itself; under -race that made every simulated SSH/SFTP session
+// pay race-runtime startup, which dominated the relevant test suites. The
+// helper is small, uninstrumented, and reused across packages and runs; when it
+// cannot be built (no toolchain available) the test binary is used as before.
+func helperBinary() (string, error) {
+	helperOnce.Do(func() {
+		helperPath, helperErr = buildHelper()
+	})
+	if helperErr != nil {
+		return testBinaryPath()
+	}
+	return helperPath, nil
+}
+
+var (
+	helperOnce sync.Once
+	helperPath string
+	helperErr  error
+)
+
+func testBinaryPath() (string, error) {
 	p, err := os.Executable()
 	if err != nil {
 		return "", fmt.Errorf("mockexec: locate test binary: %w", err)
 	}
 	return p, nil
+}
+
+// buildHelper builds ./internal/testutil/mockexec/cmd/mockhelper into a cache
+// directory keyed by the source contents, so an unchanged helper is reused
+// across packages and runs.
+func buildHelper() (string, error) {
+	root, err := moduleRoot()
+	if err != nil {
+		return "", err
+	}
+	pkgDir := filepath.Join(root, "internal", "testutil", "mockexec")
+	key, err := sourceDigest(filepath.Join(pkgDir, "cmd", "mockhelper"), pkgDir)
+	if err != nil {
+		return "", err
+	}
+	outDir := filepath.Join(os.TempDir(), "catsync-mockexec-"+key)
+	out := filepath.Join(outDir, "mockhelper")
+	if fi, err := os.Stat(out); err == nil && fi.Mode().IsRegular() {
+		return out, nil
+	}
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return "", err
+	}
+	tmp := out + ".tmp"
+	cmd := exec.Command("go", "build", "-o", tmp, "./internal/testutil/mockexec/cmd/mockhelper")
+	cmd.Dir = root
+	if combined, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("mockexec: build helper: %v (%s)", err, strings.TrimSpace(string(combined)))
+	}
+	if err := os.Rename(tmp, out); err != nil {
+		return "", err
+	}
+	return out, nil
+}
+
+// moduleRoot walks up from the working directory to the module root.
+func moduleRoot() (string, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", errors.New("mockexec: module root not found")
+		}
+		dir = parent
+	}
+}
+
+// sourceDigest hashes the helper sources so a changed helper forces a rebuild.
+func sourceDigest(dir, pkgDir string) (string, error) {
+	h := sha256.New()
+	for _, d := range []string{dir, pkgDir} {
+		entries, err := os.ReadDir(d)
+		if err != nil {
+			return "", err
+		}
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".go") {
+				names = append(names, e.Name())
+			}
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			data, err := os.ReadFile(filepath.Join(d, name))
+			if err != nil {
+				return "", err
+			}
+			h.Write([]byte(name))
+			h.Write(data)
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16], nil
 }
 
 // LinkPrograms creates hard links (or copies, when linking fails) to the
