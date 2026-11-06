@@ -243,3 +243,15 @@ record (`D` for a tree, `F` for one file) so a remote file operand produces
 the same single-entry plan. Resume revalidates the named file only, not its
 parent directory, and the persisted run records the file so `status` renders
 the exact source.
+
+### Changing parallelism on resume
+
+Resume accepts `--jobs` and `--streams` overrides. The chunk plan is derived
+from the recorded file size and chunk size, the temporary path and its
+completed-chunk set live in the checkpoint, and neither depends on how many
+workers or SFTP sessions run, so changing parallelism cannot corrupt progress:
+already-completed chunks are skipped, the same temporary object continues, and
+the new values are validated against the planned-peak SSH budget and persisted
+on the run. Everything else about a resumed run stays immutable; a fresh
+`copy`/`sync` creates a new run with its own checkpoint directory, so it never
+adopts another run's temporary object.

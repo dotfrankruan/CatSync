@@ -3719,3 +3719,215 @@ func TestSyncWideLargeTreeExceedsBudget(t *testing.T) {
 		t.Errorf("sftp sessions = %d, want 0 (refused at plan time)", got)
 	}
 }
+
+// TestResumeOverridesConcurrency: a resume may change --jobs/--streams
+// without losing progress, the new values are persisted, and the same
+// checkpoint/temp continues.
+func TestResumeOverridesConcurrency(t *testing.T) {
+	if !mockexec.SFTPServerAvailable() {
+		t.Skip("real sftp-server is unavailable")
+	}
+	h := newHarness(t)
+	const name = "resume-streams.bin"
+	remote := filepath.Join(h.remoteDir, name)
+	want := bytes.Repeat([]byte("override-"), 2048)
+	if err := os.WriteFile(remote, want, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	mtime := time.Unix(1_700_500_600, 0)
+	if err := os.Chtimes(remote, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := h.writeManifest("remote-source", "F\x00"+sourceManifestRecord(name, fi.Size(), fi.ModTime()))
+	h.writeScript("ssh", "match=if [ -d\nstdout_file="+manifest+"\n")
+	h.writeScript("rsync", "exit=0")
+
+	// A recorded run from an earlier invocation with the default parity.
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := state.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &state.Run{
+		ID:        id,
+		Status:    state.StatusFailed,
+		CreatedAt: time.Now().UTC(),
+		Config: state.Config{
+			Direction:      state.DirectionRemoteToLocal,
+			Backend:        state.BackendMSCP,
+			Verify:         state.VerifyNone,
+			Jobs:           2,
+			Streams:        2,
+			LargeThreshold: 1024,
+		},
+		Source:      state.Source{User: "u", Host: "h", Path: h.remoteDir, File: name},
+		Destination: state.Destination{Path: h.src},
+		WorkDir:     h.src,
+		Tasks: []state.Task{{
+			Path:    name,
+			Size:    fi.Size(),
+			ModTime: fi.ModTime(),
+			Backend: state.BackendMSCP,
+			Status:  state.StatusPending,
+		}},
+	}
+	if err := store.Save(run); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = Resume(context.Background(), Config{
+		StateDir: h.stateDir,
+		Programs: h.config().Programs,
+		Env:      h.nativeEnv(),
+		Jobs:     3,
+		Streams:  16,
+	}, run.ID)
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if got := len(sftpSessionInvocations(h.invocations())); got != 16 {
+		t.Errorf("sftp sessions = %d, want 16 (the --streams override)", got)
+	}
+	got, err := os.ReadFile(filepath.Join(h.src, name))
+	if err != nil {
+		t.Fatalf("downloaded file missing: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Error("content mismatch")
+	}
+	// The override is persisted for later resumes.
+	loaded, err := store.Load(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Config.Streams != 16 || loaded.Config.Jobs != 3 {
+		t.Errorf("persisted parallelism = jobs %d streams %d, want 3/16", loaded.Config.Jobs, loaded.Config.Streams)
+	}
+}
+
+// TestResumeConcurrencyOverrideRespectsBudget: an override that would exceed
+// the SSH budget is refused before any session starts and does not mutate the
+// recorded run.
+func TestResumeConcurrencyOverrideRespectsBudget(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("big.bin", 4096)
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := state.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	size, mt := h.srcMeta("big.bin")
+	run := &state.Run{
+		ID:        id,
+		Status:    state.StatusFailed,
+		CreatedAt: time.Now().UTC(),
+		Config: state.Config{
+			Backend:        state.BackendMSCP,
+			Verify:         state.VerifyNone,
+			Jobs:           4,
+			Streams:        4,
+			LargeThreshold: 1024,
+		},
+		Source:      state.Source{Path: h.src},
+		Destination: state.Destination{User: "u", Host: "h", Path: h.remoteDir},
+		WorkDir:     h.src,
+		Tasks: []state.Task{{
+			Path:    "big.bin",
+			Size:    size,
+			ModTime: mt,
+			Backend: state.BackendMSCP,
+			Status:  state.StatusPending,
+		}},
+	}
+	if err := store.Save(run); err != nil {
+		t.Fatal(err)
+	}
+	// 4 concurrent large files would be needed; here only one task exists, so
+	// 64 streams is the boundary and 65 is refused by the dimension bound.
+	if _, err := Resume(context.Background(), Config{
+		StateDir: h.stateDir,
+		Programs: h.config().Programs,
+		Streams:  65,
+	}, run.ID); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("Resume with 65 streams = %v, want ErrInvalidConfig", err)
+	}
+	loaded, err := store.Load(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Config.Streams != 4 {
+		t.Errorf("recorded streams = %d, want 4 unchanged", loaded.Config.Streams)
+	}
+	if got := len(sftpSessionInvocations(h.invocations())); got != 0 {
+		t.Errorf("sftp sessions = %d, want 0", got)
+	}
+}
+
+// TestResumeWideOverrideBudget uses many pending large tasks so the planned
+// peak, not just the per-dimension bound, rejects the override.
+func TestResumeWideOverrideBudget(t *testing.T) {
+	h := newHarness(t)
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := state.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &state.Run{
+		ID:        id,
+		Status:    state.StatusFailed,
+		CreatedAt: time.Now().UTC(),
+		Config: state.Config{
+			Backend:        state.BackendMSCP,
+			Verify:         state.VerifyNone,
+			Jobs:           4,
+			Streams:        4,
+			LargeThreshold: 1024,
+		},
+		Source:      state.Source{Path: h.src},
+		Destination: state.Destination{User: "u", Host: "h", Path: h.remoteDir},
+		WorkDir:     h.src,
+	}
+	for i := 0; i < 8; i++ {
+		run.Tasks = append(run.Tasks, state.Task{
+			Path:    fmt.Sprintf("big%d.bin", i),
+			Size:    4096,
+			ModTime: time.Unix(1_700_000_000, 0),
+			Backend: state.BackendMSCP,
+			Status:  state.StatusPending,
+		})
+	}
+	if err := store.Save(run); err != nil {
+		t.Fatal(err)
+	}
+	// 8 pending large tasks with jobs raised to 8 and 16 streams each:
+	// 8 × 16 = 128 > 64, so the planned peak (not a single dimension) must
+	// reject it.
+	if _, err := Resume(context.Background(), Config{
+		StateDir: h.stateDir,
+		Programs: h.config().Programs,
+		Jobs:     8,
+		Streams:  16,
+	}, run.ID); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("Resume wide override = %v, want ErrInvalidConfig", err)
+	}
+	loaded, err := store.Load(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Config.Streams != 4 {
+		t.Errorf("recorded streams = %d, want 4 unchanged", loaded.Config.Streams)
+	}
+}

@@ -155,8 +155,11 @@ func runResume(ctx context.Context, opts *Options, id string, stdout, stderr io.
 		execOut = nil
 	}
 	cfg := executor.Config{
-		StateDir:         opts.StateDir,
-		Programs:         programsFromEnv(),
+		StateDir: opts.StateDir,
+		Programs: programsFromEnv(),
+		// Concurrency overrides: zero keeps the run's recorded values.
+		Jobs:             opts.Jobs,
+		Streams:          opts.Streams,
 		Stdout:           execOut,
 		Stderr:           stderr,
 		Progress:         progressEnabled(opts.Progress, opts.Quiet, stderr),

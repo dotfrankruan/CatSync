@@ -168,6 +168,23 @@ state directories in old runs are ignored and retired on completion),
 resumes large files from their native multistream checkpoints, and reuses
 rsync's partial directory. Retained checkpoints survive failed resumes.
 
+`--jobs` and `--streams` may be given to change the parallelism of the
+resumed run, for example to use more streams after moving to a faster
+network:
+
+```sh
+catsync resume --streams 16                 # latest resumable run
+catsync resume --jobs 2 --streams 8 RUN_ID
+```
+
+This is safe because the chunk plan, the temporary path, and the checkpoint
+are independent of parallelism: already-transferred chunks are never re-sent,
+the same temporary object continues, and the new values are validated against
+the SSH connection budget and persisted for later resumes. Only these two
+options are accepted, since the rest of a run's strategy is recorded and
+immutable; a fresh `copy`/`sync` starts a new run with a new checkpoint and
+does not adopt an interrupted run's temporary object.
+
 ### `catsync status [RUN_ID]`
 
 Prints a run without mutating it: status, source/destination, timestamps,

@@ -646,11 +646,18 @@ func (e *Executor) checkConnectionBudget(out *PlanOutcome) error {
 			conservative++
 		}
 	}
-	jobs := e.cfg.Jobs
+	return connectionBudgetError(large, small, conservative, e.cfg.Jobs, e.cfg.Streams)
+}
+
+// connectionBudgetPeak computes the worst-case concurrent SSH connections of
+// one run from its parallel work. The stages run sequentially, so the peak is
+// the largest of the native stage (concurrent large files × streams per
+// file), the small-file stage (one ssh per concurrent rsync batch), and the
+// conservative rsync stage.
+func connectionBudgetPeak(large, small, conservative, jobs, streams int) int {
 	if jobs < 1 {
 		jobs = 1
 	}
-	streams := e.cfg.Streams
 	if streams < 1 {
 		streams = 1
 	}
@@ -674,11 +681,46 @@ func (e *Executor) checkConnectionBudget(out *PlanOutcome) error {
 	if conservativePeak > peak {
 		peak = conservativePeak
 	}
-	if peak > MaxSSHConnections {
-		return fmt.Errorf("%w: the plan can hold up to %d concurrent SSH connections (%d large file(s) × %d stream(s) per job), exceeding the budget %d; lower --streams or --jobs",
-			ErrInvalidConfig, peak, nativePeak/streams, streams, MaxSSHConnections)
+	return peak
+}
+
+// connectionBudgetError reports ErrInvalidConfig when the parallel work would
+// hold more than MaxSSHConnections concurrent SSH connections.
+func connectionBudgetError(large, small, conservative, jobs, streams int) error {
+	peak := connectionBudgetPeak(large, small, conservative, jobs, streams)
+	if peak <= MaxSSHConnections {
+		return nil
 	}
-	return nil
+	jobs = max(jobs, 1)
+	streams = max(streams, 1)
+	largeAtOnce := large
+	if largeAtOnce > jobs {
+		largeAtOnce = jobs
+	}
+	return fmt.Errorf("%w: the plan can hold up to %d concurrent SSH connections (%d large file(s) × %d stream(s) per job), exceeding the budget %d; lower --streams or --jobs",
+		ErrInvalidConfig, peak, largeAtOnce, streams, MaxSSHConnections)
+}
+
+// checkRunConnectionBudget validates a resumed run's parallel work against
+// the budget, using the tasks that will actually run again.
+func checkRunConnectionBudget(run *state.Run) error {
+	large, small, conservative := 0, 0, 0
+	for _, t := range run.Tasks {
+		switch t.Status {
+		case state.StatusPending, state.StatusFailed, state.StatusRunning:
+		default:
+			continue
+		}
+		switch t.Backend {
+		case state.BackendMSCP:
+			large++
+		case state.BackendFPSync:
+			small++
+		case state.BackendRsync:
+			conservative++
+		}
+	}
+	return connectionBudgetError(large, small, conservative, run.Config.Jobs, run.Config.Streams)
 }
 
 // planPhase performs discovery, manifest collection, and planning.
@@ -932,6 +974,17 @@ func resumeWith(ctx context.Context, cfg Config, id string, prepare func(*Execut
 	if !run.Resumable() {
 		return run, fmt.Errorf("%w: %s (status %s, no pending or failed tasks)", ErrNotResumable, run.ID, run.Status)
 	}
+	// Concurrency overrides: the chunk plan, temp path, and checkpoint
+	// contract are independent of how many jobs and streams run, so a resume
+	// may change them (for example to use more streams on a faster network).
+	// The values are validated below and persisted, so later resumes keep
+	// them. Zero means "keep the recorded value".
+	if cfg.Jobs > 0 {
+		run.Config.Jobs = cfg.Jobs
+	}
+	if cfg.Streams > 0 {
+		run.Config.Streams = cfg.Streams
+	}
 	// The recorded configuration is authoritative for the transfer
 	// strategy, but the current invocation's program overrides are what
 	// Resume will actually execute, so they must pass the same validation
@@ -960,6 +1013,9 @@ func resumeWith(ctx context.Context, cfg Config, id string, prepare func(*Execut
 	}
 	if err := rc.validateFull(); err != nil {
 		return run, fmt.Errorf("executor: run %s configuration no longer valid: %w", run.ID, err)
+	}
+	if err := checkRunConnectionBudget(run); err != nil {
+		return run, err
 	}
 	if direction == target.LocalToRemote {
 		if _, err := target.ValidateSource(run.Source.Path); err != nil {

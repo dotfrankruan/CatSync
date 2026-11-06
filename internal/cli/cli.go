@@ -219,6 +219,13 @@ func runStateCommand(name string, args []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(&opts.Verbose, "verbose", false, "increase output detail")
 	fs.BoolVar(&opts.Quiet, "quiet", false, "suppress non-error output")
 	fs.StringVar(&opts.Progress, "progress", opts.Progress, "progress display: auto, always, or never")
+	if name == "resume" {
+		// Concurrency overrides: the chunk plan and checkpoint are
+		// independent of parallelism, so a resume may change it. Zero keeps
+		// the recorded value.
+		fs.IntVar(&opts.Jobs, "jobs", 0, "override the recorded parallel transfer jobs (0 keeps it)")
+		fs.IntVar(&opts.Streams, "streams", 0, "override the recorded parallel streams per job (0 keeps it)")
+	}
 	operands, code, ok := splitArgs(fs, args)
 	if !ok {
 		return code
@@ -226,6 +233,18 @@ func runStateCommand(name string, args []string, stdout, stderr io.Writer) int {
 	if err := opts.validateOutput(); err != nil {
 		fmt.Fprintf(stderr, "catsync: %s: %v\n", name, err)
 		return ExitUsage
+	}
+	if name == "resume" {
+		explicit := map[string]bool{}
+		fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+		if explicit["jobs"] && opts.Jobs < 1 {
+			fmt.Fprintf(stderr, "catsync: resume: --jobs must be at least 1, got %d\n", opts.Jobs)
+			return ExitUsage
+		}
+		if explicit["streams"] && opts.Streams < 1 {
+			fmt.Fprintf(stderr, "catsync: resume: --streams must be at least 1, got %d\n", opts.Streams)
+			return ExitUsage
+		}
 	}
 	if len(operands) > 1 {
 		fmt.Fprintf(stderr, "catsync: %s: want at most one run identifier, got %d operands\n", name, len(operands))
@@ -279,7 +298,10 @@ func stateUsage(name string) string {
 	return fmt.Sprintf(`Usage: catsync %s [options] [run-id]
 
 Without a run identifier the latest resumable run in the state directory is
-used. Options may appear before, between, or after the run identifier, for
+used. Resume accepts --jobs and --streams to change the parallelism of the
+resumed run: the chunk plan, temporary path, and checkpoint are independent
+of it, so already-transferred chunks are never re-sent. Other options are not
+accepted because the run's recorded strategy is authoritative. Options may appear before, between, or after the run identifier, for
 example "catsync %s --state-dir DIR RUN_ID" and
 "catsync %s RUN_ID --state-dir DIR" are equivalent.
 

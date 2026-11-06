@@ -940,3 +940,100 @@ func TestCLISingleFileDownloadEndToEnd(t *testing.T) {
 		t.Errorf("recorded source = %+v, want %q under %q", rec.Source, name, h.remoteDir)
 	}
 }
+
+// TestCLIResumeConcurrencyOverride: resume accepts --jobs/--streams, applies
+// them to the resumed run, persists them, and rejects zero/negative values.
+func TestCLIResumeConcurrencyOverride(t *testing.T) {
+	h := newCLIHarness(t)
+	h.armNative()
+	const name = "resume-cli.bin"
+	remote := filepath.Join(h.remoteDir, name)
+	want := bytes.Repeat([]byte("cli-resume-"), 256)
+	if err := os.WriteFile(remote, want, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	mtime := time.Unix(1_700_600_700, 0)
+	if err := os.Chtimes(remote, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := h.writeManifest("remote-source", "F\x00"+fmt.Sprintf("%s\x00f\x00%d\x00%s\x00", name, fi.Size(), epochtime.Format(fi.ModTime())))
+	h.writeScript("ssh", "match=if [ -d\nstdout_file="+manifest+"\n")
+	h.writeScript("rsync", "exit=0")
+
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := state.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(t.TempDir(), "download")
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runRec := &state.Run{
+		ID:        id,
+		Status:    state.StatusFailed,
+		CreatedAt: time.Now().UTC(),
+		Config: state.Config{
+			Direction:      state.DirectionRemoteToLocal,
+			Backend:        state.BackendMSCP,
+			Verify:         state.VerifyNone,
+			Jobs:           2,
+			Streams:        2,
+			LargeThreshold: 1024,
+		},
+		Source:      state.Source{User: "user", Host: "host", Path: h.remoteDir, File: name},
+		Destination: state.Destination{Path: dest},
+		WorkDir:     dest,
+		Tasks: []state.Task{{
+			Path:    name,
+			Size:    fi.Size(),
+			ModTime: fi.ModTime(),
+			Backend: state.BackendMSCP,
+			Status:  state.StatusPending,
+		}},
+	}
+	if err := store.Save(runRec); err != nil {
+		t.Fatal(err)
+	}
+
+	// Zero and negative overrides are usage errors.
+	for _, args := range [][]string{
+		{"resume", "--jobs", "0", "--state-dir", h.stateDir, id},
+		{"resume", "--streams=0", "--state-dir", h.stateDir, id},
+		{"resume", "--streams=-2", "--state-dir", h.stateDir, id},
+	} {
+		if code, _, stderr := run(t, args...); code != ExitUsage {
+			t.Errorf("%v exit = %d, want usage (stderr %q)", args, code, stderr)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dest, name)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a rejected resume transferred the file: %v", err)
+	}
+
+	code, _, stderr := run(t, "resume", "--jobs", "3", "--streams", "8",
+		"--state-dir", h.stateDir, id)
+	if code != ExitOK {
+		t.Fatalf("resume exit = %d, stderr:\n%s", code, stderr)
+	}
+	got, err := os.ReadFile(filepath.Join(dest, name))
+	if err != nil {
+		t.Fatalf("resumed download missing: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Error("resumed content mismatch")
+	}
+	loaded, err := store.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Config.Jobs != 3 || loaded.Config.Streams != 8 {
+		t.Errorf("persisted parallelism = jobs %d streams %d, want 3/8", loaded.Config.Jobs, loaded.Config.Streams)
+	}
+}
