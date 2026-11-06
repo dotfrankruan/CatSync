@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -58,6 +59,52 @@ type batchOutcome struct {
 	cancelled bool
 	stderr    string
 	err       error
+}
+
+// captureWriter forwards writes to dst and keeps a bounded copy of the start,
+// so a child's stderr can be classified (for example an authentication
+// rejection) without hiding it from the operator.
+type captureWriter struct {
+	mu    sync.Mutex
+	dst   io.Writer
+	buf   bytes.Buffer
+	limit int
+}
+
+func newCaptureWriter(dst io.Writer) *captureWriter {
+	return &captureWriter{dst: dst, limit: 8 << 10}
+}
+
+func (w *captureWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	if w.buf.Len() < w.limit {
+		room := w.limit - w.buf.Len()
+		if room > len(p) {
+			room = len(p)
+		}
+		w.buf.Write(p[:room])
+	}
+	w.mu.Unlock()
+	if w.dst != nil {
+		return w.dst.Write(p)
+	}
+	return len(p), nil
+}
+
+func (w *captureWriter) text() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
+// authFailure wraps a failed ssh-driven invocation, marking authentication
+// rejections so the interactive retry loop can offer re-authentication. ssh
+// reports these only on stderr, so the caller passes its captured output.
+func authFailure(cause error, stderr string) error {
+	if backend.AuthFailure(stderr) {
+		return fmt.Errorf("%w: %v (%s)", backend.ErrAuthentication, cause, firstLine(stderr))
+	}
+	return cause
 }
 
 // smallFileStage runs the native parallel-rsync small-file stage: the
@@ -334,11 +381,12 @@ func (e *Executor) runSmallBatch(ctx, stageCtx context.Context, batch partition.
 			out.cancelled = true
 			return out
 		}
-		if ferr := e.failBatch(active, fmt.Sprintf("rsync batch failed: %v", err)); ferr != nil {
+		rsErr := authFailure(err, stderr.String())
+		if ferr := e.failBatch(active, fmt.Sprintf("rsync batch failed: %v", rsErr)); ferr != nil {
 			out.err = ferr
 			return out
 		}
-		out.err = fmt.Errorf("rsync batch failed: %w", err)
+		out.err = fmt.Errorf("rsync batch failed: %w", rsErr)
 		return out
 	}
 	out.stderr = stderr.String()
@@ -497,6 +545,7 @@ func (e *Executor) rsyncStage(ctx context.Context) error {
 		return err
 	}
 	e.logf("stage rsync: %d file(s)", len(active))
+	diag := newCaptureWriter(e.stderr)
 	cfg := rsync.Config{
 		Program:   e.progs.rsync(),
 		Direction: e.transferDirection(),
@@ -506,21 +555,22 @@ func (e *Executor) rsyncStage(ctx context.Context) error {
 		Paths:     paths,
 		Env:       e.cfg.Env,
 		Stdout:    e.stdout,
-		Stderr:    e.stderr,
+		Stderr:    diag,
 		Progress:  e.addProgress,
 	}
 	if e.run.Config.Direction.Effective() == state.DirectionRemoteToLocal {
 		cfg.NoImpliedDirs = true
 	}
 	if err := cfg.Run(ctx); err != nil {
+		rsErr := authFailure(err, diag.text())
 		if ctx.Err() == nil {
 			for _, t := range active {
-				if ferr := e.failTask(t, fmt.Sprintf("rsync failed: %v", err)); ferr != nil {
+				if ferr := e.failTask(t, fmt.Sprintf("rsync failed: %v", rsErr)); ferr != nil {
 					return ferr
 				}
 			}
 		}
-		return err
+		return rsErr
 	}
 	if e.run.Config.Direction.Effective() == state.DirectionRemoteToLocal {
 		var err error

@@ -255,3 +255,29 @@ the new values are persisted on the run. Parallelism is not validated against
 a plan-peak ceiling: an estimate above the 64-connection guidance only warns. Everything else about a resumed run stays immutable; a fresh
 `copy`/`sync` creates a new run with its own checkpoint directory, so it never
 adopts another run's temporary object.
+
+### Authentication failures and re-authentication
+
+SSH authentication is re-established for every new connection, so expiring
+credentials (for example a short-lived certificate) can fail a run midway even
+though earlier sessions are still open. Authentication rejections are
+classified into `backend.ErrAuthentication` (from the native backend's captured
+session stderr, and from the textual signature ssh/rsync print on the
+process-based paths). With `--on-auth-failure retry` the executor's stage
+runner catches that class, prompts on the terminal, reverts tasks that failed
+for that reason to pending, and retries the same stage — safe because stages
+are idempotent: open sessions keep working, native large files resume from
+their checkpoints, completed files are recorded, and rsync skips files whose
+size and mtime already match. The default mode fails the run with a resume hint
+instead of blocking, and without a terminal the retry loop never runs.
+
+### Resume reconciliation
+
+Before any stage runs, a resume compares pending or failed rsync-driven tasks
+with the destination manifest and marks a task completed when its destination
+entry already has the planned size and nanosecond mtime. An interrupted run can
+have written a file completely while its completion was never recorded — for
+example when the connection dropped during verification — and this avoids
+transferring it again. Native large-file tasks are excluded: their checkpoint
+and the same-inode publish probe are the authoritative recovery path, and a
+metadata match alone could accept a foreign file.

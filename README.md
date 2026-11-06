@@ -185,6 +185,29 @@ options are accepted, since the rest of a run's strategy is recorded and
 immutable; a fresh `copy`/`sync` starts a new run with a new checkpoint and
 does not adopt an interrupted run's temporary object.
 
+### Expired certificates and re-authentication
+
+SSH credentials can expire while a transfer runs: a short-lived certificate
+or an agent identity can be valid when the run starts and rejected minutes
+later. CatSync distinguishes that class of failure (ssh "Permission denied",
+expired certificate, exhausted identities) from ordinary errors and offers:
+
+- **Keep the sessions you already have.** Sessions that are open keep
+  transferring; an interrupted large file resumes from its checkpoint on the
+  next attempt, so nothing already transferred is re-sent.
+- **Re-authenticate and continue.** With `--on-auth-failure retry`, CatSync
+  pauses on an authentication rejection, asks you to renew the credentials
+  (re-run `ssh-add`, issue a fresh certificate), and retries the stage after
+  you confirm. Answering no stops with the failure.
+
+```sh
+catsync copy --on-auth-failure retry SRC user@host:/dest
+```
+
+The default is `fail`: the run stops with an actionable message and stays
+resumable, so `catsync resume` continues later. The prompt is only shown on a
+terminal; without one the run fails instead of blocking.
+
 ### `catsync status [RUN_ID]`
 
 Prints a run without mutating it: status, source/destination, timestamps,

@@ -125,6 +125,14 @@ type Config struct {
 	Streams int
 	// LargeThreshold is the size in bytes at which a file counts as large.
 	LargeThreshold uint64
+	// AuthRetry enables the interactive re-authentication loop: a stage that
+	// fails because ssh authentication was rejected (for example an expired
+	// certificate) asks the operator to renew the credentials and then retries
+	// the stage. Zero keeps the fail-fast behavior.
+	AuthRetry int
+	// Prompt asks the operator a yes/no question and reports the answer. It is
+	// only consulted when AuthRetry is positive and nil disables the loop.
+	Prompt func(question string) (bool, error)
 	// StateDir holds the durable run state.
 	StateDir string
 	// Programs overrides the external executables (tests, diagnostics).
@@ -1001,6 +1009,10 @@ func resumeWith(ctx context.Context, cfg Config, id string, prepare func(*Execut
 		}
 	}
 
+	// Files already complete at the destination are recorded before any
+	// stage runs, so a resume never re-transfers them.
+	e.reconcileAlreadyPresent(ctx)
+
 	// A crash between persisting completion and checkpoint cleanup leaves a
 	// completed task referencing a file. Retire those now; this cannot lose
 	// progress because completed is already durable.
@@ -1055,6 +1067,79 @@ func (e *Executor) latestResumable() (*state.Run, error) {
 // execute runs the transfer stages sequentially, then verification, then
 // finalization. Stages are sequential so a destination path never has
 // concurrent writers.
+// authRetryLimit bounds interactive re-authentication attempts per stage, so a
+// persistent misconfiguration cannot loop forever.
+const authRetryLimit = 5
+
+// isAuthFailure reports whether err is an ssh authentication rejection that
+// renewing credentials could fix. It accepts both the structured sentinel the
+// native backend sets and the textual signature ssh/rsync print, because the
+// process-based paths surface only stderr text.
+func isAuthFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, backend.ErrAuthentication) {
+		return true
+	}
+	return backend.AuthFailure(err.Error())
+}
+
+// runStageWithAuthRetry runs one stage and, when it fails with an
+// authentication error and interactive re-authentication is enabled, asks the
+// operator to renew the credentials and retries the stage.
+//
+// Retrying is safe because stages are idempotent: in-flight work in a stage
+// that failed keeps its sessions until it returns, completed files are
+// recorded, native large files resume from their checkpoints, and rsync skips
+// files whose size and mtime already match. Sessions that were already
+// established keep transferring; only new connections need the renewed
+// credentials.
+func (e *Executor) runStageWithAuthRetry(ctx context.Context, name string, fn func(context.Context) error) error {
+	err := fn(ctx)
+	for attempt := 1; err != nil && isAuthFailure(err) && e.cfg.AuthRetry > 0 && e.cfg.Prompt != nil && attempt <= authRetryLimit; attempt++ {
+		if ctx.Err() != nil {
+			return err
+		}
+		e.warnf("%s stage: ssh authentication failed: %v", name, err)
+		ok, perr := e.cfg.Prompt("renew your SSH credentials (for example re-run ssh-add or issue a fresh certificate), then confirm to retry")
+		if perr != nil {
+			return err
+		}
+		if !ok {
+			return err
+		}
+		e.revertAuthFailedTasks()
+		e.logf("%s stage: retrying after re-authentication (attempt %d/%d)", name, attempt, authRetryLimit)
+		err = fn(ctx)
+	}
+	if err != nil && isAuthFailure(err) {
+		return fmt.Errorf("%w (re-authenticate, then run 'catsync resume' to continue)", err)
+	}
+	return err
+}
+
+// revertAuthFailedTasks returns tasks failed by an authentication error to
+// pending so the retried stage picks them up again.
+func (e *Executor) revertAuthFailedTasks() {
+	e.runMu.Lock()
+	changed := false
+	for i := range e.run.Tasks {
+		t := &e.run.Tasks[i]
+		if t.Status == state.StatusFailed && isAuthFailure(errors.New(t.Error)) {
+			t.Status = state.StatusPending
+			t.Error = ""
+			changed = true
+		}
+	}
+	e.runMu.Unlock()
+	if changed {
+		if err := e.saveRun(); err != nil {
+			e.warnf("record tasks reverted after re-authentication: %v", err)
+		}
+	}
+}
+
 func (e *Executor) execute(ctx context.Context) (retErr error) {
 	defer func() {
 		if e.progress != nil {
@@ -1062,6 +1147,7 @@ func (e *Executor) execute(ctx context.Context) (retErr error) {
 		}
 	}()
 	var errs []string
+	var cause error
 	stages := []struct {
 		name string
 		fn   func(context.Context) error
@@ -1072,13 +1158,16 @@ func (e *Executor) execute(ctx context.Context) (retErr error) {
 	}
 	for _, st := range stages {
 		e.progressPhase(st.name)
-		if err := st.fn(ctx); err != nil {
+		if err := e.runStageWithAuthRetry(ctx, st.name, st.fn); err != nil {
 			if ctx.Err() != nil {
 				ctxErr := fmt.Errorf("executor: %s stage: %w", st.name, ctx.Err())
 				if ierr := e.interrupt(); ierr != nil {
 					return fmt.Errorf("%w; %v", ctxErr, ierr)
 				}
 				return ctxErr
+			}
+			if cause == nil {
+				cause = err
 			}
 			errs = append(errs, fmt.Sprintf("%s stage: %v", st.name, err))
 			e.warnf("%s", errs[len(errs)-1])
@@ -1088,7 +1177,7 @@ func (e *Executor) execute(ctx context.Context) (retErr error) {
 	// failed transfer stage. Copy runs do not enter this stage at all.
 	if len(errs) == 0 && e.run.Config.Mirror {
 		e.progressPhase("mirror-reconcile")
-		if err := e.mirrorStage(ctx); err != nil {
+		if err := e.runStageWithAuthRetry(ctx, "mirror-reconcile", e.mirrorStage); err != nil {
 			if ctx.Err() != nil {
 				ctxErr := fmt.Errorf("executor: mirror stage: %w", ctx.Err())
 				if ierr := e.interrupt(); ierr != nil {
@@ -1096,12 +1185,15 @@ func (e *Executor) execute(ctx context.Context) (retErr error) {
 				}
 				return ctxErr
 			}
+			if cause == nil {
+				cause = err
+			}
 			errs = append(errs, fmt.Sprintf("mirror stage: %v", err))
 			e.warnf("%s", errs[len(errs)-1])
 		}
 	}
 	e.progressPhase("verification")
-	if err := e.verifyStage(ctx); err != nil {
+	if err := e.runStageWithAuthRetry(ctx, "verification", e.verifyStage); err != nil {
 		if ctx.Err() != nil {
 			ctxErr := fmt.Errorf("executor: verification: %w", ctx.Err())
 			if ierr := e.interrupt(); ierr != nil {
@@ -1109,10 +1201,21 @@ func (e *Executor) execute(ctx context.Context) (retErr error) {
 			}
 			return ctxErr
 		}
+		if cause == nil {
+			cause = err
+		}
 		errs = append(errs, fmt.Sprintf("verification: %v", err))
 		e.warnf("%s", errs[len(errs)-1])
 	}
-	return e.finalize(errs)
+	if ferr := e.finalize(errs); ferr != nil {
+		if cause != nil {
+			// Keep the aggregate message and the structured first cause
+			// (for example backend.ErrAuthentication) inspectable.
+			return fmt.Errorf("%w; caused by: %w", ferr, cause)
+		}
+		return ferr
+	}
+	return nil
 }
 
 // interrupt converts the run to its resumable interrupted form and saves.
@@ -1315,6 +1418,80 @@ func (e *Executor) retireCheckpoint(t *state.Task) error {
 		e.warnf("remove checkpoint %s: %v", cp, err)
 	}
 	return nil
+}
+
+// reconcileAlreadyPresent marks pending or failed tasks whose destination
+// entry already matches the plan (size and nanosecond mtime) as completed
+// without transferring them. An interrupted run can leave a file fully
+// written while its completion was never recorded — for example when the
+// connection dropped during verification — and re-running the stage would
+// transfer it again.
+//
+// This is the resume analogue of rsync's quick check, and it is restricted to
+// the rsync-driven backends where that check is already the acceptance
+// criterion. Native large-file tasks are deliberately excluded: their
+// checkpoint plus the same-inode publish probe are the authoritative recovery
+// path, and claiming completion from metadata alone could accept a foreign
+// file that merely matches.
+//
+// A failure to read the destination manifest is a warning, not a resume
+// failure: the stages then simply do their normal work.
+func (e *Executor) reconcileAlreadyPresent(ctx context.Context) {
+	e.runMu.Lock()
+	var candidates []*state.Task
+	for i := range e.run.Tasks {
+		t := &e.run.Tasks[i]
+		if t.Backend == state.BackendMSCP {
+			continue
+		}
+		if t.Status != state.StatusPending && t.Status != state.StatusFailed {
+			continue
+		}
+		candidates = append(candidates, t)
+	}
+	e.runMu.Unlock()
+	if len(candidates) == 0 {
+		return
+	}
+	var manifest map[string]discovery.RemoteEntry
+	var err error
+	if e.run.Config.Direction.Effective() == state.DirectionRemoteToLocal {
+		manifest, err = collectLocalManifest(e.run.Destination.Path)
+	} else {
+		var known bool
+		manifest, known, err = e.collectManifest(ctx, e.destTarget(), e.run.Config.IPv6)
+		if err == nil && !known {
+			err = errors.New("destination metadata unavailable")
+		}
+	}
+	if err != nil {
+		e.warnf("resume reconciliation skipped: %v", err)
+		return
+	}
+	reconciled := 0
+	for _, t := range candidates {
+		entry, ok := manifest[t.Path]
+		if !ok || entry.Size != t.Size || !entry.ModTime.Equal(t.ModTime) {
+			continue
+		}
+		// Native temp objects and rsync partials are not destination
+		// entries, so a matching entry here means the file itself is done.
+		e.runMu.Lock()
+		prevStatus, prevErr := t.Status, t.Error
+		t.Status = state.StatusCompleted
+		t.Error = ""
+		e.runMu.Unlock()
+		if serr := e.saveRun(); serr != nil {
+			e.runMu.Lock()
+			t.Status, t.Error = prevStatus, prevErr
+			e.runMu.Unlock()
+			return
+		}
+		reconciled++
+	}
+	if reconciled > 0 {
+		e.logf("resume: %d file(s) already complete at the destination; marked completed without transferring", reconciled)
+	}
 }
 
 // retireCompletedCheckpoints is the resume-time recovery pass for completed

@@ -41,6 +41,11 @@ type Options struct {
 	Jobs int
 	// Streams caps parallel streams per job.
 	Streams int
+	// OnAuthFailure selects the behavior when ssh authentication is
+	// rejected (for example an expired certificate): "fail" stops the run
+	// (it stays resumable), "retry" asks the operator to renew credentials
+	// and retries the stage.
+	OnAuthFailure string
 	// LargeThreshold is the size at which a file counts as large.
 	LargeThreshold bytesize.Size
 }
@@ -55,6 +60,7 @@ func defaultOptions() Options {
 		Jobs:           4,
 		Streams:        4,
 		LargeThreshold: bytesize.Size(512 * bytesize.MiB),
+		OnAuthFailure:  "fail",
 	}
 }
 
@@ -114,6 +120,11 @@ func (o *Options) Validate() error {
 	case "auto", "fpsync", "mscp", "rsync":
 	default:
 		return fmt.Errorf("--backend %q is not valid: want auto, fpsync, mscp, or rsync", o.Backend)
+	}
+	switch o.OnAuthFailure {
+	case "fail", "retry":
+	default:
+		return fmt.Errorf("--on-auth-failure %q is not valid: want fail or retry", o.OnAuthFailure)
 	}
 	switch o.Verify {
 	case "auto", "none", "size", "sha256":

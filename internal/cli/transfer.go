@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -41,6 +42,40 @@ func (o *Options) executorConfig(transfer target.Transfer, stdout, stderr io.Wri
 		Stderr:           stderr,
 		Progress:         progressEnabled(o.Progress, o.Quiet, stderr),
 		ProgressTerminal: progressTerminal(o.Progress, o.Quiet, stderr),
+		AuthRetry:        authRetry(o.OnAuthFailure),
+		Prompt:           authPrompt(o, stderr),
+	}
+}
+
+// authRetry maps --on-auth-failure to the interactive retry limit.
+func authRetry(mode string) int {
+	if mode == "retry" {
+		return 5
+	}
+	return 0
+}
+
+// authPrompt builds the interactive re-authentication question. It only
+// prompts on a terminal: without one there is nobody to ask, so the run fails
+// with the actionable resume message instead of blocking.
+func authPrompt(o *Options, stderr io.Writer) func(string) (bool, error) {
+	f, ok := stderr.(*os.File)
+	if !ok {
+		return nil
+	}
+	fi, err := f.Stat()
+	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		return nil
+	}
+	return func(question string) (bool, error) {
+		fmt.Fprintf(stderr, "catsync: %s [y/N]: ", question)
+		reader := bufio.NewReader(os.Stdin)
+		line, rerr := reader.ReadString('\n')
+		if rerr != nil && line == "" {
+			return false, nil
+		}
+		answer := strings.ToLower(strings.TrimSpace(line))
+		return answer == "y" || answer == "yes", nil
 	}
 }
 
@@ -164,6 +199,8 @@ func runResume(ctx context.Context, opts *Options, id string, stdout, stderr io.
 		Stderr:           stderr,
 		Progress:         progressEnabled(opts.Progress, opts.Quiet, stderr),
 		ProgressTerminal: progressTerminal(opts.Progress, opts.Quiet, stderr),
+		AuthRetry:        authRetry(opts.OnAuthFailure),
+		Prompt:           authPrompt(opts, stderr),
 	}
 	run, err := executor.Resume(ctx, cfg, id)
 	if err != nil {

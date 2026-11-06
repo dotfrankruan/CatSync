@@ -79,6 +79,15 @@ func (h *cliHarness) armNative() {
 	h.t.Setenv(mockexec.EnvRecordDir, recDir)
 }
 
+// resetScriptCounters resets the mock tool's invocation counter so a later
+// command starts its scripted sequence from the beginning.
+func (h *cliHarness) resetScriptCounters(tool string) {
+	h.t.Helper()
+	if err := os.Remove(filepath.Join(h.scriptDir, tool, ".count")); err != nil && !errors.Is(err, os.ErrNotExist) {
+		h.t.Fatal(err)
+	}
+}
+
 func (h *cliHarness) writeScript(tool, config string) {
 	h.t.Helper()
 	dir := filepath.Join(h.scriptDir, tool)
@@ -342,6 +351,7 @@ func TestCLISyncFailureExitCode(t *testing.T) {
 
 	// Resume retries the failed task; the mock rsync still fails, so
 	// resume exits nonzero and the run stays failed.
+	h.resetScriptCounters("ssh")
 	code, _, _ = run(t, "resume", "--state-dir", h.stateDir)
 	if code != ExitError {
 		t.Errorf("resume with still-failing rsync exit = %d, want %d", code, ExitError)
@@ -451,6 +461,7 @@ func TestCLIResumeAfterInterrupt(t *testing.T) {
 	}
 
 	// The second rsync invocation succeeds; resume completes the run.
+	h.resetScriptCounters("ssh")
 	code, stdout, stderr := run(t, "resume", "--state-dir", h.stateDir)
 	if code != ExitOK {
 		t.Fatalf("resume exit = %d, stderr:\n%s", code, stderr)
@@ -1035,5 +1046,38 @@ func TestCLIResumeConcurrencyOverride(t *testing.T) {
 	}
 	if loaded.Config.Jobs != 3 || loaded.Config.Streams != 8 {
 		t.Errorf("persisted parallelism = jobs %d streams %d, want 3/8", loaded.Config.Jobs, loaded.Config.Streams)
+	}
+}
+
+// TestCLIAuthFailureRetryFlag: --on-auth-failure selects the behavior; the
+// default fails a non-interactive run with an actionable resume hint, and an
+// invalid value is a usage error.
+func TestCLIAuthFailureRetryFlag(t *testing.T) {
+	h := newCLIHarness(t)
+	h.writeSrc("small.txt", 2048)
+	post := h.writeManifest("post", h.record("small.txt"))
+	authErr := h.writeManifest("auth", "Permission denied (publickey).\n")
+	h.scriptFreshDestSSH(post)
+	h.writeScript("rsync", "stderr_file="+authErr+"\nexit=255\n")
+
+	if code, _, stderr := run(t, "copy", "--on-auth-failure", "bogus",
+		"--state-dir", h.stateDir, h.src, "user@host:"+h.remoteDir); code != ExitUsage {
+		t.Errorf("invalid --on-auth-failure exit = %d, want usage (%q)", code, stderr)
+	}
+
+	// Default mode: fail with the resume hint (stdout/stderr are pipes here,
+	// so no interactive prompt can happen).
+	code, _, stderr := run(t, "copy", "--backend", "rsync", "--state-dir", h.stateDir,
+		h.src, "user@host:"+h.remoteDir)
+	if code != ExitError {
+		t.Fatalf("auth failure exit = %d, want %d (%q)", code, ExitError, stderr)
+	}
+	if !strings.Contains(stderr, "re-authenticate") || !strings.Contains(stderr, "catsync resume") {
+		t.Errorf("stderr should explain recovery:\n%s", stderr)
+	}
+	// The run stays resumable.
+	code, stdout, _ := run(t, "status", "--state-dir", h.stateDir)
+	if code != ExitOK || !strings.Contains(stdout, "failed") {
+		t.Errorf("status after auth failure = %d %q", code, stdout)
 	}
 }

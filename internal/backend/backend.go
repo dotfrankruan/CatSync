@@ -23,6 +23,40 @@ import (
 	"github.com/dotfrankruan/CatSync/internal/target"
 )
 
+// ErrAuthentication marks a failure that is an SSH authentication problem
+// (expired certificate, rejected key, exhausted agent identities) rather than
+// a network or transfer error. Callers use it to offer re-authentication
+// instead of failing the run.
+var ErrAuthentication = errors.New("ssh: authentication failed")
+
+// authFailureMarkers are the ssh/rsync stderr fragments that identify an
+// authentication failure. They are matched case-insensitively.
+var authFailureMarkers = []string{
+	"permission denied",
+	"authentication failed",
+	"too many authentication failures",
+	"no such identity",
+	"certificate invalid",
+	"certificate has expired",
+	"host key verification failed",
+}
+
+// AuthFailure reports whether stderr describes an SSH authentication failure:
+// the class of error where the credentials (for example a short-lived
+// certificate) must be renewed before another connection can succeed.
+func AuthFailure(stderr string) bool {
+	if stderr == "" {
+		return false
+	}
+	lower := strings.ToLower(stderr)
+	for _, marker := range authFailureMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // SSH carries the SSH transport options honored by the backends.
 type SSH struct {
 	// IPv6 restricts connections to IPv6 (rsync transport "ssh -6").

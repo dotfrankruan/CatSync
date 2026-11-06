@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dotfrankruan/CatSync/internal/backend"
 	"github.com/dotfrankruan/CatSync/internal/backend/multistream"
 	"github.com/dotfrankruan/CatSync/internal/epochtime"
 	"github.com/dotfrankruan/CatSync/internal/state"
@@ -133,6 +134,15 @@ func (h *harness) writeScript(tool, config string) {
 		h.t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "config"), []byte(config), 0o600); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// resetScriptCounters resets the mock tool's invocation counter, so a second
+// phase (resume) starts its scripted sequence from the beginning.
+func (h *harness) resetScriptCounters(tool string) {
+	h.t.Helper()
+	if err := os.Remove(filepath.Join(h.scriptDir, tool, ".count")); err != nil && !errors.Is(err, os.ErrNotExist) {
 		h.t.Fatal(err)
 	}
 }
@@ -992,6 +1002,7 @@ func TestSyncInterruptionLeavesResumableState(t *testing.T) {
 	}
 
 	// Resume finishes the pending task; the second rsync invocation exits 0.
+	h.resetScriptCounters("ssh")
 	run2, err := Resume(context.Background(), Config{
 		StateDir: h.stateDir,
 		Programs: cfg.Programs,
@@ -1196,8 +1207,15 @@ func TestResumeLegacyFPSyncStateNatively(t *testing.T) {
 	h := newHarness(t)
 	h.writeSrc("small.txt", 10)
 	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
-	// Resume has no plan-phase manifest; the only ssh call is verification.
-	h.writeScript("ssh", "match=if [ -d\nstdout_file="+post+"\n")
+	// Resume's first ssh call is the reconciliation scan (an empty destination
+	// here), the second is verification of the transferred file.
+	h.writeScript("ssh", `match=if [ -d
+nth=1
+exit=42
+---
+match=if [ -d
+stdout_file=`+post+`
+`)
 	h.writeScript("rsync", "exit=0")
 
 	// Persist a run exactly as the removed external-fpsync implementation
@@ -1237,6 +1255,7 @@ func TestResumeLegacyFPSyncStateNatively(t *testing.T) {
 	}
 
 	cfg := h.config()
+	h.resetScriptCounters("ssh")
 	run2, err := Resume(context.Background(), Config{
 		StateDir: h.stateDir,
 		Programs: cfg.Programs,
@@ -2325,6 +2344,7 @@ func TestNativeStageInterruptionThenResume(t *testing.T) {
 		}
 	}
 
+	h.resetScriptCounters("ssh")
 	run2, err := Resume(context.Background(), Config{
 		StateDir: h.stateDir,
 		Programs: cfg.Programs,
@@ -2894,6 +2914,7 @@ func TestNativeStageCancellationRevertSaveFailure(t *testing.T) {
 	}
 
 	// Resume finishes the work: exactly one rsync launch overall.
+	h.resetScriptCounters("ssh")
 	run2, err := Resume(context.Background(), Config{
 		StateDir: h.stateDir,
 		Programs: cfg.Programs,
@@ -3850,5 +3871,221 @@ func TestResumeConcurrencyOverrideRespectsBudget(t *testing.T) {
 	}
 	if got := len(sftpSessionInvocations(h.invocations())); got != 0 {
 		t.Errorf("sftp sessions = %d, want 0", got)
+	}
+}
+
+// TestResumeReconcilesAlreadyPresentFiles: a file that was fully transferred
+// but whose completion was never recorded (the connection dropped during
+// verification) is marked completed on resume instead of being transferred
+// again.
+func TestResumeReconcilesAlreadyPresentFiles(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 2048)
+	h.writeSrc("big.bin", 4096)
+	// The remote already holds both files exactly as planned (an interrupted
+	// run wrote them, then verification failed).
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt"), h.newFileRecord("big.bin")))
+	// Resume calls the destination manifest first: return the real one.
+	h.writeScript("ssh", "match=if [ -d\nstdout_file="+post+"\n")
+	h.writeScript("rsync", "exit=0")
+
+	size1, mt1 := h.srcMeta("small.txt")
+	size2, mt2 := h.srcMeta("big.bin")
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := state.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &state.Run{
+		ID:        id,
+		Status:    state.StatusFailed,
+		CreatedAt: time.Now().UTC(),
+		Config: state.Config{
+			Backend:        state.BackendAuto,
+			Verify:         state.VerifySize,
+			Jobs:           2,
+			Streams:        2,
+			LargeThreshold: 2048,
+		},
+		Source:      state.Source{Path: h.src},
+		Destination: state.Destination{User: "u", Host: "h", Path: h.remoteDir},
+		WorkDir:     h.src,
+		Tasks: []state.Task{
+			{Path: "small.txt", Size: size1, ModTime: mt1, Backend: state.BackendFPSync, Status: state.StatusFailed,
+				Error: "size verification failed: destination state unavailable"},
+			{Path: "big.bin", Size: size2, ModTime: mt2, Backend: state.BackendMSCP, Status: state.StatusFailed,
+				Error: "size verification failed: destination state unavailable"},
+		},
+	}
+	if err := store.Save(run); err != nil {
+		t.Fatal(err)
+	}
+
+	resumed, err := Resume(context.Background(), Config{
+		StateDir: h.stateDir,
+		Programs: h.config().Programs,
+		Env:      h.nativeEnv(),
+	}, run.ID)
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if resumed.Status != state.StatusCompleted {
+		t.Fatalf("resumed run = %s (%q), want completed", resumed.Status, resumed.Error)
+	}
+	if got := resumed.Tasks[0].Status; got != state.StatusCompleted {
+		t.Errorf("small file = %s, want completed by reconciliation", got)
+	}
+	// The rsync stage must not have run for the reconciled file.
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 0 {
+		t.Errorf("rsync invocations = %d, want 0 (file reconciled, not transferred)", got)
+	}
+}
+
+// TestResumeReconcileSkipsMismatchedDestination: a destination file with the
+// wrong size or mtime is not reconciled; the task keeps working normally.
+func TestResumeReconcileSkipsMismatchedDestination(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 2048)
+	// The destination entry differs in size: not ours to claim.
+	post := h.writeManifest("post", "small.txt\x00\x00\x00")
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "exit=0")
+	size1, mt1 := h.srcMeta("small.txt")
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := state.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &state.Run{
+		ID:        id,
+		Status:    state.StatusFailed,
+		CreatedAt: time.Now().UTC(),
+		Config: state.Config{
+			Backend: state.BackendAuto, Verify: state.VerifyNone,
+			Jobs: 1, Streams: 1, LargeThreshold: 2048,
+		},
+		Source:      state.Source{Path: h.src},
+		Destination: state.Destination{User: "u", Host: "h", Path: h.remoteDir},
+		WorkDir:     h.src,
+		Tasks: []state.Task{{
+			Path: "small.txt", Size: size1, ModTime: mt1,
+			Backend: state.BackendFPSync, Status: state.StatusPending,
+		}},
+	}
+	if err := store.Save(run); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := Resume(context.Background(), Config{
+		StateDir: h.stateDir,
+		Programs: h.config().Programs,
+		Env:      h.nativeEnv(),
+	}, run.ID)
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if got := resumed.Tasks[0].Status; got != state.StatusCompleted {
+		t.Errorf("task = %s, want completed by the normal stage", got)
+	}
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 1 {
+		t.Errorf("rsync invocations = %d, want 1 (not reconciled)", got)
+	}
+}
+
+// TestStageRetriesAfterReauthentication: an ssh authentication rejection
+// (for example an expired certificate) pauses the stage, asks the operator to
+// renew credentials, and retries the same stage instead of failing the run.
+func TestStageRetriesAfterReauthentication(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 2048)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
+	// First rsync attempt: ssh rejects the credentials. Second: success.
+	authErr := h.writeManifest("auth", "Permission denied (publickey).\n")
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "nth=1\nstderr_file="+authErr+"\nexit=255\n---\nexit=0\n")
+	// Fresh-destination scripting consumes the first two ssh calls; the
+	// resumed verification call needs the post manifest again.
+	cfg := h.config()
+	cfg.Backend = state.BackendRsync
+	cfg.AuthRetry = 5
+	prompts := 0
+	cfg.Prompt = func(string) (bool, error) {
+		prompts++
+		return true, nil
+	}
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Sync with interactive re-authentication: %v", err)
+	}
+	if run.Status != state.StatusCompleted {
+		t.Fatalf("run = %s (%q), want completed after the retry", run.Status, run.Error)
+	}
+	if prompts != 1 {
+		t.Errorf("prompts = %d, want exactly 1", prompts)
+	}
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 2 {
+		t.Errorf("rsync invocations = %d, want 2 (rejected + retried)", got)
+	}
+}
+
+// TestAuthFailureWithoutRetryFailsActionably: with retry disabled (the
+// default) the run fails and tells the operator to re-authenticate and resume.
+func TestAuthFailureWithoutRetryFailsActionably(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 2048)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
+	authErr := h.writeManifest("auth", "Permission denied (publickey).\n")
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "stderr_file="+authErr+"\nexit=255\n")
+	cfg := h.config()
+	cfg.Backend = state.BackendRsync
+
+	run, err := Sync(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("Sync = nil, want an authentication failure")
+	}
+	if !errors.Is(err, backend.ErrAuthentication) {
+		t.Errorf("error %v does not wrap backend.ErrAuthentication", err)
+	}
+	if !strings.Contains(err.Error(), "catsync resume") {
+		t.Errorf("error %q should point at resume", err)
+	}
+	store, serr := state.NewStore(h.stateDir)
+	if serr != nil {
+		t.Fatal(serr)
+	}
+	loaded, serr := store.Load(run.ID)
+	if serr != nil {
+		t.Fatal(serr)
+	}
+	if loaded.Status == state.StatusCompleted {
+		t.Error("run must not be completed after an authentication failure")
+	}
+}
+
+// TestReauthenticationDeclinedStopsRetrying: answering no stops the loop and
+// returns the authentication error.
+func TestReauthenticationDeclinedStopsRetrying(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 2048)
+	post := h.writeManifest("post", manifestContent(h.newFileRecord("small.txt")))
+	authErr := h.writeManifest("auth", "Permission denied (publickey).\n")
+	h.scriptSSHFreshDest(post)
+	h.writeScript("rsync", "stderr_file="+authErr+"\nexit=255\n")
+	cfg := h.config()
+	cfg.Backend = state.BackendRsync
+	cfg.AuthRetry = 5
+	cfg.Prompt = func(string) (bool, error) { return false, nil }
+
+	if _, err := Sync(context.Background(), cfg); err == nil {
+		t.Fatal("Sync = nil, want the declined-retry error")
+	}
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 1 {
+		t.Errorf("rsync invocations = %d, want 1 (declined, no retry)", got)
 	}
 }

@@ -1,6 +1,7 @@
 package multistream
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -89,6 +90,43 @@ func (c *idempotentWriteCloser) Close() error {
 	return c.err
 }
 
+// stderrTee forwards ssh's stderr and keeps a bounded copy of its beginning,
+// so a failed handshake can be classified (for example an expired
+// certificate) without buffering an unbounded stream.
+type stderrTee struct {
+	mu    sync.Mutex
+	dst   io.Writer
+	buf   bytes.Buffer
+	limit int
+}
+
+func newStderrTee(dst io.Writer) *stderrTee {
+	return &stderrTee{dst: dst, limit: 8 << 10}
+}
+
+func (t *stderrTee) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	if t.buf.Len() < t.limit {
+		room := t.limit - t.buf.Len()
+		if room > len(p) {
+			room = len(p)
+		}
+		t.buf.Write(p[:room])
+	}
+	t.mu.Unlock()
+	if t.dst != nil {
+		return t.dst.Write(p)
+	}
+	return len(p), nil
+}
+
+// text returns the captured stderr prefix.
+func (t *stderrTee) text() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.buf.String()
+}
+
 // sftpSession is one live system-SSH SFTP session: a client plus the ssh
 // process underneath it.
 type sftpSession struct {
@@ -130,13 +168,14 @@ func (c SFTPConfig) startSession(ctx context.Context, argv []string) (*sftpSessi
 	var rxOnce sync.Once
 	closeClientRx := func() { rxOnce.Do(func() { _ = sshRx_r.Close() }) }
 
+	diag := newStderrTee(c.Stderr)
 	h, err := process.StartInteractive(ctx, process.Spec{
 		Name:   argv[0],
 		Args:   argv[1:],
 		Env:    c.Env,
 		Stdin:  clientTx_r,
 		Stdout: sshRx_w,
-		Stderr: c.Stderr,
+		Stderr: diag,
 	})
 	if err != nil {
 		clientTx_r.Close()
@@ -184,6 +223,13 @@ func (c SFTPConfig) startSession(ctx context.Context, argv []string) (*sftpSessi
 		waitErr := h.Wait()
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("multistream: sftp session interrupted: %w", err)
+		}
+		cause := hsErr
+		if cause == nil {
+			cause = waitErr
+		}
+		if backend.AuthFailure(diag.text()) {
+			return nil, fmt.Errorf("%w: %v (ssh: %s)", backend.ErrAuthentication, cause, strings.TrimSpace(diag.text()))
 		}
 		if hsErr != nil && waitErr != nil {
 			return nil, fmt.Errorf("multistream: sftp handshake failed: %w; ssh: %v", hsErr, waitErr)
