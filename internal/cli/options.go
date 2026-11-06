@@ -126,14 +126,13 @@ func (o *Options) Validate() error {
 	if o.Streams < 1 {
 		return fmt.Errorf("--streams must be at least 1, got %d", o.Streams)
 	}
-	// The real concurrency depends on the plan (how many large files actually
-	// run at once), so the executor validates the peak after planning. Only
-	// the per-dimension sanity bounds are enforceable here.
+	// Parallelism is the operator's choice: the planned peak is only reported
+	// as a warning. These per-dimension bounds just catch typos.
 	if o.Jobs > executor.MaxSSHConnections {
-		return fmt.Errorf("--jobs = %d exceeds the SSH connection budget of %d", o.Jobs, executor.MaxSSHConnections)
+		return fmt.Errorf("--jobs must be at most %d, got %d", executor.MaxSSHConnections, o.Jobs)
 	}
 	if o.Streams > executor.MaxSSHConnections {
-		return fmt.Errorf("--streams = %d exceeds the SSH connection budget of %d", o.Streams, executor.MaxSSHConnections)
+		return fmt.Errorf("--streams must be at most %d, got %d", executor.MaxSSHConnections, o.Streams)
 	}
 	if o.Port < 0 || o.Port > 65535 {
 		return fmt.Errorf("--port must be between 1 and 65535, got %d", o.Port)

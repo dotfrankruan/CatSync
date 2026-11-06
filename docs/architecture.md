@@ -251,7 +251,7 @@ from the recorded file size and chunk size, the temporary path and its
 completed-chunk set live in the checkpoint, and neither depends on how many
 workers or SFTP sessions run, so changing parallelism cannot corrupt progress:
 already-completed chunks are skipped, the same temporary object continues, and
-the new values are validated against the planned-peak SSH budget and persisted
-on the run. Everything else about a resumed run stays immutable; a fresh
+the new values are persisted on the run. Parallelism is not validated against
+a plan-peak ceiling: an estimate above the 64-connection guidance only warns. Everything else about a resumed run stays immutable; a fresh
 `copy`/`sync` creates a new run with its own checkpoint directory, so it never
 adopts another run's temporary object.

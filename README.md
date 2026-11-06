@@ -179,8 +179,8 @@ catsync resume --jobs 2 --streams 8 RUN_ID
 
 This is safe because the chunk plan, the temporary path, and the checkpoint
 are independent of parallelism: already-transferred chunks are never re-sent,
-the same temporary object continues, and the new values are validated against
-the SSH connection budget and persisted for later resumes. Only these two
+the same temporary object continues, and the new values are persisted for
+later resumes. Only these two
 options are accepted, since the rest of a run's strategy is recorded and
 immutable; a fresh `copy`/`sync` starts a new run with a new checkpoint and
 does not adopt an interrupted run's temporary object.
@@ -223,18 +223,17 @@ current smoothed speed, elapsed time, ETA, ETD (estimated local completion
 clock time), and the active stage. It redraws one line on a terminal and is
 silent when redirected unless `--progress always` is selected.
 
-**Parallelism and the SSH connection budget.** `--jobs` bounds how many files
-transfer concurrently and `--streams` bounds how many parallel SFTP sessions
-one large-file transfer holds (both default to 4). The stages run
-sequentially, so the peak connection count of a plan is the largest of
-`min(jobs, large files) × streams`, `min(jobs, small files)` (one ssh per
-concurrent rsync batch), and the conservative rsync stage — capped at 64.
-The budget is validated against the actual plan, so a single file (or a
-handful of large files) can use many streams: `--streams 32` with the default
-`--jobs 4` transfers one file over 32 sessions and is accepted, while a wide
-plan that would genuinely hold more than 64 connections is refused before
-anything is transferred. `--jobs` above 64 or `--streams` above 64 is always
-rejected.
+**Parallelism.** `--jobs` bounds how many files transfer concurrently and
+`--streams` bounds how many parallel SFTP sessions one large-file transfer
+holds (both default to 4). The stages run sequentially, so the peak connection
+count of a plan is the largest of `min(jobs, large files) × streams`,
+`min(jobs, small files)` (one ssh per concurrent rsync batch), and the
+conservative rsync stage. Parallelism is the operator's choice: a single file
+can use many streams (`--streams 32` with the default `--jobs 4` transfers one
+file over 32 sessions), and a wide plan is never refused. When the estimate
+exceeds the 64-connection guidance, CatSync prints one warning and proceeds.
+Each value is capped at 64 on its own (`--jobs 65` or `--streams 65` is a
+usage error) to catch typos.
 
 ## Backend selection
 

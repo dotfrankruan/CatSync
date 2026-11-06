@@ -22,7 +22,6 @@ import (
 
 	"github.com/dotfrankruan/CatSync/internal/backend/multistream"
 	"github.com/dotfrankruan/CatSync/internal/epochtime"
-	"github.com/dotfrankruan/CatSync/internal/planner"
 	"github.com/dotfrankruan/CatSync/internal/state"
 	"github.com/dotfrankruan/CatSync/internal/target"
 	"github.com/dotfrankruan/CatSync/internal/testutil/mockexec"
@@ -3594,52 +3593,30 @@ func TestMirrorRefusesSingleFileSource(t *testing.T) {
 	}
 }
 
-// TestConnectionBudgetUsesPlannedConcurrency: the budget is checked against
-// what actually runs concurrently, so one file may use many streams while a
-// wide large-file tree is still refused.
-func TestConnectionBudgetUsesPlannedConcurrency(t *testing.T) {
-	mkPlan := func(backend state.Backend, n int) *PlanOutcome {
-		out := &PlanOutcome{Result: &planner.Result{}}
-		for i := 0; i < n; i++ {
-			out.Result.Decisions = append(out.Result.Decisions, planner.Decision{
-				Path:    fmt.Sprintf("f%d", i),
-				Backend: backend,
-				Status:  planner.StatusPending,
-			})
-		}
-		return out
+// TestConnectionPeak: the advisory peak uses the planned concurrency, so one
+// file with many streams is not inflated by --jobs.
+func TestConnectionPeak(t *testing.T) {
+	cases := []struct {
+		name                       string
+		large, small, conservative int
+		jobs, streams, wantPeak    int
+	}{
+		{"single large file 32 streams", 1, 0, 0, 4, 32, 32},
+		{"two large files 32 streams", 2, 0, 0, 4, 32, 64},
+		{"three large files 32 streams", 3, 0, 0, 4, 32, 96},
+		{"wide tree 16x16", 100, 0, 0, 16, 16, 256},
+		{"large bounded by jobs", 10, 0, 0, 2, 8, 16},
+		{"small-file only", 0, 100, 0, 8, 64, 8},
+		{"small-only uses jobs", 0, 3, 0, 8, 64, 3},
+		{"conservative only", 0, 0, 5, 4, 16, 4},
+		{"nothing to do", 0, 0, 0, 4, 4, 0},
 	}
-	h := newHarness(t)
-	newExec := func(jobs, streams int) *Executor {
-		cfg := h.config()
-		cfg.Jobs = jobs
-		cfg.Streams = streams
-		e, err := newExecutor(cfg)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return e
-	}
-
-	// One large file with 32 streams: peak 32, allowed.
-	if err := newExec(4, 32).checkConnectionBudget(mkPlan(state.BackendMSCP, 1)); err != nil {
-		t.Errorf("single large file with 32 streams = %v, want allowed", err)
-	}
-	// Exactly at the boundary: 2 large files × 32 streams = 64.
-	if err := newExec(4, 32).checkConnectionBudget(mkPlan(state.BackendMSCP, 2)); err != nil {
-		t.Errorf("2 large files × 32 streams = %v, want allowed", err)
-	}
-	// 3 × 32 = 96 with only 4 jobs: only 3 run at once, so it is still 96.
-	if err := newExec(4, 32).checkConnectionBudget(mkPlan(state.BackendMSCP, 3)); !errors.Is(err, ErrInvalidConfig) {
-		t.Errorf("3 large files × 32 streams = %v, want ErrInvalidConfig", err)
-	}
-	// A wide tree with 16 jobs × 16 streams exceeds the budget.
-	if err := newExec(16, 16).checkConnectionBudget(mkPlan(state.BackendMSCP, 100)); !errors.Is(err, ErrInvalidConfig) {
-		t.Errorf("16 × 16 wide tree = %v, want ErrInvalidConfig", err)
-	}
-	// Small files only: one ssh per concurrent rsync batch.
-	if err := newExec(8, 64).checkConnectionBudget(mkPlan(state.BackendFPSync, 100)); err != nil {
-		t.Errorf("small-file-only plan = %v, want allowed", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := connectionPeak(tc.large, tc.small, tc.conservative, tc.jobs, tc.streams); got != tc.wantPeak {
+				t.Errorf("peak = %d, want %d", got, tc.wantPeak)
+			}
+		})
 	}
 }
 
@@ -3696,9 +3673,9 @@ func TestSyncSingleFileHighStreams(t *testing.T) {
 	}
 }
 
-// TestSyncWideLargeTreeExceedsBudget: a plan that really would hold more than
-// the SSH budget fails before any transfer.
-func TestSyncWideLargeTreeExceedsBudget(t *testing.T) {
+// TestSyncWideLargeTreeWarnsButProceeds: a plan that can hold more than the
+// guidance number of connections is not refused; it warns and proceeds.
+func TestSyncWideLargeTreeWarnsButProceeds(t *testing.T) {
 	h := newHarness(t)
 	for i := 0; i < 8; i++ {
 		h.writeSrc(fmt.Sprintf("big%d.bin", i), 4096)
@@ -3707,16 +3684,19 @@ func TestSyncWideLargeTreeExceedsBudget(t *testing.T) {
 	h.scriptSSHFreshDest(post)
 	cfg := h.config()
 	cfg.Jobs = 8
-	cfg.Streams = 16 // 8 × 16 = 128 > 64
+	cfg.Streams = 16 // 8 × 16 = 128 estimated connections
+	var stderr bytes.Buffer
+	cfg.Stderr = &stderr
 
-	if _, err := Sync(context.Background(), cfg); !errors.Is(err, ErrInvalidConfig) {
-		t.Fatalf("Sync wide large tree = %v, want ErrInvalidConfig", err)
+	out, err := Plan(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Plan with a wide large-file set = %v, want it to proceed", err)
 	}
-	if got := len(toolInvocations(h.invocations(), "rsync")); got != 0 {
-		t.Errorf("rsync invocations = %d, want 0 (refused at plan time)", got)
+	if len(out.Result.Decisions) != 8 {
+		t.Fatalf("decisions = %d, want 8", len(out.Result.Decisions))
 	}
-	if got := len(sftpSessionInvocations(h.invocations())); got != 0 {
-		t.Errorf("sftp sessions = %d, want 0 (refused at plan time)", got)
+	if !strings.Contains(stderr.String(), "concurrent SSH connections") {
+		t.Errorf("stderr = %q, want an advisory connection-count warning", stderr.String())
 	}
 }
 
@@ -3870,64 +3850,5 @@ func TestResumeConcurrencyOverrideRespectsBudget(t *testing.T) {
 	}
 	if got := len(sftpSessionInvocations(h.invocations())); got != 0 {
 		t.Errorf("sftp sessions = %d, want 0", got)
-	}
-}
-
-// TestResumeWideOverrideBudget uses many pending large tasks so the planned
-// peak, not just the per-dimension bound, rejects the override.
-func TestResumeWideOverrideBudget(t *testing.T) {
-	h := newHarness(t)
-	store, err := state.NewStore(h.stateDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id, err := state.NewID()
-	if err != nil {
-		t.Fatal(err)
-	}
-	run := &state.Run{
-		ID:        id,
-		Status:    state.StatusFailed,
-		CreatedAt: time.Now().UTC(),
-		Config: state.Config{
-			Backend:        state.BackendMSCP,
-			Verify:         state.VerifyNone,
-			Jobs:           4,
-			Streams:        4,
-			LargeThreshold: 1024,
-		},
-		Source:      state.Source{Path: h.src},
-		Destination: state.Destination{User: "u", Host: "h", Path: h.remoteDir},
-		WorkDir:     h.src,
-	}
-	for i := 0; i < 8; i++ {
-		run.Tasks = append(run.Tasks, state.Task{
-			Path:    fmt.Sprintf("big%d.bin", i),
-			Size:    4096,
-			ModTime: time.Unix(1_700_000_000, 0),
-			Backend: state.BackendMSCP,
-			Status:  state.StatusPending,
-		})
-	}
-	if err := store.Save(run); err != nil {
-		t.Fatal(err)
-	}
-	// 8 pending large tasks with jobs raised to 8 and 16 streams each:
-	// 8 × 16 = 128 > 64, so the planned peak (not a single dimension) must
-	// reject it.
-	if _, err := Resume(context.Background(), Config{
-		StateDir: h.stateDir,
-		Programs: h.config().Programs,
-		Jobs:     8,
-		Streams:  16,
-	}, run.ID); !errors.Is(err, ErrInvalidConfig) {
-		t.Fatalf("Resume wide override = %v, want ErrInvalidConfig", err)
-	}
-	loaded, err := store.Load(run.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if loaded.Config.Streams != 4 {
-		t.Errorf("recorded streams = %d, want 4 unchanged", loaded.Config.Streams)
 	}
 }

@@ -618,21 +618,44 @@ func Plan(ctx context.Context, cfg Config) (*PlanOutcome, error) {
 	return e.planPhase(ctx)
 }
 
-// checkConnectionBudget validates the planned peak number of concurrent SSH
-// connections against MaxSSHConnections. The stages run sequentially, so the
-// peak is the largest of:
-//
-//   - the native large-file stage: min(Jobs, large files) transfers, each
-//     holding Streams sessions;
-//   - the parallel-rsync small-file stage: min(Jobs, small files) rsync
-//     processes, each with one SSH connection;
-//   - the conservative rsync stage: likewise.
-//
-// Using the planned work instead of Jobs × Streams means a single-file or
-// few-large-file run is not penalized by a --jobs value that never runs
-// concurrently: one file can use up to MaxSSHConnections streams.
-func (e *Executor) checkConnectionBudget(out *PlanOutcome) error {
-	large, small, conservative := 0, 0, 0
+// warnConnectionPeak reports, without failing, when the planned parallel work
+// can hold more concurrent SSH connections than the guidance value. The check
+// is advisory: --jobs and --streams are the operator's choice, so a wide plan
+// proceeds, but a typo that would open hundreds of connections is visible.
+func (e *Executor) warnConnectionPeak(large, small, conservative int) {
+	peak := connectionPeak(large, small, conservative, e.cfg.Jobs, e.cfg.Streams)
+	if peak <= MaxSSHConnections {
+		return
+	}
+	jobs := max(e.cfg.Jobs, 1)
+	largeAtOnce := large
+	if largeAtOnce > jobs {
+		largeAtOnce = jobs
+	}
+	e.warnf("plan can hold up to %d concurrent SSH connections (%d large file(s) × %d stream(s) per job); continuing as requested",
+		peak, largeAtOnce, max(e.cfg.Streams, 1))
+}
+
+// connectionPeak computes the worst-case concurrent SSH connections of one
+// run from its parallel work. The stages run sequentially, so the peak is the
+// largest of the native stage (concurrent large files × streams per file),
+// the small-file stage (one ssh per concurrent rsync batch), and the
+// conservative rsync stage.
+func connectionPeak(large, small, conservative, jobs, streams int) int {
+	jobs = max(jobs, 1)
+	streams = max(streams, 1)
+	peak := min(large, jobs) * streams
+	if p := min(small, jobs); p > peak {
+		peak = p
+	}
+	if p := min(conservative, jobs); p > peak {
+		peak = p
+	}
+	return peak
+}
+
+// plannedPeak counts the parallel work of a fresh plan.
+func (e *Executor) plannedPeak(out *PlanOutcome) (large, small, conservative int) {
 	for _, d := range out.Result.Decisions {
 		if d.Status != planner.StatusPending {
 			continue
@@ -646,64 +669,12 @@ func (e *Executor) checkConnectionBudget(out *PlanOutcome) error {
 			conservative++
 		}
 	}
-	return connectionBudgetError(large, small, conservative, e.cfg.Jobs, e.cfg.Streams)
+	return large, small, conservative
 }
 
-// connectionBudgetPeak computes the worst-case concurrent SSH connections of
-// one run from its parallel work. The stages run sequentially, so the peak is
-// the largest of the native stage (concurrent large files × streams per
-// file), the small-file stage (one ssh per concurrent rsync batch), and the
-// conservative rsync stage.
-func connectionBudgetPeak(large, small, conservative, jobs, streams int) int {
-	if jobs < 1 {
-		jobs = 1
-	}
-	if streams < 1 {
-		streams = 1
-	}
-	nativePeak := jobs
-	if large < nativePeak {
-		nativePeak = large
-	}
-	nativePeak *= streams
-	smallPeak := jobs
-	if small < smallPeak {
-		smallPeak = small
-	}
-	conservativePeak := jobs
-	if conservative < conservativePeak {
-		conservativePeak = conservative
-	}
-	peak := nativePeak
-	if smallPeak > peak {
-		peak = smallPeak
-	}
-	if conservativePeak > peak {
-		peak = conservativePeak
-	}
-	return peak
-}
-
-// connectionBudgetError reports ErrInvalidConfig when the parallel work would
-// hold more than MaxSSHConnections concurrent SSH connections.
-func connectionBudgetError(large, small, conservative, jobs, streams int) error {
-	peak := connectionBudgetPeak(large, small, conservative, jobs, streams)
-	if peak <= MaxSSHConnections {
-		return nil
-	}
-	jobs = max(jobs, 1)
-	streams = max(streams, 1)
-	largeAtOnce := large
-	if largeAtOnce > jobs {
-		largeAtOnce = jobs
-	}
-	return fmt.Errorf("%w: the plan can hold up to %d concurrent SSH connections (%d large file(s) × %d stream(s) per job), exceeding the budget %d; lower --streams or --jobs",
-		ErrInvalidConfig, peak, largeAtOnce, streams, MaxSSHConnections)
-}
-
-// checkRunConnectionBudget validates a resumed run's parallel work against
-// the budget, using the tasks that will actually run again.
-func checkRunConnectionBudget(run *state.Run) error {
+// warnRunConnectionPeak is the resume-time counterpart of warnConnectionPeak,
+// using the tasks that will run again.
+func (e *Executor) warnRunConnectionPeak(run *state.Run) {
 	large, small, conservative := 0, 0, 0
 	for _, t := range run.Tasks {
 		switch t.Status {
@@ -720,7 +691,7 @@ func checkRunConnectionBudget(run *state.Run) error {
 			conservative++
 		}
 	}
-	return connectionBudgetError(large, small, conservative, run.Config.Jobs, run.Config.Streams)
+	e.warnConnectionPeak(large, small, conservative)
 }
 
 // planPhase performs discovery, manifest collection, and planning.
@@ -752,9 +723,7 @@ func (e *Executor) planPhase(ctx context.Context) (*PlanOutcome, error) {
 				out.LogicalBytes += d.Size
 			}
 		}
-		if err := e.checkConnectionBudget(out); err != nil {
-			return nil, err
-		}
+		e.warnConnectionPeak(e.plannedPeak(out))
 		return out, nil
 	}
 	srcAbs, err := filepath.Abs(e.cfg.SourceDir)
@@ -807,9 +776,7 @@ func (e *Executor) planPhase(ctx context.Context) (*PlanOutcome, error) {
 			out.LogicalBytes += d.Size
 		}
 	}
-	if err := e.checkConnectionBudget(out); err != nil {
-		return nil, err
-	}
+	e.warnConnectionPeak(e.plannedPeak(out))
 	return out, nil
 }
 
@@ -1014,9 +981,7 @@ func resumeWith(ctx context.Context, cfg Config, id string, prepare func(*Execut
 	if err := rc.validateFull(); err != nil {
 		return run, fmt.Errorf("executor: run %s configuration no longer valid: %w", run.ID, err)
 	}
-	if err := checkRunConnectionBudget(run); err != nil {
-		return run, err
-	}
+	e.warnRunConnectionPeak(run)
 	if direction == target.LocalToRemote {
 		if _, err := target.ValidateSource(run.Source.Path); err != nil {
 			return run, fmt.Errorf("executor: run %s source: %w", run.ID, err)
