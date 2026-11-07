@@ -29,6 +29,28 @@ daemon on the remote side.
 
 `catsync doctor` verifies the local tools and prints their versions.
 
+## Install
+
+Homebrew (macOS and Linux):
+
+```sh
+brew install dotfrankruan/catsync/catsync
+```
+
+The formula lives in [dotfrankruan/homebrew-catsync](https://github.com/dotfrankruan/homebrew-catsync);
+Homebrew may ask you to trust the third-party tap on first use
+(`brew trust dotfrankruan/catsync`). Upgrades arrive with `brew upgrade catsync`.
+
+From a release archive:
+
+```sh
+curl -LO https://github.com/dotfrankruan/CatSync/releases/download/v0.1.0/catsync_v0.1.0_darwin_arm64.tar.gz
+tar -xzf catsync_v0.1.0_darwin_arm64.tar.gz
+install -m 0755 catsync_v0.1.0_darwin_arm64/catsync ~/.local/bin/catsync
+```
+
+From source: `make install` (Go 1.23+), or `go install github.com/dotfrankruan/CatSync/cmd/catsync@latest`.
+
 ## Releases
 
 Pushing a `v*` tag runs the release workflow: it re-runs the full check suite,
@@ -41,15 +63,9 @@ git tag -a v0.1.0 -m "v0.1.0"
 git push origin v0.1.0
 ```
 
-To install a published archive:
-
-```sh
-curl -LO https://github.com/dotfrankruan/CatSync/releases/download/v0.1.0/catsync_v0.1.0_darwin_arm64.tar.gz
-tar -xzf catsync_v0.1.0_darwin_arm64.tar.gz
-install -m 0755 catsync_v0.1.0_darwin_arm64/catsync ~/.local/bin/catsync
-```
-
-`make release VERSION=v0.1.0` builds the same archives locally.
+`make release VERSION=v0.1.0` builds the same archives locally, and
+[docs/releasing.md](docs/releasing.md) lists the remaining steps: publishing the
+tag and bumping the Homebrew formula.
 
 ## Quick start
 
