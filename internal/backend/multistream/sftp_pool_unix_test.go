@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 
@@ -176,4 +177,55 @@ func TestSFTPPoolMidCancelReapsAll(t *testing.T) {
 		t.Fatalf("error = %v, want wrapped context.Canceled", err)
 	}
 	assertAllDead(t, dir, 4)
+}
+
+// TestSessionCountCallback: a progress display can count live SSH sessions:
+// the callback fires +1 when a session starts and -1 after it is reaped, and
+// balances even when a later session in the pool fails.
+func TestSessionCountCallback(t *testing.T) {
+	var mu sync.Mutex
+	open, peak := 0, 0
+	observe := func(delta int) {
+		mu.Lock()
+		open += delta
+		if open > peak {
+			peak = open
+		}
+		mu.Unlock()
+	}
+	cfg := helperConfig(t, "")
+	cfg.OnSession = observe
+	err := cfg.WithClients(context.Background(), 3, func([]*sftp.Client) error { return nil })
+	if err != nil {
+		t.Fatalf("WithClients: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if peak != 3 {
+		t.Errorf("peak concurrent sessions = %d, want 3", peak)
+	}
+	if open != 0 {
+		t.Errorf("open sessions after teardown = %d, want 0", open)
+	}
+}
+
+// TestSessionCountCallbackFailurePath: a failed handshake still decrements.
+func TestSessionCountCallbackFailurePath(t *testing.T) {
+	var mu sync.Mutex
+	open := 0
+	cfg := helperConfig(t, t.TempDir())
+	cfg.OnSession = func(delta int) {
+		mu.Lock()
+		open += delta
+		mu.Unlock()
+	}
+	cfg.Env = append(cfg.Env, envFailNth+"=1")
+	if err := cfg.WithClient(context.Background(), func(*sftp.Client) error { return nil }); err == nil {
+		t.Fatal("WithClient = nil error, want the failed session")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if open != 0 {
+		t.Errorf("open sessions after a failed start = %d, want 0", open)
+	}
 }

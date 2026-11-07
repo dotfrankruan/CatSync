@@ -208,11 +208,25 @@ sessions), and a wide plan is never refused. When the estimate exceeds the
 capped at 64 on its own (`--jobs 65` or `--streams 65` is a usage error) to catch
 typos.
 
-**Progress.** The aggregate display combines concurrent rsync batches and native
-multistream workers. It reports percentage, transferred logical bytes, smoothed
-speed, elapsed time, ETA, ETD (estimated local completion clock time), and the
-active stage. It redraws one line on a terminal and is silent when redirected
-unless `--progress always` is selected.
+**Progress.** The display has three parts, redrawn as one block on a terminal and
+printed as snapshots when redirected with `--progress always`:
+
+```
+[============------------]  50.00%  8.2 GiB/16.4 GiB  Current Speed 28.3 MiB/s  Elapsed 04:12  ETA 04:51  ETD 17:44:10  native-large
+ssh conns 7  |  files 12/40 done, 0 checked, 3 skipped
+  …/data/big1.bin  4.1 GiB/9.0 GiB  21.0 MiB/s  ETA 03:58
+  …/data/big2.bin  1.9 GiB/7.4 GiB   7.3 MiB/s  ETA 12:40
+```
+
+- the header aggregates every backend: percentage, transferred logical bytes,
+  smoothed speed, elapsed time, ETA, ETD (estimated local completion clock time),
+  and the active stage;
+- the counter line shows the current SSH connection count and how many files are
+  done, checked (verified), and skipped because the destination already matched;
+- up to five active transfers follow, each with its own bytes, speed, and ETA.
+  Native large-file and single-file SFTP transfers are per file; rsync batches
+  are reported per batch with their file count, because rsync reports progress
+  per invocation rather than per file.
 
 ## Backend selection
 

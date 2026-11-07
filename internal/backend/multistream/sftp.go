@@ -41,6 +41,10 @@ type SFTPConfig struct {
 	// Stderr receives ssh's stderr (kept strictly separate from the SFTP
 	// protocol stream on stdout); nil discards it.
 	Stderr io.Writer
+	// OnSession, when set, is called with +1 when an ssh session process
+	// starts and -1 after it has been reaped, so a progress display can
+	// report live connection counts.
+	OnSession func(delta int)
 }
 
 // Command builds the ssh argv: ssh [-6] -T -s [user@]host sftp. The remote
@@ -130,9 +134,10 @@ func (t *stderrTee) text() string {
 // sftpSession is one live system-SSH SFTP session: a client plus the ssh
 // process underneath it.
 type sftpSession struct {
-	client  *sftp.Client
-	handle  *process.Handle
-	closeRx func() // closes the client's read end, exactly once
+	client    *sftp.Client
+	handle    *process.Handle
+	closeRx   func() // closes the client's read end, exactly once
+	onSession func(int)
 }
 
 // close tears the session down: the client's read end closes first so its
@@ -144,6 +149,9 @@ func (s *sftpSession) close() error {
 	s.closeRx()
 	clientErr := s.client.Close()
 	waitErr := s.handle.Wait()
+	if s.onSession != nil {
+		s.onSession(-1)
+	}
 	if clientErr != nil {
 		return clientErr
 	}
@@ -188,6 +196,9 @@ func (c SFTPConfig) startSession(ctx context.Context, argv []string) (*sftpSessi
 	// child sees EOF exactly when the client side closes.
 	clientTx_r.Close()
 	sshRx_w.Close()
+	if c.OnSession != nil {
+		c.OnSession(1)
+	}
 
 	type hsResult struct {
 		client *sftp.Client
@@ -221,6 +232,9 @@ func (c SFTPConfig) startSession(ctx context.Context, argv []string) (*sftpSessi
 	if client == nil {
 		closeClientRx()
 		waitErr := h.Wait()
+		if c.OnSession != nil {
+			c.OnSession(-1)
+		}
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("multistream: sftp session interrupted: %w", err)
 		}
@@ -242,7 +256,7 @@ func (c SFTPConfig) startSession(ctx context.Context, argv []string) (*sftpSessi
 		}
 		return nil, errors.New("multistream: sftp handshake produced no client")
 	}
-	return &sftpSession{client: client, handle: h, closeRx: closeClientRx}, nil
+	return &sftpSession{client: client, handle: h, closeRx: closeClientRx, onSession: c.OnSession}, nil
 }
 
 // MaxSFTPStreams caps one pool: the number of concurrent SFTP sessions over

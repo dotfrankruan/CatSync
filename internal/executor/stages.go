@@ -369,7 +369,7 @@ func (e *Executor) runSmallBatch(ctx, stageCtx context.Context, batch partition.
 		Stderr:        &stderr,
 		Progress:      e.addProgress,
 	}
-	if err := cfg.Run(stageCtx); err != nil {
+	if err := e.withConnection(func() error { return cfg.Run(stageCtx) }); err != nil {
 		out.stderr = stderr.String()
 		if stageCtx.Err() != nil {
 			// Cancelled by the caller or by a sibling batch failure: the
@@ -545,6 +545,15 @@ func (e *Executor) rsyncStage(ctx context.Context) error {
 		return err
 	}
 	e.logf("stage rsync: %d file(s)", len(active))
+	var batchBytes uint64
+	for _, t := range active {
+		if t.Size > 0 {
+			batchBytes += uint64(t.Size)
+		}
+	}
+	label := fmt.Sprintf("rsync (%d files)", len(active))
+	e.progressFileStart(label, batchBytes, 0)
+	defer e.progressFileDone(label, 0)
 	diag := newCaptureWriter(e.stderr)
 	cfg := rsync.Config{
 		Program:   e.progs.rsync(),
@@ -556,12 +565,12 @@ func (e *Executor) rsyncStage(ctx context.Context) error {
 		Env:       e.cfg.Env,
 		Stdout:    e.stdout,
 		Stderr:    diag,
-		Progress:  e.addProgress,
+		Progress:  e.addFileProgress(label),
 	}
 	if e.run.Config.Direction.Effective() == state.DirectionRemoteToLocal {
 		cfg.NoImpliedDirs = true
 	}
-	if err := cfg.Run(ctx); err != nil {
+	if err := e.withConnection(func() error { return cfg.Run(ctx) }); err != nil {
 		rsErr := authFailure(err, diag.text())
 		if ctx.Err() == nil {
 			for _, t := range active {
@@ -619,9 +628,11 @@ func (e *Executor) mirrorStage(ctx context.Context) error {
 		Program: e.progs.rsync(), Direction: e.transferDirection(),
 		SourceDir: e.localRoot(), Dest: e.destTarget(),
 		SSH: e.sshOpts(e.run.Config.IPv6), Env: e.cfg.Env,
-		Stdout: e.stdout, Stderr: e.stderr, Progress: e.addProgress,
+		Stdout: e.stdout, Stderr: e.stderr, Progress: e.addFileProgress("mirror reconcile"),
 	}
-	if err := cfg.Run(ctx); err != nil {
+	e.progressFileStart("mirror reconcile", 0, 0)
+	defer e.progressFileDone("mirror reconcile", 0)
+	if err := e.withConnection(func() error { return cfg.Run(ctx) }); err != nil {
 		return err
 	}
 	// The full-tree archive pass also handles directories, symlinks, and
@@ -809,6 +820,7 @@ func (e *Executor) verifyStage(ctx context.Context) error {
 
 	if e.run.Config.Verify == state.VerifySize {
 		for _, t := range sizeOK {
+			e.progressChecked(1)
 			if err := e.completeVerifiedTask(ctx, t); err != nil {
 				return err
 			}
@@ -842,6 +854,7 @@ func (e *Executor) verifyStage(ctx context.Context) error {
 		// reads remote file contents back through SFTP as a fallback.
 		e.finalWarnings = append(e.finalWarnings, noRemoteHashToolWarning)
 		for _, t := range sizeOK {
+			e.progressChecked(1)
 			if err := e.completeVerifiedTask(ctx, t); err != nil {
 				return err
 			}
@@ -878,6 +891,7 @@ func (e *Executor) verifyStage(ctx context.Context) error {
 			failures = append(failures, t.Path)
 			continue
 		}
+		e.progressChecked(1)
 		if err := e.completeVerifiedTask(ctx, t); err != nil {
 			return err
 		}

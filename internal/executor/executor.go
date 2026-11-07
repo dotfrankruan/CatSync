@@ -339,6 +339,22 @@ func (e *Executor) startProgress() {
 		}
 	}
 	e.progress = progressui.NewWithBaseline(e.stderr, total, baseline, e.cfg.ProgressTerminal)
+	// Seed the file counters from the run's recorded state so a resume shows
+	// the whole job, not just this process's work.
+	var completed, skipped int
+	for _, task := range e.run.Tasks {
+		switch task.Status {
+		case state.StatusCompleted:
+			completed++
+		case state.StatusSkipped:
+			skipped++
+		}
+	}
+	e.progress.FilesTotal(len(e.run.Tasks))
+	e.progress.CompletedFiles(completed)
+	e.progress.SkippedFiles(skipped)
+	// Redraw now that the counters reflect the run's recorded state.
+	e.progress.Phase("starting")
 	if baseline > 0 {
 		// Say what the fast-forward means, and why it can be slightly below
 		// the interrupted figure: bytes written but not fsynced before the
@@ -381,6 +397,54 @@ func (e *Executor) addProgress(n uint64) {
 	if e.progress != nil {
 		e.progress.Add(n)
 	}
+}
+
+// addFileProgress returns a callback that credits bytes to one active file in
+// the progress display.
+func (e *Executor) addFileProgress(label string) func(uint64) {
+	if e.progress == nil {
+		return nil
+	}
+	return func(n uint64) { e.progress.FileAdd(label, n) }
+}
+
+// progressFileStart begins a per-file progress entry at the bytes already
+// durable (a resumed transfer).
+func (e *Executor) progressFileStart(label string, size, done uint64) {
+	if e.progress != nil {
+		e.progress.FileStart(label, size, done)
+	}
+}
+
+// progressFileDone removes a per-file entry and counts the finished files.
+func (e *Executor) progressFileDone(label string, countFiles int) {
+	if e.progress == nil {
+		return
+	}
+	e.progress.FileEnd(label)
+	e.progress.CompletedFiles(countFiles)
+}
+
+// progressChecked counts verified files in the display.
+func (e *Executor) progressChecked(n int) {
+	if e.progress != nil {
+		e.progress.CheckedFiles(n)
+	}
+}
+
+// progressConnDelta reports an SSH connection opening (+1) or closing (-1).
+func (e *Executor) progressConnDelta(delta int) {
+	if e.progress != nil {
+		e.progress.ConnDelta(delta)
+	}
+}
+
+// withConnection wraps one ssh-driving operation so the display's connection
+// counter covers it.
+func (e *Executor) withConnection(fn func() error) error {
+	e.progressConnDelta(1)
+	defer e.progressConnDelta(-1)
+	return fn()
 }
 
 func (e *Executor) progressPhase(phase string) {
@@ -503,12 +567,14 @@ func (e *Executor) collectManifest(ctx context.Context, dest target.Destination,
 		return nil, false, err
 	}
 	var stdout, stderr strings.Builder
-	err = process.Run(ctx, process.Spec{
-		Name:   argv[0],
-		Args:   argv[1:],
-		Env:    e.cfg.Env,
-		Stdout: &stdout,
-		Stderr: &stderr,
+	err = e.withConnection(func() error {
+		return process.Run(ctx, process.Spec{
+			Name:   argv[0],
+			Args:   argv[1:],
+			Env:    e.cfg.Env,
+			Stdout: &stdout,
+			Stderr: &stderr,
+		})
 	})
 	if err != nil {
 		var exitErr *process.ExitError
@@ -542,7 +608,9 @@ func (e *Executor) collectRemoteSource(ctx context.Context, source target.Destin
 		return "", "", nil, err
 	}
 	var stdout, stderr strings.Builder
-	runErr := process.Run(ctx, process.Spec{Name: argv[0], Args: argv[1:], Env: e.cfg.Env, Stdout: &stdout, Stderr: &stderr})
+	runErr := e.withConnection(func() error {
+		return process.Run(ctx, process.Spec{Name: argv[0], Args: argv[1:], Env: e.cfg.Env, Stdout: &stdout, Stderr: &stderr})
+	})
 	if runErr != nil {
 		var exitErr *process.ExitError
 		if errors.As(runErr, &exitErr) && exitErr.Code == discovery.ManifestExitNoSuchDir {
@@ -607,11 +675,13 @@ func (e *Executor) mkdirRemoteParents(ctx context.Context, dest target.Destinati
 		return err
 	}
 	var stderr strings.Builder
-	if err := process.Run(ctx, process.Spec{
-		Name:   argv[0],
-		Args:   argv[1:],
-		Env:    e.cfg.Env,
-		Stderr: &stderr,
+	if err := e.withConnection(func() error {
+		return process.Run(ctx, process.Spec{
+			Name:   argv[0],
+			Args:   argv[1:],
+			Env:    e.cfg.Env,
+			Stderr: &stderr,
+		})
 	}); err != nil {
 		detail := strings.TrimSpace(stderr.String())
 		if detail != "" {

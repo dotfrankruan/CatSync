@@ -52,6 +52,9 @@ func (e *Executor) sftpConfig() multistream.SFTPConfig {
 		Port:    e.run.Config.Port,
 		Env:     e.cfg.Env,
 		Stderr:  e.stderr,
+		OnSession: func(delta int) {
+			e.progressConnDelta(delta)
+		},
 	}
 }
 
@@ -239,6 +242,10 @@ func (e *Executor) nativeLargeDownloadTask(ctx context.Context, t *state.Task, c
 	}
 	remoteSource := backend.RemotePath(e.run.Source.Path, t.Path)
 	localFinal := filepath.Join(e.run.Destination.Path, filepath.FromSlash(t.Path))
+	label := t.Path
+	e.progressFileStart(label, uint64(t.Size), e.nativeCompletedBytes(t))
+	completed := 0
+	defer func() { e.progressFileDone(label, completed) }()
 	opts := multistream.TransferOptions{
 		SFTP:           e.sftpConfig(),
 		Streams:        e.run.Config.Streams,
@@ -246,7 +253,7 @@ func (e *Executor) nativeLargeDownloadTask(ctx context.Context, t *state.Task, c
 		ChunkSize:      nativeChunkSize,
 		CheckpointPath: checkpoint,
 		ExpectedRemote: &multistream.RemoteIdentity{Size: uint64(t.Size), ModTime: t.ModTime},
-		OnProgress:     e.addProgress,
+		OnProgress:     e.addFileProgress(label),
 	}
 	if err := e.markRunning(t); err != nil {
 		return err
@@ -277,6 +284,7 @@ func (e *Executor) nativeLargeDownloadTask(ctx context.Context, t *state.Task, c
 		}
 		return err
 	}
+	completed = 1
 	if e.stageVerifyNone() {
 		if err := e.completeTask(t); err != nil {
 			return err
@@ -447,13 +455,17 @@ func (e *Executor) nativeLargeTask(ctx context.Context, t *state.Task, ckptDir s
 
 	sourceAbs := filepath.Join(e.run.Source.Path, filepath.FromSlash(t.Path))
 	remoteFinal := backend.RemotePath(e.run.Destination.Path, t.Path)
+	label := t.Path
+	e.progressFileStart(label, uint64(t.Size), e.nativeCompletedBytes(t))
+	completed := 0
+	defer func() { e.progressFileDone(label, completed) }()
 	opts := multistream.TransferOptions{
 		SFTP:           e.sftpConfig(),
 		Streams:        e.run.Config.Streams,
 		Workers:        e.run.Config.Streams,
 		ChunkSize:      nativeChunkSize,
 		CheckpointPath: checkpoint,
-		OnProgress:     e.addProgress,
+		OnProgress:     e.addFileProgress(label),
 	}
 
 	// The running intent must be durable before any remote write.
@@ -500,6 +512,7 @@ func (e *Executor) nativeLargeTask(ctx context.Context, t *state.Task, ckptDir s
 	if !ok {
 		return fmt.Errorf("%s: source changed during transfer", t.Path)
 	}
+	completed = 1
 	if e.stageVerifyNone() {
 		// Ordering: publish+verify (done inside Transfer/Resume) → persist
 		// completed → retire the local checkpoint → remove the remote temp.

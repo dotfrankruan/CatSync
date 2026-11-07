@@ -164,13 +164,17 @@ func (e *Executor) nativeSmallTask(ctx context.Context, t *state.Task, ckptDir s
 		return e.failTask(t, fmt.Sprintf("create checkpoint directory: %v", err))
 	}
 
+	label := t.Path
+	e.progressFileStart(label, uint64(t.Size), e.nativeCompletedBytes(t))
+	completed := 0
+	defer func() { e.progressFileDone(label, completed) }()
 	opts := multistream.TransferOptions{
 		SFTP:           e.sftpConfig(),
 		Streams:        1, // one file: extra sessions only add overhead
 		Workers:        1,
 		ChunkSize:      nativeChunkSize,
 		CheckpointPath: checkpoint,
-		OnProgress:     e.addProgress,
+		OnProgress:     e.addFileProgress(label),
 	}
 	if !upload {
 		opts.ExpectedRemote = &multistream.RemoteIdentity{Size: uint64(t.Size), ModTime: t.ModTime}
@@ -196,6 +200,7 @@ func (e *Executor) nativeSmallTask(ctx context.Context, t *state.Task, ckptDir s
 		}
 		return err
 	}
+	completed = 1
 	if e.stageVerifyNone() {
 		if err := e.completeTask(t); err != nil {
 			return err
