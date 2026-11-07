@@ -211,3 +211,28 @@ func TestDoctorRejectsOperandsAndConflictingFlags(t *testing.T) {
 		t.Errorf("doctor --quiet --verbose exit = %d, want %d", code, ExitUsage)
 	}
 }
+
+// TestDoctorWarnsAboutNonGNURsync: Apple's openrsync lacks --acls, which the
+// mirror reconciliation needs; doctor must call that out instead of reporting a
+// clean bill of health.
+func TestDoctorWarnsAboutNonGNURsync(t *testing.T) {
+	dir := t.TempDir()
+	// A stand-in "rsync" that answers --version and --help like openrsync: no
+	// GNU-only options, and a --help that exits nonzero (as the real one does).
+	if err := os.WriteFile(filepath.Join(dir, "rsync"), []byte(""), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'openrsync: protocol version 29'; exit 0;;\n  *) echo 'rsync: unrecognized option' >&2; exit 1;;\nesac\n"
+	if err := os.WriteFile(filepath.Join(dir, "rsync"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	var stdout, stderr strings.Builder
+	code := runDoctor(&stdout, &stderr, defaultOptions(), defaultProbeTimeout)
+	if code != ExitOK {
+		t.Fatalf("doctor exit = %d, want %d", code, ExitOK)
+	}
+	if !strings.Contains(stdout.String(), "GNU rsync") {
+		t.Errorf("doctor should warn about non-GNU rsync:\n%s", stdout.String())
+	}
+}

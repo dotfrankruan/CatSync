@@ -77,8 +77,8 @@ recorded and immutable.
 
 Prints a run without mutating it: status, source/destination, timestamps,
 configuration, per-status and per-backend task counts, retained checkpoint
-count, and recorded errors. Legacy fpsync run IDs on old runs are shown for
-diagnostics only. Missing or corrupt state exits nonzero.
+count, and recorded errors. Fields recorded by older releases on old runs are
+shown for diagnostics only. Missing or corrupt state exits nonzero.
 
 ### `catsync version`
 
@@ -173,7 +173,7 @@ terminal; without one the run fails instead of blocking.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--backend` | `auto` | `auto`, `fpsync` (native parallel-rsync; does not invoke fpsync/fpart), `mscp` (native multistream; never invokes external mscp), or `rsync` |
+| `--backend` | `auto` | `auto`, `fpsync` (native parallel-rsync), `mscp` (native multistream), or `rsync`; the two names are kept as compatibility values |
 | `--dry-run` | off | transfer nothing; `sync` additionally runs rsync's itemized mirror preview, including deletions |
 | `--verify` | `auto` | `auto`, `none`, `size`, or `sha256` (see [Verification](#verification)) |
 | `--progress` | `auto` | `auto` (interactive terminal only), `always` (log snapshots), or `never` |
@@ -249,7 +249,11 @@ content-checked the whole tree rather than trusting the planning hint.
 ### Requirements on the remote host
 
 - a POSIX shell and GNU findutils (manifest collection uses `find -printf`);
-- `rsync` for the conservative stage and the native small-file batches;
+- `rsync` for the conservative stage and the native small-file batches.
+  `catsync sync` additionally needs **GNU rsync** (it reconciles with
+  `--acls --xattrs --hard-links`); macOS ships Apple openrsync at
+  `/usr/bin/rsync`, so install GNU rsync (`brew install rsync`) and put it
+  first in `PATH`. `catsync doctor` warns when the rsync in `PATH` is not GNU;
 - for native **uploads**: an OpenSSH ≥ 9.0 `sftp-server` (fsync and
   `hardlink@openssh.com` extensions) and GNU coreutils (nanosecond `touch`);
 - native **downloads** need the SFTP subsystem and GNU findutils, but not the
@@ -425,6 +429,11 @@ estimate above 64 connections only warns.
 uses native multistream only for large files confirmed absent at the destination;
 existing or unknown destination state always falls back to rsync. `--backend
 mscp` refuses such files rather than overwriting them.
+
+**`rsync: unrecognized option '--acls'` on macOS.** The system `/usr/bin/rsync`
+is Apple openrsync, which lacks GNU's ACL/xattr options that `sync` uses.
+Install GNU rsync (`brew install rsync`) and make sure it comes first in
+`PATH`; `catsync doctor` reports this.
 
 **`sync` refuses to delete.** The reconciliation runs only after every transfer
 stage succeeded; fix the transfer failure first.

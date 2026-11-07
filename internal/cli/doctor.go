@@ -107,6 +107,18 @@ func runDoctor(stdout, stderr io.Writer, opts Options, timeout time.Duration) in
 		if rep.spec.required && !rep.found {
 			missing = append(missing, rep.spec.name)
 		}
+		if spec.name == "rsync" && rep.found && opts.Quiet {
+			// A non-GNU rsync is worth reporting even in quiet mode: sync
+			// cannot mirror ACLs or extended attributes with it.
+			if !gnuRsyncAvailable(rep.path, timeout) {
+				fmt.Fprintln(stderr, "catsync: doctor: the rsync in PATH lacks GNU options (--acls/--xattrs); `catsync sync` needs GNU rsync (on macOS: brew install rsync, then put it first in PATH)")
+			}
+		}
+		if spec.name == "rsync" && rep.found && !opts.Quiet {
+			if !gnuRsyncAvailable(rep.path, timeout) {
+				fmt.Fprintln(stdout, "         warning: this rsync lacks --acls/--xattrs (Apple openrsync?); `catsync sync` needs GNU rsync (macOS: brew install rsync)")
+			}
+		}
 	}
 	if len(missing) > 0 {
 		fmt.Fprintf(stderr, "catsync: doctor: missing required tools: %s\n", strings.Join(missing, ", "))
@@ -116,6 +128,18 @@ func runDoctor(stdout, stderr io.Writer, opts Options, timeout time.Duration) in
 		fmt.Fprintln(stdout, "doctor: all required tools are available")
 	}
 	return ExitOK
+}
+
+// gnuRsyncAvailable reports whether prog accepts the GNU-only options the
+// mirror reconciliation uses. Apple's openrsync does not.
+func gnuRsyncAvailable(prog string, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, prog, "--help").CombinedOutput()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), "--acls")
 }
 
 // printToolReport renders one probe result. Missing tools are always shown

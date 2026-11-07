@@ -24,14 +24,24 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # The tests exercise the real OpenSSH sftp-server. macOS ships it at
-      # /usr/libexec/sftp-server; Debian/Ubuntu install it from the
+      # The tests exercise the real OpenSSH sftp-server: macOS ships it at
+      # /usr/libexec/sftp-server, Debian/Ubuntu install it from the
       # openssh-sftp-server package.
       - name: Install test dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y rsync openssh-sftp-server
+
+      # macOS ships Apple openrsync at /usr/bin/rsync, which rejects the
+      # --acls/--xattrs/--hard-links options the mirror tests exercise. Install
+      # GNU rsync and put it ahead of /usr/bin.
+      - name: Install GNU rsync (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install rsync
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          "$(brew --prefix)/bin/rsync" --version | head -1
 
       - name: Format, vet, race tests
         env:

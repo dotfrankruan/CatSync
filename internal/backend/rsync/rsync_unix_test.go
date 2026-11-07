@@ -252,11 +252,24 @@ func TestLocalRealRsyncTransfer(t *testing.T) {
 	}
 }
 
+// requireGNUrsync skips a test when the resolved rsync cannot supply the
+// options under test. Apple ships openrsync at /usr/bin/rsync, which rejects
+// --acls/--xattrs/--hard-links; install GNU rsync (brew install rsync) to run
+// these tests there.
+func requireGNUrsync(t *testing.T, prog string) {
+	t.Helper()
+	out, err := exec.Command(prog, "--help").CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "--acls") {
+		t.Skipf("%s is not GNU rsync (no --acls; on macOS install GNU rsync and put it first in PATH)", prog)
+	}
+}
+
 func TestLocalRealRsyncMirrorDeletesAfterTransferAndPreservesTree(t *testing.T) {
 	prog, err := exec.LookPath("rsync")
 	if err != nil {
 		t.Skip("rsync not installed; skipping real local mirror test")
 	}
+	requireGNUrsync(t, prog)
 	src := t.TempDir()
 	dst := t.TempDir()
 	writeSourceFile(t, src, "kept/file.txt", []byte("new content"))
@@ -358,6 +371,7 @@ func TestLocalRealRsyncNoImpliedDirsNested(t *testing.T) {
 	if err != nil {
 		t.Skip("rsync not installed; skipping real local transfer test")
 	}
+	requireGNUrsync(t, prog)
 	src := t.TempDir()
 	dst := t.TempDir()
 	paths := []string{
