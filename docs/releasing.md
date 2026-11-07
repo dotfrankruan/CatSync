@@ -65,3 +65,7 @@ brew install dotfrankruan/catsync/catsync
 catsync version
 catsync doctor
 ```
+
+The fully-qualified install auto-taps the repository and needs no trust step;
+only installing by short name after an explicit `brew tap` requires
+`brew trust dotfrankruan/catsync` (that command trusts the whole tap).

@@ -37,9 +37,18 @@ Homebrew (macOS and Linux):
 brew install dotfrankruan/catsync/catsync
 ```
 
-The formula lives in [dotfrankruan/homebrew-catsync](https://github.com/dotfrankruan/homebrew-catsync);
-Homebrew may ask you to trust the third-party tap on first use
-(`brew trust dotfrankruan/catsync`). Upgrades arrive with `brew upgrade catsync`.
+The formula lives in [dotfrankruan/homebrew-catsync](https://github.com/dotfrankruan/homebrew-catsync)
+(`dotfrankruan/catsync` is the tap name; Homebrew maps it to that repository).
+The fully-qualified install needs no extra trust step. If you prefer to tap
+first and install by short name, Homebrew asks you to trust the tap once:
+
+```sh
+brew tap dotfrankruan/catsync
+brew trust dotfrankruan/catsync   # trusts the tap, i.e. its formulae
+brew install catsync
+```
+
+Upgrades arrive with `brew upgrade catsync`.
 
 From a release archive:
 
