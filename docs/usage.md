@@ -173,7 +173,7 @@ terminal; without one the run fails instead of blocking.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--backend` | `auto` | `auto`, `fpsync` (native parallel-rsync), `mscp` (native multistream), or `rsync`; the two names are kept as compatibility values |
+| `--backend` | `auto` | `auto`, `fpsync` (native parallel-rsync), `mscp` (native multistream), `sftp` (native single-file SFTP), or `rsync`; `fpsync`/`mscp` are kept as compatibility values |
 | `--dry-run` | off | transfer nothing; `sync` additionally runs rsync's itemized mirror preview, including deletions |
 | `--verify` | `auto` | `auto`, `none`, `size`, or `sha256` (see [Verification](#verification)) |
 | `--progress` | `auto` | `auto` (interactive terminal only), `always` (log snapshots), or `never` |
@@ -221,7 +221,7 @@ Auto mode assigns every regular file exactly one owner:
 | Source / destination state | Backend |
 | --- | --- |
 | unchanged size and mtime (hint only) | skipped — no transfer |
-| new file below the threshold | native parallel-rsync batches (backend name `fpsync` for compatibility) |
+| new file below the threshold | native parallel-rsync batches (backend name `fpsync` for compatibility), or native single-file SFTP transfers when rsync is not installed (backend `sftp`) |
 | new file at or above the threshold | native multistream (backend name `mscp` for compatibility) |
 | existing, modified, or state unknown | rsync |
 | symlink, special file, or scan error | unsupported — recorded distinctly, never followed |
@@ -245,6 +245,17 @@ instead of claiming an exact mirror.
 Files initially `skipped` because size and mtime matched are promoted to
 `completed` after a successful checksum reconciliation, because sync has then
 content-checked the whole tree rather than trusting the planning hint.
+
+### Running without rsync
+
+rsync is not required for a copy that only adds files: new small files go over
+a single native SFTP session each (backend `sftp`) and new large files already
+use native multistream, so a host with only `ssh` can copy a new tree. What
+still needs rsync is updating files that already exist at the destination (delta
+transfer), the mirror reconciliation of `sync`, and the parallel batches that
+make many small files fast when rsync *is* installed. `catsync doctor` reports
+rsync as optional and explains what it is used for; a run that needs it fails
+with a clear message instead of guessing.
 
 ### Requirements on the remote host
 

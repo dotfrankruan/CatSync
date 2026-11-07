@@ -86,13 +86,14 @@ const (
 	BackendAuto   Backend = "auto"
 	BackendFPSync Backend = "fpsync"
 	BackendMSCP   Backend = "mscp"
+	BackendSFTP   Backend = "sftp"
 	BackendRsync  Backend = "rsync"
 )
 
 // Valid reports whether b is a known backend.
 func (b Backend) Valid() bool {
 	switch b {
-	case BackendAuto, BackendFPSync, BackendMSCP, BackendRsync:
+	case BackendAuto, BackendFPSync, BackendMSCP, BackendSFTP, BackendRsync:
 		return true
 	}
 	return false

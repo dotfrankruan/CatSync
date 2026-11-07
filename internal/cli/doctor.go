@@ -28,7 +28,7 @@ type toolSpec struct {
 // (system OpenSSH SFTP subsystem) and remote metadata commands. No other
 // external tool is needed.
 var doctorTools = []toolSpec{
-	{name: "rsync", required: true, versionArgs: []string{"--version"}, purpose: "required transfer backend (conservative and native small-file batches)"},
+	{name: "rsync", required: false, versionArgs: []string{"--version"}, purpose: "needed for updated files, mirror reconciliation, and the fastest small-file batches; new files also transfer over native SFTP without it"},
 	{name: "ssh", required: true, versionArgs: []string{"-V"}, purpose: "required remote transport (native multistream large-file backend runs over its SFTP subsystem)"},
 }
 

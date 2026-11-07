@@ -286,8 +286,8 @@ func TestForcedMSCPRejectsExistingAndUnknown(t *testing.T) {
 func TestMissingTools(t *testing.T) {
 	entries := []discovery.Entry{file("f", 1)}
 	dest := map[string]discovery.RemoteEntry{}
-	// rsync is required in every mode: all fallbacks land on it.
-	for _, backend := range []state.Backend{state.BackendAuto, state.BackendRsync, state.BackendFPSync, state.BackendMSCP} {
+	// Forced rsync-backed modes cannot be honored without rsync.
+	for _, backend := range []state.Backend{state.BackendRsync, state.BackendFPSync} {
 		t.Run("no rsync/"+string(backend), func(t *testing.T) {
 			tools := allTools()
 			tools.Rsync = false
@@ -295,6 +295,20 @@ func TestMissingTools(t *testing.T) {
 				t.Errorf("Plan succeeded without rsync: %+v", res)
 			}
 		})
+	}
+	// Without rsync, auto still plans new files natively, and a forced native
+	// backend still works.
+	tools := allTools()
+	tools.Rsync = false
+	res, err := Plan(entries, dest, Config{Backend: state.BackendAuto, Threshold: 1024, Tools: tools})
+	if err != nil {
+		t.Fatalf("auto without rsync: %v", err)
+	}
+	if res.Decisions[0].Backend != state.BackendSFTP {
+		t.Errorf("auto without rsync planned %s, want sftp", res.Decisions[0].Backend)
+	}
+	if _, err := Plan(entries, dest, Config{Backend: state.BackendMSCP, Threshold: 1024, Tools: tools}); err != nil {
+		t.Errorf("forced native multistream without rsync: %v", err)
 	}
 	// Forced fpsync is the native small-file backend: it needs no fpsync
 	// or fpart executables, only rsync.

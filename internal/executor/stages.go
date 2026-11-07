@@ -893,7 +893,7 @@ func (e *Executor) completeVerifiedTask(ctx context.Context, t *state.Task) erro
 	// completeTask retires it, then remove the temp only after completed is
 	// durable.
 	tempPath := ""
-	if t.Backend == state.BackendMSCP {
+	if t.Backend == state.BackendMSCP || t.Backend == state.BackendSFTP {
 		tempPath = e.nativeTempPath(t)
 	}
 	if err := e.completeTask(t); err != nil {

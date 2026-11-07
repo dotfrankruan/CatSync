@@ -1304,6 +1304,7 @@ func (e *Executor) execute(ctx context.Context) (retErr error) {
 		fn   func(context.Context) error
 	}{
 		{"parallel-rsync", e.smallFileStage},
+		{"native-small", e.nativeSmallStage},
 		{"native-large", e.nativeLargeStage},
 		{"rsync", e.rsyncStage},
 	}
@@ -1626,7 +1627,7 @@ func (e *Executor) reconcileAlreadyPresent(ctx context.Context) {
 		// Native temp objects and rsync partials are not destination
 		// entries, so a matching entry here means the file itself is done.
 		tempPath := ""
-		if t.Backend == state.BackendMSCP {
+		if t.Backend == state.BackendMSCP || t.Backend == state.BackendSFTP {
 			tempPath = e.nativeTempPath(t)
 		}
 		e.runMu.Lock()
@@ -1642,7 +1643,7 @@ func (e *Executor) reconcileAlreadyPresent(ctx context.Context) {
 		}
 		// The published file is live and completion is durable: retire the
 		// remaining resume artifacts, best effort.
-		if t.Backend == state.BackendMSCP {
+		if t.Backend == state.BackendMSCP || t.Backend == state.BackendSFTP {
 			if err := e.retireCheckpoint(t); err != nil {
 				e.warnf("resume reconciliation: retire checkpoint for %s: %v", t.Path, err)
 			}
@@ -1690,7 +1691,7 @@ func (e *Executor) retireCompletedCheckpoints(ctx context.Context) error {
 	paths := make([]string, len(refs))
 	for i, t := range refs {
 		paths[i] = t.Checkpoint
-		if t.Backend == state.BackendMSCP {
+		if t.Backend == state.BackendMSCP || t.Backend == state.BackendSFTP {
 			tempPaths = append(tempPaths, e.nativeTempPath(t))
 		}
 		t.Checkpoint = ""

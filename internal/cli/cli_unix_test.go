@@ -205,7 +205,7 @@ func TestCLISyncEndToEnd(t *testing.T) {
 	if code != ExitOK {
 		t.Fatalf("status exit = %d, stderr:\n%s", code, stderr)
 	}
-	for _, want := range []string{"completed", "native-small 1, native-large 1, rsync 0", "user@host:" + h.remoteDir} {
+	for _, want := range []string{"completed", "native-small 1, native-small-sftp 0, native-large 1, rsync 0", "user@host:" + h.remoteDir} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("status output missing %q:\n%s", want, stdout)
 		}

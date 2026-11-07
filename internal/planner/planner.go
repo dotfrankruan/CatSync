@@ -31,7 +31,6 @@
 package planner
 
 import (
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -78,18 +77,22 @@ type Config struct {
 	Tools Tools
 }
 
-// validate checks the configuration, including that the tools every policy
-// path can fall back on are present.
+// validate checks the configuration. rsync absence is not fatal here: new
+// files still transfer natively, and only the files that need rsync (existing,
+// modified, or unknown destination state) are rejected below with a specific
+// reason.
 func (c *Config) validate() error {
 	if !c.Backend.Valid() {
 		return fmt.Errorf("planner: invalid backend %q", c.Backend)
 	}
+	// A forced rsync-backed mode cannot be honored without rsync. Auto mode
+	// still works for new files, and the native backends never need it.
 	if !c.Tools.Rsync {
-		return errors.New("planner: rsync is required but not available")
+		switch c.Backend {
+		case state.BackendRsync, state.BackendFPSync:
+			return fmt.Errorf("planner: backend %q requires rsync, which is not installed", c.Backend)
+		}
 	}
-	// The native small-file and large-file stages need only rsync and ssh;
-	// "mscp" is a compatibility value for the native multistream backend and
-	// requires no external tool.
 	return nil
 }
 
@@ -213,6 +216,17 @@ func planFile(d *Decision, e discovery.Entry, dest map[string]discovery.RemoteEn
 		d.Status = StatusPending
 		d.Backend = state.BackendRsync
 		d.Reason = "forced rsync"
+	case state.BackendSFTP:
+		if !isNew {
+			*rejected = append(*rejected, e.Path)
+			d.Status = StatusUnsupported
+			d.Backend = state.BackendRsync
+			d.Reason = "forced native SFTP refuses files that already exist at the destination"
+			return
+		}
+		d.Status = StatusPending
+		d.Backend = state.BackendSFTP
+		d.Reason = "forced native SFTP"
 	case state.BackendFPSync:
 		if large {
 			*rejected = append(*rejected, e.Path)
@@ -240,23 +254,33 @@ func planFile(d *Decision, e discovery.Entry, dest map[string]discovery.RemoteEn
 		d.Backend = state.BackendMSCP
 		d.Reason = "forced native multistream: file confirmed absent at the destination"
 	default: // auto
-		planAuto(d, e, dest, isNew, large, cfg)
+		planAuto(d, e, dest, isNew, large, cfg, rejected)
 	}
 }
 
 // planAuto applies the auto-mode assignment policy to one regular file.
-func planAuto(d *Decision, e discovery.Entry, dest map[string]discovery.RemoteEntry, isNew, large bool, cfg *Config) {
+func planAuto(d *Decision, e discovery.Entry, dest map[string]discovery.RemoteEntry, isNew, large bool, cfg *Config, rejected *[]string) {
 	d.Status = StatusPending
 	switch {
-	case isNew && !large:
-		// The native small-file stage is always usable: it drives rsync,
-		// which is a required tool.
+	case isNew && !large && cfg.Tools.Rsync:
+		// Batched rsync is the fastest path for many small files.
 		d.Backend = state.BackendFPSync
 		d.Reason = "new file below threshold: native parallel rsync"
+	case isNew && !large:
+		// Without rsync, send the file over the native SFTP path instead.
+		d.Backend = state.BackendSFTP
+		d.Reason = "new file below threshold: native SFTP (rsync unavailable)"
 	case isNew && large:
 		d.Backend = state.BackendMSCP
 		d.Reason = "new file at or above threshold: native multistream"
 	default:
+		if !cfg.Tools.Rsync {
+			*rejected = append(*rejected, e.Path)
+			d.Status = StatusUnsupported
+			d.Backend = state.BackendRsync
+			d.Reason = "rsync is required for existing or unknown destination files but is not installed"
+			return
+		}
 		d.Backend = state.BackendRsync
 		if dest == nil {
 			d.Reason = "destination metadata unknown: rsync"

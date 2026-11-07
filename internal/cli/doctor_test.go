@@ -101,9 +101,10 @@ func TestDoctorMissingRequiredToolFails(t *testing.T) {
 		tools   map[string]string
 		missing string
 	}{
-		{"no rsync", map[string]string{"ssh": "echo v"}, "rsync"},
+		// rsync is optional: new files transfer over native SFTP without it,
+		// only updated files and mirror reconciliation need it.
 		{"no ssh", map[string]string{"rsync": "echo v"}, "ssh"},
-		{"neither", nil, "rsync, ssh"},
+		{"neither", nil, "ssh"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -119,6 +120,19 @@ func TestDoctorMissingRequiredToolFails(t *testing.T) {
 				t.Errorf("stdout should mark the tool as REQUIRED:\n%s", stdout)
 			}
 		})
+	}
+}
+
+// TestDoctorWithoutRsyncSucceeds: rsync is optional; a host with only ssh can
+// still copy new files natively, and doctor says so without failing.
+func TestDoctorWithoutRsyncSucceeds(t *testing.T) {
+	fakePath(t, map[string]string{"ssh": "echo 'OpenSSH_9.7p1'"})
+	code, stdout, stderr := runDoctorCmd(t, 2*time.Second, Options{})
+	if code != ExitOK {
+		t.Fatalf("exit = %d, want %d (stderr %q)", code, ExitOK, stderr)
+	}
+	if !strings.Contains(stdout, "rsync   missing  optional") {
+		t.Errorf("missing rsync should be reported as optional:\n%s", stdout)
 	}
 }
 

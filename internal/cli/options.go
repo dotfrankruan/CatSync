@@ -84,7 +84,7 @@ func defaultStateDir() string {
 // defaultOptions for help text to render correct defaults.
 func (o *Options) bindSharedFlags(fs *flag.FlagSet) {
 	fs.StringVar(&o.Backend, "backend", o.Backend,
-		"transfer backend: auto, fpsync (native parallel-rsync), mscp (native multistream over system ssh), or rsync")
+		"transfer backend: auto, fpsync (native parallel-rsync), mscp (native multistream over system ssh), sftp (native single-file SFTP), or rsync")
 	fs.BoolVar(&o.DryRun, "dry-run", o.DryRun, "plan and report without transferring data")
 	fs.BoolVar(&o.Fresh, "fresh", o.Fresh, "start a new run instead of resuming an interrupted run for the same source and destination")
 	fs.BoolVar(&o.Verbose, "verbose", o.Verbose, "increase output detail")
@@ -123,9 +123,9 @@ func (o *Options) Validate() error {
 		return err
 	}
 	switch o.Backend {
-	case "auto", "fpsync", "mscp", "rsync":
+	case "auto", "fpsync", "mscp", "sftp", "rsync":
 	default:
-		return fmt.Errorf("--backend %q is not valid: want auto, fpsync, mscp, or rsync", o.Backend)
+		return fmt.Errorf("--backend %q is not valid: want auto, fpsync, mscp, sftp, or rsync", o.Backend)
 	}
 	switch o.OnAuthFailure {
 	case "fail", "retry":

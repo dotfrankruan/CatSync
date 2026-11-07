@@ -23,7 +23,7 @@ daemon on the remote side.
 
 | | |
 | --- | --- |
-| Local | Go 1.23+ to build. At runtime only `ssh` and `rsync`. |
+| Local | Go 1.23+ to build. At runtime `ssh`, plus `rsync` for updated files and mirror sync; a copy that only adds files works with `ssh` alone. |
 | Remote | `rsync`, `sshd` with `sftp-server`, and GNU findutils. Native uploads additionally need OpenSSH ≥ 9.0 (fsync and `hardlink@openssh.com`) and GNU coreutils; native downloads need only SFTP and GNU findutils. |
 | Not required | No remote daemon and no extra tooling beyond the two programs above. |
 
