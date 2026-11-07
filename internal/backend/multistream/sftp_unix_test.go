@@ -42,12 +42,25 @@ const (
 // sftpServerBin is the real OpenSSH sftp-server used by the fake-ssh helper
 // when envRealServer is set, so tempfile tests exercise the real protocol —
 // exclusive create, truncate, chmod, fsync — not an approximation.
-const sftpServerBin = "/usr/libexec/sftp-server"
+// sftpServerCandidates lists where OpenSSH installs sftp-server.
+var sftpServerCandidates = []string{
+	"/usr/libexec/sftp-server",
+	"/usr/lib/openssh/sftp-server",
+}
+
+// sftpServerBin returns the first available real sftp-server, or "".
+func sftpServerBin() string {
+	for _, p := range sftpServerCandidates {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
 
 // realServerAvailable reports whether the real server binary exists.
 func realServerAvailable() bool {
-	_, err := os.Stat(sftpServerBin)
-	return err == nil
+	return sftpServerBin() != ""
 }
 
 // TestMain runs the fake-ssh helper when marked, else the tests.
@@ -249,7 +262,7 @@ func runFakeSSH() int {
 	}
 	if os.Getenv(envRealServer) != "" && realServerAvailable() {
 		// The real server inherits our stdio exactly; no copying, no shell.
-		cmd := exec.Command(sftpServerBin)
+		cmd := exec.Command(sftpServerBin())
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr

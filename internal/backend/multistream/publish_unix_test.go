@@ -257,7 +257,7 @@ func TestTransferPreEpochNanosecondMtime(t *testing.T) {
 // touch/test command construction as pure data.
 func TestTransferShellInjectionFilenames(t *testing.T) {
 	if !realServerAvailable() {
-		t.Skipf("real sftp-server %s not available", sftpServerBin)
+		t.Skipf("real sftp-server %s not available", sftpServerBin())
 	}
 	base := t.TempDir()
 	sentinel := filepath.Join(base, "sentinel-must-survive")

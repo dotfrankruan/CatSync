@@ -20,12 +20,26 @@ import (
 
 // sftpServerBin is the real OpenSSH sftp-server used to emulate the remote
 // end of an ssh SFTP subsystem invocation.
-const sftpServerBin = "/usr/libexec/sftp-server"
+// sftpServerCandidates lists where OpenSSH installs sftp-server: macOS uses
+// /usr/libexec, Debian/Ubuntu use /usr/lib/openssh.
+var sftpServerCandidates = []string{
+	"/usr/libexec/sftp-server",
+	"/usr/lib/openssh/sftp-server",
+}
+
+// sftpServerBin returns the first available real sftp-server, or "".
+func sftpServerBin() string {
+	for _, p := range sftpServerCandidates {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
 
 // SFTPServerAvailable reports whether the real sftp-server binary exists.
 func SFTPServerAvailable() bool {
-	_, err := os.Stat(sftpServerBin)
-	return err == nil
+	return sftpServerBin() != ""
 }
 
 // envSFTPFailNth makes the Nth SFTP subsystem invocation in this record
@@ -306,10 +320,10 @@ func failNthSFTPSession() bool {
 // and stat all behave exactly as a real remote end would.
 func serveSFTP() int {
 	if !SFTPServerAvailable() {
-		fmt.Fprintf(os.Stderr, "mockexec: %s not available\n", sftpServerBin)
+		fmt.Fprintf(os.Stderr, "mockexec: sftp-server not available\n")
 		return 2
 	}
-	c := exec.Command(sftpServerBin)
+	c := exec.Command(sftpServerBin())
 	c.Stdin = os.Stdin
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr

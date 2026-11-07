@@ -364,7 +364,7 @@ func TestOpenResumeTempRejectsExistingFinal(t *testing.T) {
 func withRealSFTPServer(t *testing.T, fn func(*sftp.Client) error) {
 	t.Helper()
 	if !realServerAvailable() {
-		t.Skipf("real sftp-server %s not available; skipping real-server test", sftpServerBin)
+		t.Skipf("real sftp-server %s not available; skipping real-server test", sftpServerBin())
 	}
 	cfg := helperConfig(t, t.TempDir(), envRealServer+"=1")
 	if err := cfg.WithClient(context.Background(), fn); err != nil {

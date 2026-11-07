@@ -20,7 +20,7 @@ import (
 // contract.
 func TestNativeTransferEndToEnd(t *testing.T) {
 	if !realServerAvailable() {
-		t.Skipf("real sftp-server %s not available", sftpServerBin)
+		t.Skipf("real sftp-server %s not available", sftpServerBin())
 	}
 	base := t.TempDir()
 	src := filepath.Join(base, "src", "big.bin")

@@ -28,7 +28,7 @@ type transferEnv struct {
 func newTransferEnv(t *testing.T, size uint64, chunkSize uint64) *transferEnv {
 	t.Helper()
 	if !realServerAvailable() {
-		t.Skipf("real sftp-server %s not available; skipping real-server test", sftpServerBin)
+		t.Skipf("real sftp-server %s not available; skipping real-server test", sftpServerBin())
 	}
 	base := t.TempDir()
 	src := filepath.Join(base, "src", "big.bin")

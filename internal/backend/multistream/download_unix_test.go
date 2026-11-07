@@ -22,7 +22,7 @@ type downloadEnv struct {
 func newDownloadEnv(t *testing.T, size, chunkSize uint64) *downloadEnv {
 	t.Helper()
 	if !realServerAvailable() {
-		t.Skipf("real sftp-server %s not available; skipping real-server test", sftpServerBin)
+		t.Skipf("real sftp-server %s not available; skipping real-server test", sftpServerBin())
 	}
 	base := t.TempDir()
 	remote := filepath.Join(base, "remote", "source with space.bin")
