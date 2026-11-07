@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The tests exercise the real OpenSSH sftp-server. macOS ships it at
+      # /usr/libexec/sftp-server; Debian/Ubuntu install it from the
+      # openssh-sftp-server package.
+      - name: Install test dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rsync openssh-sftp-server
+
+      - name: Format, vet, race tests
+        env:
+          GOFLAGS: -p=1
+        run: make check
+
+      - name: Cross build
+        run: make cross
