@@ -7,6 +7,7 @@ works internally see [architecture.md](architecture.md).
 
 ## Contents
 
+- [Installation](#installation)
 - [Commands](#commands)
 - [Sources and destinations](#sources-and-destinations)
 - [Interruptions and resume](#interruptions-and-resume)
@@ -20,6 +21,36 @@ works internally see [architecture.md](architecture.md).
 - [Program overrides](#program-overrides)
 - [Troubleshooting](#troubleshooting)
 - [Known limitations](#known-limitations)
+
+## Installation
+
+Homebrew, on macOS and Linux:
+
+```sh
+brew install dotfrankruan/catsync/catsync
+```
+
+The formula lives in
+[dotfrankruan/homebrew-catsync](https://github.com/dotfrankruan/homebrew-catsync);
+`dotfrankruan/catsync` is the tap name, which Homebrew maps to that repository.
+The fully-qualified install auto-taps it and needs no trust step. If you tap
+first and then install by short name, Homebrew asks you to trust the tap once:
+
+```sh
+brew tap dotfrankruan/catsync
+brew trust dotfrankruan/catsync   # trusts the whole tap
+brew install catsync
+```
+
+Prebuilt archives for linux/amd64, linux/arm64, darwin/amd64, and darwin/arm64
+are on the [releases page](https://github.com/dotfrankruan/CatSync/releases),
+each tag with a `SHA256SUMS` file. From source (Go 1.23+):
+
+```sh
+make install        # -> ~/.local/bin/catsync
+```
+
+or `go install github.com/dotfrankruan/CatSync/cmd/catsync@latest`.
 
 ## Commands
 
