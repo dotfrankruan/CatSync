@@ -16,7 +16,7 @@ daemon on the remote side.
 
 | | |
 | --- | --- |
-| Local | Linux (amd64, arm64), macOS (arm64). Builds from source anywhere Go runs; `make cross` produces the three release binaries. |
+| Local | Linux (amd64, arm64), macOS (amd64, arm64). Prebuilt archives are published on the [releases page](https://github.com/dotfrankruan/CatSync/releases); `make cross` builds all four locally. |
 | Remote | Any POSIX host with `rsync`, an SSH server with the SFTP subsystem, and GNU findutils. |
 
 ## Requirements
@@ -28,6 +28,28 @@ daemon on the remote side.
 | Not required | No remote daemon and no extra tooling beyond the two programs above. |
 
 `catsync doctor` verifies the local tools and prints their versions.
+
+## Releases
+
+Pushing a `v*` tag runs the release workflow: it re-runs the full check suite,
+builds `linux/amd64`, `linux/arm64`, `darwin/amd64`, and `darwin/arm64`
+archives with the tag baked in, and publishes them with `SHA256SUMS` and
+generated notes on the GitHub releases page.
+
+```sh
+git tag -a v0.1.0 -m "v0.1.0"
+git push origin v0.1.0
+```
+
+To install a published archive:
+
+```sh
+curl -LO https://github.com/dotfrankruan/CatSync/releases/download/v0.1.0/catsync_v0.1.0_darwin_arm64.tar.gz
+tar -xzf catsync_v0.1.0_darwin_arm64.tar.gz
+install -m 0755 catsync_v0.1.0_darwin_arm64/catsync ~/.local/bin/catsync
+```
+
+`make release VERSION=v0.1.0` builds the same archives locally.
 
 ## Quick start
 
@@ -56,7 +78,8 @@ locally:
 ```sh
 make test     # go test ./...
 make check    # gofmt, go vet, go test -race
-make cross    # dist/ binaries: linux/amd64, linux/arm64, darwin/arm64
+make cross    # dist/ binaries: linux/amd64, linux/arm64, darwin/amd64, darwin/arm64
+make release  # versioned archives + SHA256SUMS, as published on a tag
 ```
 
 ## Acknowledgements

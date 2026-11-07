@@ -8,7 +8,7 @@ GO ?= go
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 
-.PHONY: build test check cross clean install uninstall
+.PHONY: build test check cross release platforms clean install uninstall
 
 build:
 	$(GO) build -ldflags "$(LDFLAGS)" -o bin/catsync ./cmd/catsync
@@ -21,10 +21,39 @@ check:
 	$(GO) vet ./...
 	$(GO) test -race ./...
 
+# Every platform the release workflow publishes.
+PLATFORMS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
+
+platforms:
+	@echo $(PLATFORMS)
+
+# cross builds one plain binary per platform into dist/.
 cross:
-	GOOS=linux GOARCH=amd64 $(GO) build -ldflags "$(LDFLAGS)" -o dist/catsync-linux-amd64 ./cmd/catsync
-	GOOS=linux GOARCH=arm64 $(GO) build -ldflags "$(LDFLAGS)" -o dist/catsync-linux-arm64 ./cmd/catsync
-	GOOS=darwin GOARCH=arm64 $(GO) build -ldflags "$(LDFLAGS)" -o dist/catsync-darwin-arm64 ./cmd/catsync
+	@for target in $(PLATFORMS); do \
+	  os=$${target%/*}; arch=$${target#*/}; \
+	  echo "GOOS=$$os GOARCH=$$arch go build -o dist/catsync-$$os-$$arch"; \
+	  GOOS=$$os GOARCH=$$arch $(GO) build -ldflags "$(LDFLAGS)" \
+	    -o dist/catsync-$$os-$$arch ./cmd/catsync || exit 1; \
+	done
+
+# release builds the same binaries into versioned, checksummed archives that the
+# GitHub release workflow attaches to a tag. It works on macOS and Linux: the
+# checksum tool differs between them, so pick whichever exists.
+release:
+	@mkdir -p dist/release
+	@for target in $(PLATFORMS); do \
+	  os=$${target%/*}; arch=$${target#*/}; \
+	  name="catsync_$(VERSION)_$${os}_$${arch}"; \
+	  dir="dist/release/$$name"; \
+	  mkdir -p "$$dir"; \
+	  echo "building $$name"; \
+	  GOOS=$$os GOARCH=$$arch $(GO) build -ldflags "$(LDFLAGS)" -o "$$dir/catsync" ./cmd/catsync || exit 1; \
+	  cp LICENSE README.md "$$dir/" 2>/dev/null || cp LICENSE "$$dir/"; \
+	  tar -czf "dist/release/$$name.tar.gz" -C "dist/release" "$$name" || exit 1; \
+	  rm -rf "$$dir"; \
+	done
+	@cd dist/release && (command -v sha256sum >/dev/null && sha256sum *.tar.gz > SHA256SUMS || shasum -a 256 *.tar.gz > SHA256SUMS)
+	@echo "release archives:"; ls -1 dist/release
 
 clean:
 	rm -rf bin dist

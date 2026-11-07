@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: publish ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags and history for the version string
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The release is only published when the tagged tree passes the same
+      # checks as CI. Linux needs the real sftp-server for the protocol tests.
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rsync openssh-sftp-server
+
+      - name: Format, vet, race tests
+        env:
+          GOFLAGS: -p=1
+        run: make check
+
+      - name: Build release archives
+        run: make release VERSION="${{ github.ref_name }}"
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # A re-run for an existing tag replaces the assets instead of failing.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/release/*.tar.gz dist/release/SHA256SUMS --clobber
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --generate-notes \
+              dist/release/*.tar.gz dist/release/SHA256SUMS
+          fi
+
+      - name: Show the published assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release view "${{ github.ref_name }}" --json tagName,assets --jq '.tagName, (.assets[].name)'
