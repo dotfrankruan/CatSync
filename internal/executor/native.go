@@ -22,13 +22,13 @@ import (
 // nativeChunkSize is the fixed chunk size for native multistream transfers.
 const nativeChunkSize = 16 << 20 // 16 MiB
 
-// legacyMSCPMessage is the fail-closed error for a checkpoint produced by
-// the old external-mscp backend. Its binary/relative-path format is not a
-// native checkpoint; the file may have been partially transferred, so the
-// destination is never touched and the user must recover with an older
-// CatSync release or inspect the destination manually.
-const legacyMSCPMessage = "legacy external-mscp checkpoint found; this build cannot resume it — " +
-	"recover with an older catsync release or delete the checkpoint after manually verifying the destination (the final file may be partially written and is left untouched)"
+// legacyMSCPMessage is the fail-closed error for a checkpoint written by an
+// older CatSync release. Its binary/relative-path format is not a native
+// checkpoint; the file may have been partially transferred, so the destination
+// is never touched and the user must recover with an older release or inspect
+// the destination manually.
+const legacyMSCPMessage = "legacy checkpoint from an older catsync release; this build cannot resume it — " +
+	"recover with that older release or delete the checkpoint after manually verifying the destination (the final file may be partially written and is left untouched)"
 
 // nativeCheckpointName builds the deterministic local checkpoint path for
 // one relative path.
@@ -37,7 +37,7 @@ func nativeCheckpointName(ckptDir, rel string) string {
 	return filepath.Join(ckptDir, hex.EncodeToString(sum[:])+".nativeckpt")
 }
 
-// legacyCheckpointName is the name the external-mscp backend used.
+// legacyCheckpointName is the suffix older releases used.
 func legacyCheckpointName(ckptDir, rel string) string {
 	sum := sha256.Sum256([]byte(rel))
 	return filepath.Join(ckptDir, hex.EncodeToString(sum[:])+".mscpckpt")
@@ -57,8 +57,8 @@ func (e *Executor) sftpConfig() multistream.SFTPConfig {
 
 // nativeLargeStage runs the confirmed-new large-file tasks through the
 // native system-SSH/SFTP multistream backend, one transfer per file,
-// bounded by the jobs semaphore. The persisted backend value stays "mscp"
-// for compatibility; no external mscp is ever executed.
+// bounded by the jobs semaphore. The persisted backend value stays "mscp" for
+// compatibility with existing runs.
 func (e *Executor) nativeLargeStage(ctx context.Context) error {
 	if e.run.Config.Direction.Effective() == state.DirectionRemoteToLocal {
 		return e.nativeLargeDownloadStage(ctx)
@@ -312,7 +312,7 @@ const (
 	nativeNotStarted nativeStartState = iota
 	// nativeStarted: this task already has native transfer state.
 	nativeStarted
-	// nativeStartedLegacy: a legacy external-mscp checkpoint exists.
+	// nativeStartedLegacy: a legacy checkpoint from an older release exists.
 	nativeStartedLegacy
 	// nativeStateUnknown: the checkpoint state cannot be determined
 	// reliably, which must be treated as started.
@@ -333,7 +333,7 @@ func (e *Executor) classifyNativeStart(t *state.Task, ckptDir string) (nativeSta
 	if exists, err := fileExistsChecked(legacyCheckpointName(ckptDir, t.Path)); err != nil {
 		return nativeStateUnknown, fmt.Sprintf("cannot determine legacy checkpoint state: %v", err)
 	} else if exists {
-		return nativeStartedLegacy, "a legacy external-mscp checkpoint exists"
+		return nativeStartedLegacy, "a legacy checkpoint from an older release exists"
 	}
 	return nativeNotStarted, ""
 }
@@ -429,8 +429,8 @@ func (e *Executor) nativeLargeTask(ctx context.Context, t *state.Task, ckptDir s
 		return nil
 	}
 
-	// Fail closed on a legacy external-mscp checkpoint: its format is not a
-	// native checkpoint and the destination may hold a partial file.
+	// Fail closed on a legacy checkpoint from an older release: its format is
+	// not a native checkpoint and the destination may hold a partial file.
 	if strings.HasSuffix(t.Checkpoint, ".mscpckpt") || fileExists(legacyCheckpointName(ckptDir, t.Path)) {
 		return e.failTask(t, legacyMSCPMessage)
 	}

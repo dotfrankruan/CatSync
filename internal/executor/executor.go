@@ -3,7 +3,7 @@
 // the remote manifest in one batched SSH call, plans disjoint backend sets,
 // persists the run before any transfer, executes the native parallel-rsync
 // small-file stage, the native multistream large-file stage (persisted
-// backend name "mscp"), and the rsync stage sequentially (so no destination
+// compatibility backend name "mscp"), and the rsync stage sequentially (so no destination
 // path ever has concurrent writers), verifies, and only then marks tasks
 // completed.
 //
@@ -11,7 +11,7 @@
 // destination lock, revalidates source metadata, and continues pending and
 // failed tasks with the run's recorded immutable configuration: small-file
 // batches are rebuilt deterministically from pending tasks (legacy
-// fpsync-run fields are ignored and retired on completion), large files
+// legacy helper fields are ignored and retired on completion), large files
 // resume from their native multistream checkpoints, and rsync resumes
 // through its partial directory.
 //
@@ -127,7 +127,7 @@ type Config struct {
 	Verify string
 	// Jobs caps concurrent transfer processes.
 	Jobs int
-	// Streams caps mscp SSH connections per transfer process.
+	// Streams caps SSH sessions per large-file transfer.
 	Streams int
 	// LargeThreshold is the size in bytes at which a file counts as large.
 	LargeThreshold uint64
@@ -253,7 +253,7 @@ type Executor struct {
 	progress *progressui.Reporter
 
 	// run is the active run document. runMu serializes task transitions
-	// and saves so concurrent mscp workers never corrupt the document.
+	// and saves so concurrent native workers never corrupt the document.
 	run   *state.Run
 	runMu sync.Mutex
 
@@ -828,9 +828,9 @@ func (e *Executor) planPhase(ctx context.Context) (*PlanOutcome, error) {
 	m, mok, merr := e.collectManifest(ctx, e.cfg.Dest, e.cfg.IPv6)
 	switch {
 	case merr != nil && e.cfg.Backend == state.BackendMSCP:
-		// Forced mscp must never write a file whose destination state is
-		// unknown.
-		return nil, fmt.Errorf("executor: backend mscp requires destination metadata: %w", merr)
+		// A forced native large-file transfer must never write a file whose
+		// destination state is unknown.
+		return nil, fmt.Errorf("executor: --backend mscp requires destination metadata: %w", merr)
 	case merr != nil:
 		e.warnf("remote manifest unavailable; planning conservatively (all files via rsync): %v", merr)
 	default:
@@ -1408,7 +1408,7 @@ func (e *Executor) finalize(errs []string) error {
 		e.run.Status = state.StatusCompleted
 		e.run.FinishedAt = &now
 		e.run.Error = ""
-		// Retire legacy external-fpsync artifacts in the same atomic save
+		// Retire legacy helper artifacts in the same atomic save
 		// as the completion: resume never reads them, and the fields stay
 		// set on a failed or interrupted run for diagnostics.
 		e.run.FPSyncRunID = ""

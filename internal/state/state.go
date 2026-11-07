@@ -271,7 +271,7 @@ type Task struct {
 	// Attempts counts started transfer attempts.
 	Attempts int `json:"attempts"`
 	// Checkpoint is the path of the backend checkpoint file (for example an
-	// mscp -W checkpoint) used to resume this task, empty when none exists.
+	// native checkpoint) used to resume this task, empty when none exists.
 	Checkpoint string `json:"checkpoint,omitempty"`
 	// Error records the most recent failure or interruption.
 	Error string `json:"error,omitempty"`
@@ -326,13 +326,13 @@ type Run struct {
 	// Config is the immutable transfer configuration.
 	Config Config `json:"config"`
 	// FPSyncRunID, FPSyncStateDir, and FPSyncOutput are LEGACY fields
-	// written by the removed external-fpsync implementation. They remain
+	// written by a removed helper implementation. They remain
 	// so old run documents still load; new runs never write them, native
 	// resume does not read them, and a successful completion clears them.
 	FPSyncRunID string `json:"fpsync_run_id,omitempty"`
-	// FPSyncStateDir is the legacy fpsync -t directory; see FPSyncRunID.
+	// FPSyncStateDir is the legacy helper state directory; see FPSyncRunID.
 	FPSyncStateDir string `json:"fpsync_state_dir,omitempty"`
-	// FPSyncOutput is the legacy preserved fpsync stdout; see FPSyncRunID.
+	// FPSyncOutput is the legacy preserved helper output; see FPSyncRunID.
 	FPSyncOutput string `json:"fpsync_output,omitempty"`
 	// Status is the run lifecycle state.
 	Status Status `json:"status"`

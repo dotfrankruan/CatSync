@@ -276,7 +276,7 @@ func TestSyncAutoFreshDest(t *testing.T) {
 			t.Errorf("task %s = %s (%q), want completed", task.Path, task.Status, task.Error)
 		}
 	}
-	// The native stage never writes the legacy external-fpsync artifacts.
+	// The native stage never writes the legacy helper artifacts.
 	if run.FPSyncRunID != "" || run.FPSyncStateDir != "" || run.FPSyncOutput != "" {
 		t.Errorf("legacy fpsync artifacts set on a native run: %q %q %q", run.FPSyncRunID, run.FPSyncStateDir, run.FPSyncOutput)
 	}
@@ -3003,7 +3003,7 @@ func TestNativeLegacyCheckpointDeterministic(t *testing.T) {
 	if got := loaded.Tasks[0].Status; got != state.StatusFailed {
 		t.Errorf("task = %s, want failed (fail closed)", got)
 	}
-	if !strings.Contains(loaded.Tasks[0].Error, "legacy external-mscp") {
+	if !strings.Contains(loaded.Tasks[0].Error, "legacy checkpoint from an older catsync release") {
 		t.Errorf("task error = %q, want the legacy checkpoint message", loaded.Tasks[0].Error)
 	}
 	// The destination was never touched: no final, no temp.
@@ -3356,7 +3356,7 @@ func TestNativeResumeLegacyCheckpointWithoutHardlink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(loaded.Tasks[0].Error, "legacy external-mscp") {
+	if !strings.Contains(loaded.Tasks[0].Error, "legacy checkpoint from an older catsync release") {
 		t.Errorf("task error = %q, want the legacy checkpoint message", loaded.Tasks[0].Error)
 	}
 	if _, err := os.Stat(derived); err != nil {

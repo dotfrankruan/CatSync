@@ -6,8 +6,8 @@ CatSync moves large file trees — or a single file — between your machine and
 remote host over SSH, in either direction. It plans the transfer file by file,
 runs small files in parallel batches and large files over several SFTP streams,
 never overwrites a file that already exists at the destination, and can resume an
-interrupted transfer from where it stopped. It is a single Go binary: no daemon
-on the remote side, and no external `fpsync`, `fpart`, or `mscp`.
+interrupted transfer from where it stopped. It is a single Go binary with no
+daemon on the remote side.
 
 [![CI](https://github.com/dotfrankruan/CatSync/actions/workflows/ci.yml/badge.svg)](https://github.com/dotfrankruan/CatSync/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
@@ -25,7 +25,7 @@ on the remote side, and no external `fpsync`, `fpart`, or `mscp`.
 | --- | --- |
 | Local | Go 1.23+ to build. At runtime only `ssh` and `rsync`. |
 | Remote | `rsync`, `sshd` with `sftp-server`, and GNU findutils. Native uploads additionally need OpenSSH ≥ 9.0 (fsync and `hardlink@openssh.com`) and GNU coreutils; native downloads need only SFTP and GNU findutils. |
-| Not required | No remote daemon, no `fpsync`, no `fpart`, no `mscp`. |
+| Not required | No remote daemon and no extra tooling beyond the two programs above. |
 
 `catsync doctor` verifies the local tools and prints their versions.
 
@@ -58,6 +58,13 @@ make test     # go test ./...
 make check    # gofmt, go vet, go test -race
 make cross    # dist/ binaries: linux/amd64, linux/arm64, darwin/arm64
 ```
+
+## Acknowledgements
+
+Earlier CatSync releases orchestrated the external `fpsync`, `fpart`, and `mscp`
+tools. Those integrations have been replaced by native implementations and are no
+longer included, invoked, or required; no code from those projects is part of
+CatSync.
 
 ## Documentation
 

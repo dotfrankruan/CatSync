@@ -8,8 +8,8 @@
 //   - unchanged size and mtime:        skipped (no transfer)
 //   - new file below the threshold:    BackendFPSync, the native parallel
 //     rsync small-file stage (the backend name is kept for compatibility
-//     with existing runs; no external fpsync or fpart process is used)
-//   - new file at or above threshold:  native multistream (backend name "mscp")
+//     with existing runs; the stage is native)
+//   - new file at or above threshold:  native multistream (compatibility name "mscp")
 //   - existing/modified/unknown file:  rsync
 //   - symlink, special, or scan error: unsupported (explicit)
 //
@@ -21,9 +21,10 @@
 // Size and mtime equality is only a planning hint, never proof of content
 // equality; a mismatch routes the file to rsync, the correctness fallback.
 //
-// Forced backends must preserve the safety policy or fail: a forced mscp
+// Forced backends must preserve the safety policy or fail: a forced native
 // rejects files that exist at the destination or whose destination state is
-// unknown (mscp writes only files confirmed absent), and a forced fpsync
+// unknown (the native large-file backend writes only files confirmed absent),
+// and a forced native small-file run
 // (the native parallel-rsync small-file backend) rejects files at or above
 // the large threshold. Rejections abort planning with an error naming the
 // offending paths. Duplicate source paths are likewise fatal.
@@ -87,7 +88,7 @@ func (c *Config) validate() error {
 		return errors.New("planner: rsync is required but not available")
 	}
 	// The native small-file and large-file stages need only rsync and ssh;
-	// "mscp" is a compatibility name for the native multistream backend and
+	// "mscp" is a compatibility value for the native multistream backend and
 	// requires no external tool.
 	return nil
 }
@@ -217,27 +218,27 @@ func planFile(d *Decision, e discovery.Entry, dest map[string]discovery.RemoteEn
 			*rejected = append(*rejected, e.Path)
 			d.Status = StatusUnsupported
 			d.Backend = state.BackendRsync
-			d.Reason = "forced fpsync (native parallel rsync) refuses files at or above the large threshold"
+			d.Reason = "forced native parallel-rsync refuses files at or above the large threshold"
 			return
 		}
 		d.Status = StatusPending
 		d.Backend = state.BackendFPSync
-		d.Reason = "forced fpsync (native parallel rsync)"
+		d.Reason = "forced native parallel-rsync"
 	case state.BackendMSCP:
 		if !isNew {
 			*rejected = append(*rejected, e.Path)
 			d.Status = StatusUnsupported
 			d.Backend = state.BackendRsync
 			if dest == nil {
-				d.Reason = "forced mscp refuses files whose destination state is unknown"
+				d.Reason = "forced native multistream refuses files whose destination state is unknown"
 			} else {
-				d.Reason = "forced mscp refuses files that already exist at the destination"
+				d.Reason = "forced native multistream refuses files that already exist at the destination"
 			}
 			return
 		}
 		d.Status = StatusPending
 		d.Backend = state.BackendMSCP
-		d.Reason = "forced mscp: file confirmed absent at the destination"
+		d.Reason = "forced native multistream: file confirmed absent at the destination"
 	default: // auto
 		planAuto(d, e, dest, isNew, large, cfg)
 	}
@@ -254,7 +255,7 @@ func planAuto(d *Decision, e discovery.Entry, dest map[string]discovery.RemoteEn
 		d.Reason = "new file below threshold: native parallel rsync"
 	case isNew && large:
 		d.Backend = state.BackendMSCP
-		d.Reason = `new file at or above threshold: native multistream ("mscp")`
+		d.Reason = "new file at or above threshold: native multistream"
 	default:
 		d.Backend = state.BackendRsync
 		if dest == nil {

@@ -111,8 +111,8 @@ func authFailure(cause error, stderr string) error {
 // pending BackendFPSync tasks are packed into deterministic disjoint
 // batches, and up to Config.Jobs rsync processes run concurrently, each
 // transferring one batch via --files-from over NUL-delimited stdin. No
-// external fpsync or fpart process is used; "fpsync" is kept only as the
-// persisted backend name for compatibility with existing runs.
+// no helper process is used; "fpsync" is kept only as the persisted backend
+// name for compatibility with existing runs.
 func (e *Executor) smallFileStage(ctx context.Context) error {
 	idxs := e.pendingTasks(state.BackendFPSync)
 	if len(idxs) == 0 {
@@ -454,7 +454,7 @@ func quoteAll(paths []string, max int) []string {
 }
 
 // completeTask records a completed task after its post-checks passed, then
-// retires any mscp checkpoint. Ordering is crash-safe:
+// retires any native checkpoint. Ordering is crash-safe:
 //
 //  1. The completed status is persisted while the checkpoint reference is
 //     still present, so a crash cannot lose track of the checkpoint before
@@ -914,7 +914,7 @@ func targetRemoteJoin(base, rel string) string {
 // sshOpts renders the backend SSH options for a run. The configured ssh
 // program override (CATSYNC_SSH) reaches rsync's -e transport as well as
 // the manifest/mkdir invocations, so diagnostics and tests control the
-// whole ssh path CatSync itself starts; mscp's libssh uses its own
+// whole ssh path CatSync itself starts
 // resolution and is not affected.
 func (e *Executor) sshOpts(ipv6 bool) backend.SSH {
 	return backend.SSH{IPv6: ipv6, Port: e.run.Config.Port, Program: e.progs.sshProgram()}

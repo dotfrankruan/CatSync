@@ -3,15 +3,14 @@
 CatSync is a local orchestration CLI for local-to-remote and remote-to-local
 transfers. It discovers the source tree, obtains endpoint metadata in batches,
 assigns every path exactly one backend in an
-immutable plan, and drives external `rsync` and `ssh` processes plus its own
-native large-file backend. The small-file stage is native: CatSync partitions
-small files in pure Go and runs concurrent rsync batches itself; no external
-fpsync/fpart is used. The large-file stage is native multistream: sequential
-system-ssh SFTP sessions copy disjoint byte ranges into a receiving-side
-same-directory temp object with per-chunk atomic checkpoints and a no-clobber hardlink
-publish; no external mscp is used. The remote host needs only SSH/SFTP,
-rsync, and GNU findutils (plus GNU coreutils for native upload metadata); it
-does not run a CatSync daemon.
+immutable plan, and drives `rsync` and `ssh` processes plus its own native
+backends. The small-file stage partitions small files in pure Go and runs
+concurrent rsync batches itself. The large-file stage is native multistream:
+sequential system-ssh SFTP sessions copy disjoint byte ranges into a
+receiving-side same-directory temp object with per-chunk atomic checkpoints and
+a no-clobber hardlink publish. The remote host needs only SSH/SFTP, rsync, and
+GNU findutils (plus GNU coreutils for native upload metadata); it does not run a
+CatSync daemon.
 
 ## Safety model
 
@@ -76,20 +75,17 @@ temporary-file plus rename and a destination lock prevents overlapping runs.
 If remote manifest collection fails, auto mode routes all regular files to
 rsync. Forced backends fail when they cannot preserve the safety policy.
 
-## External-tool findings
+## Transfer stages
 
-### Native small-file batching (replacing external fpsync/fpart)
+### Native small-file batching
 
-Earlier revisions drove external `fpsync`/`fpart`; the current build packs
-small files itself (`internal/partition`, pure Go, stable next-fit, no
-filesystem or subprocess access) and runs the resulting disjoint batches as
-concurrent rsync invocations. The change removed a real boundary hazard:
-fpart's skip-big option skips only files *strictly larger* than its limit,
-which let a threshold-sized file be copied by both fpsync and its planned
-owner; the planner now owns the boundary exactly (`size >= threshold` is
-large) with no tool-side skip list. Batches are deterministic, so resume
-rebuilds equivalent batches from pending tasks without any fpsync run ID or
-state directory. rsync's per-file partial files live next to the
+CatSync packs the small files itself (`internal/partition`, pure Go, stable
+next-fit, no filesystem or subprocess access) and runs the resulting disjoint
+batches as concurrent rsync invocations. The planner owns the large/small
+boundary exactly (`size >= threshold` is large), so no tool-side skip list can
+disagree with the plan and let two owners copy one file. Batches are
+deterministic, so resume rebuilds equivalent batches from pending tasks without
+any run-scoped helper state. rsync's per-file partial files live next to the
 destination file, so partial progress survives re-batching.
 
 ### Native multistream large-file backend
@@ -113,8 +109,9 @@ mtime, chunk size) and the existing temp (regular file, exact size, checked
 again through the open handle), skips completed chunks, and copies only the
 pending ranges. The crash window between a successful hardlink and the
 recorded completion is recovered by proving final and temp are the same inode
-via a controlled remote `test -ef`. Legacy external-mscp checkpoints (binary,
-relative-path format) are detected and fail closed.
+via a controlled remote `test -ef`. Legacy checkpoints written by older
+releases (binary, relative-path format, `.mscpckpt`) are detected and fail
+closed.
 
 Native uploads require an OpenSSH ≥ 9.0 sftp-server (fsync, hardlink) and GNU
 coreutils on the remote. Upload auto mode probes the capability before any remote

@@ -17,8 +17,8 @@ import (
 // validates it.
 type Options struct {
 	// Backend selects the transfer backend: auto, fpsync, mscp, or rsync.
-	// "fpsync" is a compatibility name for the native parallel-rsync
-	// small-file backend; no external fpsync/fpart is used.
+	// "fpsync" and "mscp" are compatibility values for the native
+	// parallel-rsync and native multistream backends.
 	Backend string
 	// DryRun plans and reports without transferring data.
 	DryRun bool
@@ -84,7 +84,7 @@ func defaultStateDir() string {
 // defaultOptions for help text to render correct defaults.
 func (o *Options) bindSharedFlags(fs *flag.FlagSet) {
 	fs.StringVar(&o.Backend, "backend", o.Backend,
-		"transfer backend: auto, fpsync (native parallel-rsync; does not invoke fpsync/fpart), mscp (native multistream over system ssh; does not invoke external mscp), or rsync")
+		"transfer backend: auto, fpsync (native parallel-rsync), mscp (native multistream over system ssh), or rsync")
 	fs.BoolVar(&o.DryRun, "dry-run", o.DryRun, "plan and report without transferring data")
 	fs.BoolVar(&o.Fresh, "fresh", o.Fresh, "start a new run instead of resuming an interrupted run for the same source and destination")
 	fs.BoolVar(&o.Verbose, "verbose", o.Verbose, "increase output detail")

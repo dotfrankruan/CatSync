@@ -102,8 +102,8 @@ func progressTerminal(mode string, quiet bool, w io.Writer) bool {
 // programsFromEnv reads the CATSYNC_<TOOL> program overrides for the
 // programs CatSync itself starts (ssh and rsync). They exist for
 // diagnostics and tests; values are paths or program names and are never
-// printed. There is no mscp override: the large-file backend is the native
-// multistream implementation over system ssh.
+// printed. There is no override for the large-file backend: it is native
+// multistream over the system ssh.
 func programsFromEnv() executor.Programs {
 	return executor.Programs{
 		SSH:   os.Getenv("CATSYNC_SSH"),
@@ -156,7 +156,7 @@ func printPlan(w io.Writer, out *executor.PlanOutcome, opts *Options) {
 	fmt.Fprintf(w, "to transfer: %d file(s), %d logical source bytes (not a network-traffic estimate)\n",
 		counts[planner.StatusPending], out.LogicalBytes)
 	fmt.Fprintf(w, "  native small-file (parallel rsync): %d\n", byBackend[state.BackendFPSync])
-	fmt.Fprintf(w, "  mscp (large new, native multistream): %d\n", byBackend[state.BackendMSCP])
+	fmt.Fprintf(w, "  native multistream (large new files): %d\n", byBackend[state.BackendMSCP])
 	fmt.Fprintf(w, "  rsync (conservative): %d\n", byBackend[state.BackendRsync])
 	fmt.Fprintf(w, "skipped (unchanged): %d\n", counts[planner.StatusSkipped])
 	fmt.Fprintf(w, "unsupported (symlink/special/scan error): %d\n", counts[planner.StatusUnsupported])
@@ -331,12 +331,12 @@ func printRunStatus(w io.Writer, run *state.Run, verbose bool) {
 	if n := counts[state.StatusUnsupported]; n > 0 {
 		fmt.Fprintf(w, "  unsupported: %d (NOT transferred: symlinks, special files, or scan errors)\n", n)
 	}
-	fmt.Fprintf(w, "  backends:    native-small %d, native-large (mscp) %d, rsync %d\n",
+	fmt.Fprintf(w, "  backends:    native-small %d, native-large %d, rsync %d\n",
 		byBackend[state.BackendFPSync], byBackend[state.BackendMSCP], byBackend[state.BackendRsync])
 	if run.FPSyncRunID != "" {
-		// Legacy runs recorded an external-fpsync run id; the native
-		// backend ignores it, but keep it visible for diagnostics.
-		fmt.Fprintf(w, "  legacy fpsync run id: %s (state dir %s)\n", run.FPSyncRunID, run.FPSyncStateDir)
+		// Old runs recorded helper run fields; they are kept visible for
+		// diagnostics, but nothing reads them.
+		fmt.Fprintf(w, "  legacy run metadata: %s (state dir %s)\n", run.FPSyncRunID, run.FPSyncStateDir)
 	}
 	if checkpoints > 0 {
 		fmt.Fprintf(w, "  checkpoints: %d retained (resume artifacts)\n", checkpoints)

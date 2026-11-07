@@ -11,5 +11,4 @@ license; the full license texts live in [licenses/](licenses/).
 | golang.org/x/sys | v0.35.0 | BSD-3-Clause ([text](licenses/golang-x-sys.txt)) | syscall support of the above |
 | github.com/kr/fs | v0.1.0 | BSD-3-Clause ([text](licenses/kr-fs.txt)) | pkg/sftp's filesystem helpers |
 
-Nothing else is linked: no fpsync, fpart, or mscp binaries are needed,
-bundled, or executed.
+Nothing else is linked or executed.

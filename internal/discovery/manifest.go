@@ -397,9 +397,9 @@ func SourceManifestCommandProgPort(prog string, source target.Destination, ipv6 
 }
 
 // MkdirCommandProg builds a single ssh invocation that creates the given
-// absolute remote directories (and parents) with mkdir -p. mscp does not
-// create missing remote parent directories, so the executor issues one
-// batched mkdir for all parents of a stage's files. The result is an
+// absolute remote directories (and parents) with mkdir -p. The transfer
+// backend does not create missing remote parent directories, so the executor
+// issues one batched mkdir for all parents of a stage's files. The result is an
 // argument array for direct execution; every directory is single-quote
 // escaped for the remote shell. An empty directory list is an error: no
 // command means no invocation.

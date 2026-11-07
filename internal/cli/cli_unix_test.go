@@ -178,16 +178,16 @@ func TestCLISyncEndToEnd(t *testing.T) {
 		t.Errorf("sync stdout missing the run summary:\n%s", stdout)
 	}
 	if len(h.invocations("fpsync")) != 0 || len(h.invocations("fpart")) != 0 {
-		t.Errorf("external fpsync/fpart invoked: fpsync=%d fpart=%d, want 0",
+		t.Errorf("compatibility helper programs invoked: fpsync=%d fpart=%d, want 0",
 			len(h.invocations("fpsync")), len(h.invocations("fpart")))
 	}
 	if len(h.invocations("rsync")) != 1 {
 		t.Errorf("invocations: rsync=%d, want 1", len(h.invocations("rsync")))
 	}
-	// No external mscp; the large file went through the native backend and
+	// No helper program; the large file went through the native backend and
 	// really landed at the destination.
 	if got := len(h.invocations("mscp")); got != 0 {
-		t.Errorf("external mscp invoked %d times, want 0", got)
+		t.Errorf("helper mscp program invoked %d times, want 0", got)
 	}
 	got, err := os.ReadFile(filepath.Join(h.remoteDir, "big.bin"))
 	if err != nil {
@@ -205,7 +205,7 @@ func TestCLISyncEndToEnd(t *testing.T) {
 	if code != ExitOK {
 		t.Fatalf("status exit = %d, stderr:\n%s", code, stderr)
 	}
-	for _, want := range []string{"completed", "native-small 1, native-large (mscp) 1, rsync 0", "user@host:" + h.remoteDir} {
+	for _, want := range []string{"completed", "native-small 1, native-large 1, rsync 0", "user@host:" + h.remoteDir} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("status output missing %q:\n%s", want, stdout)
 		}
@@ -293,7 +293,7 @@ func TestCLIPlanPrintsSummary(t *testing.T) {
 	}
 	for _, want := range []string{
 		"destination metadata: authoritative",
-		"mscp (large new, native multistream): 1",
+		"native multistream (large new files): 1",
 		"logical source bytes",
 		"no data was transferred",
 	} {
@@ -373,9 +373,9 @@ func TestCLIIPv6CommandShapes(t *testing.T) {
 		t.Fatalf("sync exit = %d, stderr:\n%s", code, stderr)
 	}
 	// Every ssh invocation — manifest, SFTP sessions, metadata commands —
-	// carries the standalone -6 flag; no external mscp runs.
+	// carries the standalone -6 flag; no helper mscp program runs.
 	if got := len(h.invocations("mscp")); got != 0 {
-		t.Errorf("external mscp invoked %d times, want 0", got)
+		t.Errorf("helper mscp program invoked %d times, want 0", got)
 	}
 	ssh := h.invocations("ssh")
 	if len(ssh) == 0 {
@@ -905,7 +905,7 @@ func TestCLIPlanSingleFileRemoteSource(t *testing.T) {
 	if !strings.Contains(stdout, "source: single file "+name) {
 		t.Errorf("plan output should name the single file:\n%s", stdout)
 	}
-	if !strings.Contains(stdout, "mscp (large new, native multistream): 1") {
+	if !strings.Contains(stdout, "native multistream (large new files): 1") {
 		t.Errorf("plan should route the large single file to native multistream:\n%s", stdout)
 	}
 	if _, err := os.Stat(filepath.Join(local, name)); !errors.Is(err, os.ErrNotExist) {

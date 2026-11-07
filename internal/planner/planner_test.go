@@ -97,7 +97,7 @@ func TestAutoNewSmallFile(t *testing.T) {
 }
 
 func TestAutoNewLargeFile(t *testing.T) {
-	// The native multistream large-file backend needs no external mscp:
+	// The native multistream large-file backend needs no helper program:
 	// new large files route to it (persisted backend name "mscp") whether
 	// or not the external tool exists.
 	tests := []struct {
@@ -305,7 +305,7 @@ func TestMissingTools(t *testing.T) {
 	// mscp executable, only rsync (required above) and ssh (probed by the
 	// executor).
 	if _, err := Plan(entries, dest, Config{Backend: state.BackendMSCP, Threshold: 1024, Tools: rsyncOnly()}); err != nil {
-		t.Errorf("forced mscp (native) without external mscp failed: %v", err)
+		t.Errorf("forced mscp (native) without a helper program failed: %v", err)
 	}
 }
 
