@@ -30,6 +30,7 @@ func (o *Options) executorConfig(transfer target.Transfer, stdout, stderr io.Wri
 		Dest:             transfer.Remote,
 		Backend:          state.Backend(o.Backend),
 		DryRun:           o.DryRun,
+		Fresh:            o.Fresh,
 		IPv6:             o.IPv6,
 		Port:             o.Port,
 		Verify:           o.Verify,
@@ -135,6 +136,9 @@ func printPlan(w io.Writer, out *executor.PlanOutcome, opts *Options) {
 		if d.Status == planner.StatusUnsupported {
 			unsupported = append(unsupported, d.Path)
 		}
+	}
+	if out.ResumeRunID != "" {
+		fmt.Fprintf(w, "note: interrupted run %s matches this source and destination; copy/sync will resume it instead of transferring again (use --fresh to start over)\n", out.ResumeRunID)
 	}
 	fmt.Fprintf(w, "plan: %d source entry(ies)\n", len(out.Result.Decisions))
 	if out.SourceFile != "" {

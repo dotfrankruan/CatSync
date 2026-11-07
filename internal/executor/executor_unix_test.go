@@ -4327,3 +4327,148 @@ func TestResumeProgressStartsAtDurableBytes(t *testing.T) {
 		t.Errorf("resume should announce the durable fast-forward:\n%s", stdout.String())
 	}
 }
+
+// TestSyncAutoResumesSameJob: running copy again for the same source and
+// destination continues the interrupted run instead of planning and
+// transferring its work again.
+func TestSyncAutoResumesSameJob(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 2048)
+	// The destination stays empty, so the first run fails and stays resumable.
+	h.writeScript("ssh", "match=if [ -d\nexit=42\n")
+	authErr := h.writeManifest("auth", "ssh: connect to host h port 22: Connection refused\n")
+	h.writeScript("rsync", "nth=1\nstderr_file="+authErr+"\nexit=255\n---\nexit=0\n")
+	cfg := h.config()
+	cfg.Backend = state.BackendRsync
+	cfg.Verify = state.VerifyNone
+	first, ferr := Sync(context.Background(), cfg)
+	if ferr == nil {
+		t.Fatal("first Sync = nil error, want the rsync failure")
+	}
+	if first.Status != state.StatusFailed || !first.Resumable() {
+		t.Fatalf("first run = %s resumable=%v, want failed and resumable", first.Status, first.Resumable())
+	}
+
+	// Same source and destination, no --fresh: the same run continues.
+	second, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("second Sync: %v", err)
+	}
+	if second.ID != first.ID {
+		t.Errorf("second run ID = %s, want the resumed %s", second.ID, first.ID)
+	}
+	if second.Status != state.StatusCompleted {
+		t.Errorf("resumed run = %s (%q), want completed", second.Status, second.Error)
+	}
+	if got := len(toolInvocations(h.invocations(), "rsync")); got != 2 {
+		t.Errorf("rsync invocations = %d, want 2 (failed + resumed), not a fresh plan", got)
+	}
+}
+
+// TestSyncFreshStartsANewRun: --fresh ignores the interrupted run.
+func TestSyncFreshStartsANewRun(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 2048)
+	h.writeScript("ssh", "match=if [ -d\nexit=42\n")
+	authErr := h.writeManifest("auth", "ssh: connect to host h port 22: Connection refused\n")
+	h.writeScript("rsync", "nth=1\nstderr_file="+authErr+"\nexit=255\n---\nexit=0\n")
+	cfg := h.config()
+	cfg.Backend = state.BackendRsync
+	cfg.Verify = state.VerifyNone
+	first, ferr := Sync(context.Background(), cfg)
+	if ferr == nil {
+		t.Fatal("first Sync = nil error, want the rsync failure")
+	}
+	cfg.Fresh = true
+	second, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("fresh Sync: %v", err)
+	}
+	if second.ID == first.ID {
+		t.Errorf("--fresh reused run %s", first.ID)
+	}
+}
+
+// TestSyncDifferentDestinationDoesNotResume: a different destination is a
+// different job and gets its own run.
+func TestSyncDifferentDestinationDoesNotResume(t *testing.T) {
+	h := newHarness(t)
+	h.writeSrc("small.txt", 2048)
+	h.writeScript("ssh", "match=if [ -d\nexit=42\n")
+	authErr := h.writeManifest("auth", "ssh: connect to host h port 22: Connection refused\n")
+	h.writeScript("rsync", "nth=1\nstderr_file="+authErr+"\nexit=255\n---\nexit=0\n")
+	cfg := h.config()
+	cfg.Backend = state.BackendRsync
+	cfg.Verify = state.VerifyNone
+	first, ferr := Sync(context.Background(), cfg)
+	if ferr == nil {
+		t.Fatal("first Sync = nil error, want the rsync failure")
+	}
+	cfg.Dest.Path = "/other"
+	second, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("second Sync: %v", err)
+	}
+	if second.ID == first.ID {
+		t.Errorf("a different destination resumed run %s", first.ID)
+	}
+}
+
+// TestSyncAutoResumeDownload: the download form matches the same way, with the
+// remote file operand normalized to its recorded root plus name.
+func TestSyncAutoResumeDownload(t *testing.T) {
+	if !mockexec.SFTPServerAvailable() {
+		t.Skip("real sftp-server is unavailable")
+	}
+	h := newHarness(t)
+	const name = "resume-download.bin"
+	remote := filepath.Join(h.remoteDir, name)
+	want := bytes.Repeat([]byte("d"), 8192)
+	if err := os.WriteFile(remote, want, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := h.writeManifest("remote-source", "F\x00"+sourceManifestRecord(name, fi.Size(), fi.ModTime()))
+	h.writeScript("ssh", "match=if [ -d\nstdout_file="+manifest+"\n")
+	h.writeScript("rsync", "exit=0")
+
+	cfg := h.configNative()
+	cfg.Direction = target.RemoteToLocal
+	cfg.SourceDir = h.src
+	cfg.Dest = target.Destination{User: "u", Host: "h", Path: remote}
+	cfg.Backend = state.BackendMSCP
+	cfg.Verify = state.VerifyNone
+	cfg.Streams = 1
+	// The first transfer session fails, leaving a resumable run.
+	cfg.Env = h.nativeEnv("MOCKEXEC_SFTP_FAILNTH=1")
+	first, ferr := Sync(context.Background(), cfg)
+	if ferr == nil {
+		t.Fatal("first Sync = nil error, want the failed session")
+	}
+	if !first.Resumable() {
+		t.Fatalf("first run = %s, want resumable", first.Status)
+	}
+
+	// Same job, working ssh: the same run continues and completes.
+	cfg.Env = h.nativeEnv()
+	second, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("second Sync: %v", err)
+	}
+	if second.ID != first.ID {
+		t.Errorf("second run ID = %s, want the resumed %s", second.ID, first.ID)
+	}
+	if second.Status != state.StatusCompleted {
+		t.Errorf("resumed run = %s (%q), want completed", second.Status, second.Error)
+	}
+	got, err := os.ReadFile(filepath.Join(h.src, name))
+	if err != nil {
+		t.Fatalf("downloaded file missing: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Error("downloaded content mismatch")
+	}
+}

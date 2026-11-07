@@ -158,6 +158,26 @@ interrupted with Ctrl-C stays resumable. Exactly one operand must be remote:
 `LOCAL [user@]host:/path` uploads and `[user@]host:/path LOCAL` downloads;
 remote-to-remote and local-to-local forms are rejected.
 
+### Automatic resume
+
+`copy` and `sync` check for an interrupted run of the same job — same
+direction, same source, same destination, same command — before planning. If
+one exists it is resumed automatically, because planning again would redo work
+that run already did: its checkpoints, temporary objects, and completed tasks
+are reused. The output names the resumed run, and `plan` shows the same match
+before you commit to it:
+
+```sh
+catsync copy user@host:/data/dataset ./data      # interrupted
+catsync copy user@host:/data/dataset ./data      # continues the same run
+catsync copy --fresh user@host:/data/dataset ./data   # starts over instead
+```
+
+`--fresh` forces a new run (for example after changing the source tree or to
+discard a broken checkpoint). A run that completed, or one whose endpoints
+differ at all, is never adopted: the transfer is planned fresh and unchanged
+files are skipped as usual.
+
 ### `catsync resume [RUN_ID]`
 
 Resumes the named run, or the latest resumable run without an argument.

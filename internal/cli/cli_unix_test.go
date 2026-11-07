@@ -1081,3 +1081,58 @@ func TestCLIAuthFailureRetryFlag(t *testing.T) {
 		t.Errorf("status after auth failure = %d %q", code, stdout)
 	}
 }
+
+// TestCLICopyAutoResumesSameJob: copying the same source and destination again
+// continues the interrupted run instead of starting over, and --fresh forces a
+// new run.
+func TestCLICopyAutoResumesSameJob(t *testing.T) {
+	h := newCLIHarness(t)
+	h.writeSrc("small.txt", 2048)
+	h.writeScript("ssh", "match=if [ -d\nexit=42\n")
+	failErr := h.writeManifest("fail", "ssh: connect to host host port 22: Connection refused\n")
+	h.writeScript("rsync", "nth=1\nstderr_file="+failErr+"\nexit=255\n---\nexit=0\n")
+	args := []string{"copy", "--backend", "rsync", "--verify", "none", "--state-dir", h.stateDir,
+		h.src, "user@host:" + h.remoteDir}
+
+	if code, _, _ := run(t, args...); code != ExitError {
+		t.Fatalf("first copy exit = %d, want failure", code)
+	}
+	store, err := state.NewStore(h.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Latest()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Same job: the run is resumed, not re-planned.
+	code, stdout, stderr := run(t, args...)
+	if code != ExitOK {
+		t.Fatalf("second copy exit = %d, stderr:\n%s", code, stderr)
+	}
+	if !strings.Contains(stdout, "resuming interrupted run "+first.ID) {
+		t.Errorf("output should announce the resume:\n%s", stdout)
+	}
+	second, err := store.Latest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID != first.ID {
+		t.Errorf("second run = %s, want the resumed %s", second.ID, first.ID)
+	}
+
+	// --fresh starts a new run (with a working rsync this time).
+	h.writeScript("rsync", "exit=0")
+	code, _, serr := run(t, append([]string{args[0], "--fresh"}, args[1:]...)...)
+	if code != ExitOK {
+		t.Fatalf("--fresh copy exit = %d, stderr:\n%s", code, serr)
+	}
+	fresh, err := store.Latest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.ID == second.ID {
+		t.Errorf("--fresh reused run %s", second.ID)
+	}
+}

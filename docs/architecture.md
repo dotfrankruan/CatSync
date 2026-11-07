@@ -284,3 +284,14 @@ large-file task also retires its leftover checkpoint and temporary object, since
 the published file is already live. Files whose metadata differs are never
 claimed: they keep their normal stage, and the no-clobber publish still refuses
 to overwrite them.
+
+### Automatic resume of the same job
+
+Before planning, `copy` and `sync` look for a resumable run that describes the
+same job: equal direction, equal source endpoint (a single file keeps its name),
+equal destination endpoint, and equal command (copy versus mirror sync). When one
+exists it is resumed through the normal resume path, so its checkpoints,
+temporary objects, and completed tasks are reused instead of being re-planned and
+re-transferred; `--fresh` bypasses the lookup. The match is intentionally strict
+about endpoints, so a different destination, source, or command always produces a
+fresh run, and a completed run is never adopted.

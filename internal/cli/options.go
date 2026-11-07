@@ -22,6 +22,9 @@ type Options struct {
 	Backend string
 	// DryRun plans and reports without transferring data.
 	DryRun bool
+	// Fresh forces a new run instead of auto-resuming an interrupted run for
+	// the same source and destination.
+	Fresh bool
 	// Verbose increases output detail.
 	Verbose bool
 	// Quiet suppresses non-error output.
@@ -83,6 +86,7 @@ func (o *Options) bindSharedFlags(fs *flag.FlagSet) {
 	fs.StringVar(&o.Backend, "backend", o.Backend,
 		"transfer backend: auto, fpsync (native parallel-rsync; does not invoke fpsync/fpart), mscp (native multistream over system ssh; does not invoke external mscp), or rsync")
 	fs.BoolVar(&o.DryRun, "dry-run", o.DryRun, "plan and report without transferring data")
+	fs.BoolVar(&o.Fresh, "fresh", o.Fresh, "start a new run instead of resuming an interrupted run for the same source and destination")
 	fs.BoolVar(&o.Verbose, "verbose", o.Verbose, "increase output detail")
 	fs.BoolVar(&o.Quiet, "quiet", o.Quiet, "suppress non-error output")
 	fs.StringVar(&o.Progress, "progress", o.Progress, "progress display: auto, always, or never")

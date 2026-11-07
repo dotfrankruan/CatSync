@@ -112,6 +112,10 @@ type Config struct {
 	Backend state.Backend
 	// DryRun plans and persists the run without transferring data.
 	DryRun bool
+	// Fresh forces a brand-new run even when an interrupted run for the same
+	// source, destination, direction, and command exists. By default such a
+	// run is resumed, because re-planning would redo work it already did.
+	Fresh bool
 	// Mirror performs a final whole-tree archive reconciliation with delayed
 	// deletion. False is copy-only and never deletes destination entries.
 	Mirror bool
@@ -644,6 +648,9 @@ type PlanOutcome struct {
 	SourceRoot string
 	// SourceFile is the single-file source base name, empty for tree runs.
 	SourceFile string
+	// ResumeRunID names an interrupted run for the same job that a copy or
+	// sync would resume instead of planning fresh.
+	ResumeRunID string
 	// Result is the planner assignment.
 	Result *planner.Result
 	// ManifestKnown reports whether the destination metadata is
@@ -671,7 +678,18 @@ func Plan(ctx context.Context, cfg Config) (*PlanOutcome, error) {
 	if err != nil {
 		return nil, err
 	}
-	return e.planPhase(ctx)
+	out, err := e.planPhase(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Tell the operator when copy/sync would continue an interrupted run
+	// instead of using this plan.
+	if !cfg.Fresh {
+		if id, found, merr := e.findResumableMatch(); merr == nil && found {
+			out.ResumeRunID = id
+		}
+	}
+	return out, nil
 }
 
 // warnConnectionPeak reports, without failing, when the planned parallel work
@@ -918,6 +936,17 @@ func syncWith(ctx context.Context, cfg Config, prepare func(*Executor)) (*state.
 	if prepare != nil {
 		prepare(e)
 	}
+	// Same source, destination, direction, and command means the same job: if
+	// an interrupted run for it exists, continue that run instead of planning
+	// and transferring its work again.
+	if !cfg.Fresh && !cfg.DryRun {
+		if id, found, err := e.findResumableMatch(); err != nil {
+			return nil, err
+		} else if found {
+			e.logf("resuming interrupted run %s for this source and destination (use --fresh to start over)", id)
+			return resumeWith(ctx, cfg, id, nil)
+		}
+	}
 	lockDest := state.Destination{User: cfg.Dest.User, Host: cfg.Dest.Host, Path: cfg.Dest.Path}
 	if cfg.direction() == target.RemoteToLocal {
 		lockDest = state.Destination{Path: cfg.SourceDir}
@@ -1078,6 +1107,80 @@ func resumeWith(ctx context.Context, cfg Config, id string, prepare func(*Execut
 	e.startProgress()
 	err = e.execute(ctx)
 	return run, err
+}
+
+// requestedSource renders the source endpoint this invocation asks for, in the
+// same canonical form a recorded run uses (a single file keeps its name).
+func (e *Executor) requestedSource() (string, bool) {
+	if e.cfg.direction() == target.RemoteToLocal {
+		if e.cfg.Dest.Host == "" || e.cfg.Dest.Path == "" {
+			return "", false
+		}
+		d := target.Destination{User: e.cfg.Dest.User, Host: e.cfg.Dest.Host, Path: e.cfg.Dest.Path}
+		return d.String(), true
+	}
+	for _, field := range []string{e.cfg.SourceDir, e.cfg.SourceFile} {
+		if strings.ContainsRune(field, 0) {
+			return "", false
+		}
+	}
+	src := filepath.Clean(e.cfg.SourceDir)
+	if e.cfg.SourceFile != "" {
+		src = filepath.Join(src, e.cfg.SourceFile)
+	}
+	return src, true
+}
+
+// requestedDestination renders the destination endpoint of this invocation.
+func (e *Executor) requestedDestination() string {
+	if e.cfg.direction() == target.RemoteToLocal {
+		return filepath.Clean(e.cfg.SourceDir)
+	}
+	d := target.Destination{User: e.cfg.Dest.User, Host: e.cfg.Dest.Host, Path: e.cfg.Dest.Path}
+	return d.String()
+}
+
+// findResumableMatch reports the most recently updated interrupted run that
+// describes the same job: same direction, same source, same destination, and
+// the same command (copy versus mirror sync). Reusing it keeps its checkpoint,
+// temporary object, and completed tasks.
+func (e *Executor) findResumableMatch() (string, bool, error) {
+	wantSource, ok := e.requestedSource()
+	if !ok {
+		return "", false, nil
+	}
+	wantDest := e.requestedDestination()
+	wantMirror := e.cfg.Mirror
+	runs, err := e.store.List()
+	if err != nil {
+		if errors.Is(err, state.ErrNoRuns) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	var best *state.Run
+	for _, r := range runs {
+		loaded, _, lerr := e.store.LoadAndRecover(r.ID)
+		if lerr != nil {
+			continue
+		}
+		if !loaded.Resumable() || loaded.Config.Mirror != wantMirror {
+			continue
+		}
+		if target.Direction(loaded.Config.Direction.Effective()) != e.cfg.direction() {
+			continue
+		}
+		if loaded.Source.String() != wantSource || loaded.Destination.String() != wantDest {
+			continue
+		}
+		if best == nil || loaded.UpdatedAt.After(best.UpdatedAt) {
+			best = loaded
+		}
+	}
+	if best == nil {
+		return "", false, nil
+	}
+	return best.ID, true, nil
 }
 
 // latestResumable returns the most recently updated run that still has
