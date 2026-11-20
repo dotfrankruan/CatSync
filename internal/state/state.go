@@ -164,6 +164,15 @@ type Config struct {
 	Streams int `json:"streams"`
 	// LargeThreshold is the size in bytes at which a file counts as large.
 	LargeThreshold uint64 `json:"large_threshold"`
+	// Transport selects the remote data path: "" (historical SSH), "ssh", or
+	// "daemon". Daemon fields are additive and empty on old runs.
+	Transport       string `json:"transport,omitempty"`
+	DaemonPort      int    `json:"daemon_port,omitempty"`
+	DaemonTransport string `json:"daemon_transport,omitempty"`
+	DaemonBootstrap string `json:"daemon_bootstrap,omitempty"`
+	RemoteCatsyncd  string `json:"remote_catsyncd,omitempty"`
+	DaemonListen    string `json:"daemon_listen,omitempty"`
+	DaemonAddr      string `json:"daemon_addr,omitempty"`
 }
 
 // validate checks the configuration invariants.

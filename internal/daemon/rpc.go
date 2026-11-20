@@ -190,9 +190,11 @@ func (s *server) handleMetadata(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocol.NewError(protocol.CodeInvalidArgument, "metadata target %q is not a regular file", req.Path))
 		return
 	}
-	if err := os.Chmod(req.Path, os.FileMode(req.Mode&0o7777)); err != nil {
-		writeError(w, osError("chmod metadata target", err))
-		return
+	if req.Mode != nil {
+		if err := os.Chmod(req.Path, os.FileMode(*req.Mode&0o7777)); err != nil {
+			writeError(w, osError("chmod metadata target", err))
+			return
+		}
 	}
 	t := unixNanoTime(req.MtimeNS)
 	if err := os.Chtimes(req.Path, t, t); err != nil {

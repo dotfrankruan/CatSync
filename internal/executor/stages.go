@@ -118,8 +118,8 @@ func (e *Executor) smallFileStage(ctx context.Context) error {
 	if len(idxs) == 0 {
 		return nil
 	}
-	if err := e.requireSSH(); err != nil {
-		if ferr := e.failBatch(e.tasksAt(idxs), fmt.Sprintf("ssh is not available: %v", err)); ferr != nil {
+	if err := e.remote.RequireStage(ctx); err != nil {
+		if ferr := e.failBatch(e.tasksAt(idxs), fmt.Sprintf("remote transport is not available: %v", err)); ferr != nil {
 			return ferr
 		}
 		return err
@@ -175,7 +175,7 @@ func (e *Executor) smallFileStage(ctx context.Context) error {
 				dirs = append(dirs, d)
 			}
 			sort.Strings(dirs)
-			if err := e.mkdirRemoteParents(ctx, e.destTarget(), e.run.Config.IPv6, dirs); err != nil {
+			if err := e.remote.MkdirParents(ctx, dirs); err != nil {
 				if ferr := e.failBatch(e.tasksAt(idxs), fmt.Sprintf("create remote parent directories: %v", err)); ferr != nil {
 					return ferr
 				}
@@ -696,7 +696,7 @@ func (e *Executor) remoteSourceOperand() target.Destination {
 // only tasks whose regular-file size and nanosecond mtime still match the
 // immutable plan.
 func (e *Executor) recheckRemoteSource(ctx context.Context, tasks []*state.Task, phase string) ([]*state.Task, error) {
-	_, _, entries, err := e.collectRemoteSource(ctx, e.remoteSourceOperand(), e.run.Config.IPv6)
+	_, _, entries, err := e.remote.SourceManifest(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("remote source revalidation %s: %w", phase, err)
 	}
@@ -782,7 +782,7 @@ func (e *Executor) verifyStage(ctx context.Context) error {
 	if e.run.Config.Direction.Effective() == state.DirectionRemoteToLocal {
 		manifest, err = collectLocalManifest(e.run.Destination.Path)
 	} else {
-		manifest, known, err = e.collectManifest(ctx, e.destTarget(), e.run.Config.IPv6)
+		manifest, known, err = e.remote.DestManifest(ctx)
 	}
 	if err != nil || !known {
 		if err == nil {
@@ -831,7 +831,8 @@ func (e *Executor) verifyStage(ctx context.Context) error {
 		return nil
 	}
 
-	tool, toolErr := e.detectRemoteHashTool(ctx)
+	capability, toolErr := e.remote.HashCapability(ctx)
+	tool := capability.Tool
 	if toolErr != nil {
 		for _, t := range sizeOK {
 			if ferr := e.failTask(t, fmt.Sprintf("SHA-256 capability detection failed: %v", toolErr)); ferr != nil {
@@ -866,7 +867,7 @@ func (e *Executor) verifyStage(ctx context.Context) error {
 	}
 
 	e.logf("verify: SHA-256 content check of %d file(s) using remote %s", len(sizeOK), tool)
-	remote, err := e.remoteHashes(ctx, tool, sizeOK)
+	remote, err := e.remote.Hashes(ctx, tool, sizeOK)
 	if err != nil {
 		for _, t := range sizeOK {
 			if ferr := e.failTask(t, fmt.Sprintf("SHA-256 verification failed: %v", err)); ferr != nil {

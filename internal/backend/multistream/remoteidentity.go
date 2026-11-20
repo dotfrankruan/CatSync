@@ -17,6 +17,9 @@ func remoteFileIdentity(ctx context.Context, cfg SFTPConfig, remotePath string) 
 	if err := (RemoteSourceSpec{Path: remotePath}).validate(); err != nil {
 		return 0, time.Time{}, err
 	}
+	if cfg.RemoteIdentity != nil {
+		return cfg.RemoteIdentity(ctx, remotePath)
+	}
 	q := discovery.ShellQuote(remotePath)
 	script := "if [ -f " + q + " ] && [ ! -L " + q + " ]; then find " + q + " -maxdepth 0 -printf 'file\\0%s\\0%T@\\0'; else exit 44; fi"
 	argv, err := sshCommandArgv(cfg, []string{script})

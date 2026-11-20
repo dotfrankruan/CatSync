@@ -73,9 +73,9 @@ func (s *testSession) Wait(ctx context.Context) error {
 	return err
 }
 
-type staticTransport struct{ sess controlSession }
+type staticTransport struct{ sess ControlSession }
 
-func (t staticTransport) Start(ctx context.Context) (controlSession, error) { return t.sess, nil }
+func (t staticTransport) Start(ctx context.Context) (ControlSession, error) { return t.sess, nil }
 
 type testServer struct {
 	t      *testing.T

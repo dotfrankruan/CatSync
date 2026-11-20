@@ -69,6 +69,9 @@ func sshCommandArgv(cfg SFTPConfig, remoteCmd []string) ([]string, error) {
 // The decimal is built from floor-seconds plus a non-negative nanosecond
 // fraction, which is correct for pre-epoch times too.
 func setRemoteMtime(ctx context.Context, cfg SFTPConfig, p string, mtime time.Time) error {
+	if cfg.SetMtime != nil {
+		return cfg.SetMtime(ctx, p, mtime)
+	}
 	// A signed decimal epoch timestamp: "-0.5" is half a second before the
 	// epoch (time.Unix(-1, 500000000)), never "-1.5".
 	dec := epochtime.Format(mtime)
@@ -82,6 +85,9 @@ func setRemoteMtime(ctx context.Context, cfg SFTPConfig, p string, mtime time.Ti
 // remoteSameFile runs `test a -ef b` over a controlled ssh command and
 // reports whether a and b are the same filesystem object (same inode).
 func remoteSameFile(ctx context.Context, cfg SFTPConfig, a, b string) (bool, error) {
+	if cfg.SameFile != nil {
+		return cfg.SameFile(ctx, a, b)
+	}
 	argv, err := sshCommandArgv(cfg, []string{"test", discovery.ShellQuote(a), "-ef", discovery.ShellQuote(b)})
 	if err != nil {
 		return false, err

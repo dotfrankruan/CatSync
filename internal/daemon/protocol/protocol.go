@@ -261,12 +261,13 @@ type MkdirResponse struct {
 	Created int `json:"created"`
 }
 
-// MetadataRequest is POST /v1/metadata: mode bits and exact nanosecond
-// mtime for a regular file.
+// MetadataRequest is POST /v1/metadata: exact nanosecond mtime for a
+// regular file, optionally with permission bits. A nil Mode changes only the
+// mtime (the publish path already applied permissions through SFTP).
 type MetadataRequest struct {
-	Path    string `json:"path"`
-	Mode    uint32 `json:"mode"`
-	MtimeNS int64  `json:"mtime_ns"`
+	Path    string  `json:"path"`
+	Mode    *uint32 `json:"mode,omitempty"`
+	MtimeNS int64   `json:"mtime_ns"`
 }
 
 // MetadataResponse reports success.

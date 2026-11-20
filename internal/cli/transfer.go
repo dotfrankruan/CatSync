@@ -45,6 +45,14 @@ func (o *Options) executorConfig(transfer target.Transfer, stdout, stderr io.Wri
 		ProgressTerminal: progressTerminal(o.Progress, o.Quiet, stderr),
 		AuthRetry:        authRetry(o.OnAuthFailure),
 		Prompt:           authPrompt(o, stderr),
+		Transport:        o.Transport,
+		DaemonPort:       o.DaemonPort,
+		DaemonTransport:  o.DaemonTransport,
+		DaemonBootstrap:  o.DaemonBootstrap,
+		RemoteCatsyncd:   o.RemoteCatsyncd,
+		DaemonListen:     o.DaemonListen,
+		DaemonAddr:       o.DaemonAddr,
+		DaemonExplicit:   o.Explicit,
 	}
 }
 
@@ -206,6 +214,14 @@ func runResume(ctx context.Context, opts *Options, id string, stdout, stderr io.
 		ProgressTerminal: progressTerminal(opts.Progress, opts.Quiet, stderr),
 		AuthRetry:        authRetry(opts.OnAuthFailure),
 		Prompt:           authPrompt(opts, stderr),
+		Transport:        opts.Transport,
+		DaemonPort:       opts.DaemonPort,
+		DaemonTransport:  opts.DaemonTransport,
+		DaemonBootstrap:  opts.DaemonBootstrap,
+		RemoteCatsyncd:   opts.RemoteCatsyncd,
+		DaemonListen:     opts.DaemonListen,
+		DaemonAddr:       opts.DaemonAddr,
+		DaemonExplicit:   opts.Explicit,
 	}
 	run, err := executor.Resume(ctx, cfg, id)
 	if err != nil {
@@ -313,6 +329,10 @@ func printRunStatus(w io.Writer, run *state.Run, verbose bool) {
 		mode,
 		run.Config.Direction.Effective(), run.Config.Backend, run.Config.Verify, run.Config.Jobs, run.Config.Streams,
 		run.Config.LargeThreshold, run.Config.IPv6, run.Config.Port, run.Config.DryRun)
+	if t := run.Config.Transport; t != "" && t != "ssh" {
+		fmt.Fprintf(w, "  transport:   %s (port=%d, bootstrap=%s, catsyncd=%s)\n",
+			t, run.Config.DaemonPort, run.Config.DaemonBootstrap, run.Config.RemoteCatsyncd)
+	}
 	if run.Config.Mirror {
 		fmt.Fprintf(w, "  mirror:      reconciled=%v (destination-only deletion uses rsync --delete-delay)\n", run.MirrorReconciled)
 	}

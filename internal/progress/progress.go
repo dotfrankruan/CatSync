@@ -41,11 +41,12 @@ type Snapshot struct {
 	Elapsed    time.Duration
 	Phase      string
 	Terminal   bool
-	Conns      int // currently open SSH connections
-	FilesDone  int // transfers completed
-	Checked    int // files verified
-	Skipped    int // files skipped because the destination already matched
-	FilesTotal int // files in the run
+	Conns      int    // currently open data connections
+	ConnLabel  string // label for the connection counter
+	FilesDone  int    // transfers completed
+	Checked    int    // files verified
+	Skipped    int    // files skipped because the destination already matched
+	FilesTotal int    // files in the run
 	Files      []FileState
 	ETA        time.Duration
 	HasETA     bool
@@ -77,6 +78,7 @@ type Reporter struct {
 	terminal   bool
 	lastDraw   time.Time
 	conns      int
+	connLabel  string
 	filesDone  int
 	totalFiles int
 	checked    int
@@ -107,7 +109,7 @@ func NewWithBaseline(w io.Writer, total, baseline uint64, terminal bool) *Report
 	now := time.Now()
 	r := &Reporter{
 		w: w, total: total, done: baseline, start: now, lastSample: now, lastBytes: baseline,
-		phase: "starting", terminal: terminal,
+		phase: "starting", terminal: terminal, connLabel: "ssh conns",
 		files: make(map[string]*fileProgress),
 		stop:  make(chan struct{}), stopped: make(chan struct{}),
 	}
@@ -162,6 +164,17 @@ func (r *Reporter) Add(n uint64) {
 }
 
 // Connections reports the current number of open SSH connections.
+// SetConnLabel changes the counter label (for example "conns" for the daemon
+// transport, where no ssh data sessions exist).
+func (r *Reporter) SetConnLabel(label string) {
+	if r == nil || label == "" {
+		return
+	}
+	r.mu.Lock()
+	r.connLabel = label
+	r.mu.Unlock()
+}
+
 func (r *Reporter) Connections(n int) {
 	if r == nil {
 		return
@@ -408,7 +421,7 @@ func (r *Reporter) snapshotLocked(now time.Time) Snapshot {
 	snap := Snapshot{
 		Done: r.done, Total: r.total, Speed: r.speed,
 		Elapsed: now.Sub(r.start), Phase: r.phase, Terminal: r.terminal,
-		Conns: r.conns, FilesDone: r.filesDone,
+		Conns: r.conns, ConnLabel: r.connLabel, FilesDone: r.filesDone,
 		Checked: r.checked, Skipped: r.skipped, FilesTotal: r.totalFiles,
 	}
 	if r.speed > 0 && r.done < r.total {
@@ -500,8 +513,12 @@ func formatSnapshot(s Snapshot) []string {
 	header := fmt.Sprintf("[%s] %6.2f%%  %s/%s  Current Speed %s/s  Elapsed %s  ETA %s  ETD %s  %s",
 		bar, fraction*100, bytes(s.Done), bytes(s.Total), bytes(uint64(s.Speed)),
 		duration(s.Elapsed), etaText, etdText, s.Phase)
-	counters := fmt.Sprintf("ssh conns %d  |  files %d/%d done, %d checked, %d skipped",
-		s.Conns, s.FilesDone, s.FilesTotal, s.Checked, s.Skipped)
+	label := s.ConnLabel
+	if label == "" {
+		label = "ssh conns"
+	}
+	counters := fmt.Sprintf("%s %d  |  files %d/%d done, %d checked, %d skipped",
+		label, s.Conns, s.FilesDone, s.FilesTotal, s.Checked, s.Skipped)
 	lines := []string{header, counters}
 	shown := s.Files
 	if len(shown) > maxFileLines {

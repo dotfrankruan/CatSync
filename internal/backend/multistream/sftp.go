@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/pkg/sftp"
 
@@ -41,10 +42,22 @@ type SFTPConfig struct {
 	// Stderr receives ssh's stderr (kept strictly separate from the SFTP
 	// protocol stream on stdout); nil discards it.
 	Stderr io.Writer
-	// OnSession, when set, is called with +1 when an ssh session process
-	// starts and -1 after it has been reaped, so a progress display can
-	// report live connection counts.
+	// OnSession, when set, is called with +1 when a session starts and -1
+	// after it has been torn down, so a progress display can report live
+	// connection counts.
 	OnSession func(delta int)
+	// Dial opens one data connection for a non-SSH transport (the daemon
+	// transport). When set, startSession uses it instead of an ssh process;
+	// cleanup releases transport resources exactly once.
+	Dial func(ctx context.Context) (io.ReadWriteCloser, func(), error)
+	// SetMtime replaces the remote `touch` used to set an exact nanosecond
+	// mtime. Nil keeps the SSH implementation.
+	SetMtime func(ctx context.Context, remotePath string, t time.Time) error
+	// SameFile replaces the remote `test a -ef b` inode comparison.
+	SameFile func(ctx context.Context, a, b string) (bool, error)
+	// RemoteIdentity replaces the remote find-based exact source identity
+	// query used to bind a download to the planned size and mtime.
+	RemoteIdentity func(ctx context.Context, remotePath string) (size uint64, mtime time.Time, err error)
 }
 
 // Command builds the ssh argv: ssh [-6] -T -s [user@]host sftp. The remote
@@ -136,6 +149,7 @@ func (t *stderrTee) text() string {
 type sftpSession struct {
 	client    *sftp.Client
 	handle    *process.Handle
+	cleanup   func() // releases non-SSH transport resources, at most once
 	closeRx   func() // closes the client's read end, exactly once
 	onSession func(int)
 }
@@ -146,9 +160,21 @@ type sftpSession struct {
 // and Wait reaps ssh. A lingering ssh is bounded by the caller's context
 // through the process-group teardown.
 func (s *sftpSession) close() error {
-	s.closeRx()
-	clientErr := s.client.Close()
-	waitErr := s.handle.Wait()
+	var clientErr, waitErr error
+	if s.handle == nil {
+		// One duplex data connection: closing the client first closes its
+		// writer and unblocks the receive loop; closing the read end before
+		// that would make Close report a spurious use-of-closed-connection.
+		clientErr = s.client.Close()
+		s.closeRx()
+	} else {
+		s.closeRx()
+		clientErr = s.client.Close()
+		waitErr = s.handle.Wait()
+	}
+	if s.cleanup != nil {
+		s.cleanup()
+	}
 	if s.onSession != nil {
 		s.onSession(-1)
 	}
@@ -158,11 +184,74 @@ func (s *sftpSession) close() error {
 	return waitErr
 }
 
+// startDialSession opens one non-SSH data connection and completes the SFTP
+// handshake over it. Cancellation closes the connection so a blocked
+// handshake unblocks; the session close releases the transport resources.
+func (c SFTPConfig) startDialSession(ctx context.Context) (*sftpSession, error) {
+	conn, cleanup, err := c.Dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var (
+		cleanupOnce sync.Once
+		rxOnce      sync.Once
+	)
+	release := func() {
+		cleanupOnce.Do(func() {
+			if cleanup != nil {
+				cleanup()
+			}
+		})
+	}
+	closeRx := func() {
+		rxOnce.Do(func() {
+			release()
+			_ = conn.Close()
+		})
+	}
+	if c.OnSession != nil {
+		c.OnSession(1)
+	}
+	type hsResult struct {
+		client *sftp.Client
+		err    error
+	}
+	hsCh := make(chan hsResult, 1)
+	go func() {
+		client, herr := sftp.NewClientPipe(conn, conn)
+		hsCh <- hsResult{client, herr}
+	}()
+	var (
+		client *sftp.Client
+		hsErr  error
+	)
+	select {
+	case res := <-hsCh:
+		client, hsErr = res.client, res.err
+	case <-ctx.Done():
+		closeRx()
+		<-hsCh
+		hsErr = ctx.Err()
+	}
+	if hsErr != nil {
+		release()
+		_ = conn.Close()
+		if c.OnSession != nil {
+			c.OnSession(-1)
+		}
+		return nil, fmt.Errorf("multistream: sftp data handshake: %w", hsErr)
+	}
+	return &sftpSession{client: client, cleanup: release, closeRx: closeRx, onSession: c.OnSession}, nil
+}
+
 // startSession starts one ssh process and completes the SFTP handshake. On
 // any failure the process is torn down and no pipe leaks. The handshake
 // runs in a goroutine so cancellation and early process death can
 // interrupt it.
 func (c SFTPConfig) startSession(ctx context.Context, argv []string) (*sftpSession, error) {
+	if c.Dial != nil {
+		return c.startDialSession(ctx)
+	}
 	clientTx_r, clientTx_w, err := os.Pipe()
 	if err != nil {
 		return nil, fmt.Errorf("multistream: sftp transport pipe: %w", err)

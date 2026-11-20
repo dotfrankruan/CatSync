@@ -23,8 +23,8 @@ import (
 	"github.com/dotfrankruan/CatSync/internal/process"
 )
 
-// controlSession is the duplex bootstrap channel plus its process lifecycle.
-type controlSession interface {
+// ControlSession is the duplex bootstrap channel plus its process lifecycle.
+type ControlSession interface {
 	io.ReadWriteCloser
 	// Wait waits for the transport process to exit; ctx bounds the wait.
 	Wait(ctx context.Context) error
@@ -33,7 +33,7 @@ type controlSession interface {
 // ControlTransport starts the bootstrap channel. The SSH implementation is
 // the production path; tests provide an in-memory duplex transport.
 type ControlTransport interface {
-	Start(ctx context.Context) (controlSession, error)
+	Start(ctx context.Context) (ControlSession, error)
 }
 
 // SSHTransport starts catsyncd over one ssh process. It is the only way the
@@ -51,7 +51,7 @@ type SSHTransport struct {
 }
 
 // Start implements ControlTransport.
-func (t SSHTransport) Start(ctx context.Context) (controlSession, error) {
+func (t SSHTransport) Start(ctx context.Context) (ControlSession, error) {
 	if t.Host == "" {
 		return nil, protocol.NewError(protocol.CodeInvalidArgument, "bootstrap host is empty")
 	}
@@ -195,7 +195,7 @@ type BootstrapConfig struct {
 type Client struct {
 	hello  serverHelloMsg
 	ready  readyMsg
-	sess   controlSession
+	sess   ControlSession
 	reader *controlReader
 	writer *controlWriter
 
@@ -499,7 +499,7 @@ func (c *Client) sendGoodbye() {
 }
 
 // wrapBootstrapError classifies a missing remote executable.
-func wrapBootstrapError(err error, sess controlSession) error {
+func wrapBootstrapError(err error, sess ControlSession) error {
 	var pe *protocol.Error
 	if errors.As(err, &pe) && pe.Code != protocol.CodeControlChannelLost && pe.Code != protocol.CodeBootstrapProtocolError {
 		return err
@@ -721,6 +721,12 @@ func (c *Client) Mkdir(ctx context.Context, dirs []string) (int, error) {
 
 // Metadata applies mode bits and an exact nanosecond mtime.
 func (c *Client) Metadata(ctx context.Context, path string, mode uint32, mtimeNS int64) error {
+	return c.MetadataMtime(ctx, path, &mode, mtimeNS)
+}
+
+// MetadataMtime applies an exact nanosecond mtime; nil mode leaves the
+// permissions untouched.
+func (c *Client) MetadataMtime(ctx context.Context, path string, mode *uint32, mtimeNS int64) error {
 	var out protocol.MetadataResponse
 	if err := c.post(ctx, "/v1/metadata", protocol.MetadataRequest{Path: path, Mode: mode, MtimeNS: mtimeNS}, &out); err != nil {
 		return err

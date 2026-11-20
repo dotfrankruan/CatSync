@@ -405,3 +405,36 @@ func TestInvalidSSHOverrideIsUsageError(t *testing.T) {
 		t.Errorf("stderr should explain the whitespace restriction:\n%s", stderr)
 	}
 }
+
+func TestDaemonTransportFlagValidation(t *testing.T) {
+	src := tempSource(t)
+	cases := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--transport", "bogus"}, "--transport"},
+		{[]string{"--daemon-transport", "quic"}, "not implemented yet"},
+		{[]string{"--daemon-bootstrap", "ssh-forward"}, "not implemented yet"},
+		{[]string{"--daemon-port", "70000"}, "--daemon-port"},
+	}
+	for _, tc := range cases {
+		args := append([]string{"plan"}, tc.args...)
+		args = append(args, src, "host:/data")
+		code, _, stderr := run(t, args...)
+		if code != ExitUsage {
+			t.Errorf("args %v: exit = %d, want %d", tc.args, code, ExitUsage)
+		}
+		if !strings.Contains(stderr, tc.want) {
+			t.Errorf("args %v: stderr lacks %q:\n%s", tc.args, tc.want, stderr)
+		}
+	}
+	// A valid daemon configuration must parse (the missing ssh tool is a
+	// runtime error only for bogus transport values, so use a fake ssh that
+	// fails fast while still proving the flag set is accepted).
+	t.Setenv("CATSYNC_SSH", filepath.Join(t.TempDir(), "no-ssh"))
+	code, _, stderr := run(t, "plan", "--transport", "daemon", "--daemon-port", "0",
+		"--remote-catsyncd", "/opt/catsyncd", "--state-dir", t.TempDir(), src, "host:/data")
+	if code == ExitUsage {
+		t.Errorf("valid daemon flags rejected: %s", stderr)
+	}
+}

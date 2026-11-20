@@ -44,19 +44,6 @@ func legacyCheckpointName(ckptDir, rel string) string {
 }
 
 // sftpConfig builds the SFTP session configuration for this run.
-func (e *Executor) sftpConfig() multistream.SFTPConfig {
-	return multistream.SFTPConfig{
-		Program: e.progs.sshProgram(),
-		Dest:    e.destTarget(),
-		IPv6:    e.run.Config.IPv6,
-		Port:    e.run.Config.Port,
-		Env:     e.cfg.Env,
-		Stderr:  e.stderr,
-		OnSession: func(delta int) {
-			e.progressConnDelta(delta)
-		},
-	}
-}
 
 // nativeLargeStage runs the confirmed-new large-file tasks through the
 // native system-SSH/SFTP multistream backend, one transfer per file,
@@ -70,9 +57,9 @@ func (e *Executor) nativeLargeStage(ctx context.Context) error {
 	if len(idxs) == 0 {
 		return nil
 	}
-	if err := e.requireSSH(); err != nil {
+	if err := e.remote.RequireStage(ctx); err != nil {
 		for _, i := range idxs {
-			if ferr := e.failTask(&e.run.Tasks[i], fmt.Sprintf("ssh is not available: %v", err)); ferr != nil {
+			if ferr := e.failTask(&e.run.Tasks[i], fmt.Sprintf("remote transport is not available: %v", err)); ferr != nil {
 				return ferr
 			}
 		}
@@ -94,7 +81,7 @@ func (e *Executor) nativeLargeStage(ctx context.Context) error {
 			dirs = append(dirs, d)
 		}
 		sort.Strings(dirs)
-		if err := e.mkdirRemoteParents(ctx, e.destTarget(), e.run.Config.IPv6, dirs); err != nil {
+		if err := e.remote.MkdirParents(ctx, dirs); err != nil {
 			for _, i := range idxs {
 				if ferr := e.failTask(&e.run.Tasks[i], fmt.Sprintf("create remote parent directories: %v", err)); ferr != nil {
 					return ferr
@@ -247,7 +234,7 @@ func (e *Executor) nativeLargeDownloadTask(ctx context.Context, t *state.Task, c
 	completed := 0
 	defer func() { e.progressFileDone(label, completed) }()
 	opts := multistream.TransferOptions{
-		SFTP:           e.sftpConfig(),
+		SFTP:           e.remote.SFTPConfig(),
 		Streams:        e.run.Config.Streams,
 		Workers:        e.run.Config.Streams,
 		ChunkSize:      nativeChunkSize,
@@ -298,7 +285,7 @@ func (e *Executor) nativeLargeDownloadTask(ctx context.Context, t *state.Task, c
 // supports the hardlink@openssh.com extension required for no-clobber
 // publish.
 func (e *Executor) probeHardlink(ctx context.Context) (bool, error) {
-	cfg := e.sftpConfig()
+	cfg := e.remote.SFTPConfig()
 	ok := false
 	err := cfg.WithClient(ctx, func(c *sftp.Client) error {
 		_, ok = c.HasExtension("hardlink@openssh.com")
@@ -460,7 +447,7 @@ func (e *Executor) nativeLargeTask(ctx context.Context, t *state.Task, ckptDir s
 	completed := 0
 	defer func() { e.progressFileDone(label, completed) }()
 	opts := multistream.TransferOptions{
-		SFTP:           e.sftpConfig(),
+		SFTP:           e.remote.SFTPConfig(),
 		Streams:        e.run.Config.Streams,
 		Workers:        e.run.Config.Streams,
 		ChunkSize:      nativeChunkSize,
@@ -534,7 +521,13 @@ func (e *Executor) removeRemoteTemp(ctx context.Context, tempPath string) {
 	if tempPath == "" {
 		return
 	}
-	cfg := e.sftpConfig()
+	if e.remote == nil {
+		if _, err := e.ensureRemote(ctx); err != nil {
+			e.warnf("native-large: remove remote temp %s: %v (the published file is unaffected; clean up manually or rerun)", tempPath, err)
+			return
+		}
+	}
+	cfg := e.remote.SFTPConfig()
 	err := cfg.WithClient(ctx, func(c *sftp.Client) error {
 		return c.Remove(tempPath)
 	})

@@ -184,6 +184,7 @@ func runTransferCommand(name string, args []string, stdout, stderr io.Writer) in
 	if !ok {
 		return code
 	}
+	opts.recordExplicit(fs)
 	if err := opts.Validate(); err != nil {
 		fmt.Fprintf(stderr, "catsync: %s: %v\n", name, err)
 		return ExitUsage
@@ -228,18 +229,23 @@ func runStateCommand(name string, args []string, stdout, stderr io.Writer) int {
 		// the recorded value.
 		fs.IntVar(&opts.Jobs, "jobs", 0, "override the recorded parallel transfer jobs (0 keeps it)")
 		fs.IntVar(&opts.Streams, "streams", 0, "override the recorded parallel streams per job (0 keeps it)")
+		opts.bindDaemonFlags(fs)
 	}
 	operands, code, ok := splitArgs(fs, args)
 	if !ok {
 		return code
 	}
+	opts.recordExplicit(fs)
 	if err := opts.validateOutput(); err != nil {
 		fmt.Fprintf(stderr, "catsync: %s: %v\n", name, err)
 		return ExitUsage
 	}
 	if name == "resume" {
-		explicit := map[string]bool{}
-		fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+		if err := opts.validateDaemonFlags(); err != nil {
+			fmt.Fprintf(stderr, "catsync: resume: %v\n", err)
+			return ExitUsage
+		}
+		explicit := opts.Explicit
 		if explicit["jobs"] && opts.Jobs < 1 {
 			fmt.Fprintf(stderr, "catsync: resume: --jobs must be at least 1, got %d\n", opts.Jobs)
 			return ExitUsage

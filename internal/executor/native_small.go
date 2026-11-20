@@ -28,9 +28,9 @@ func (e *Executor) nativeSmallStage(ctx context.Context) error {
 	if len(idxs) == 0 {
 		return nil
 	}
-	if err := e.requireSSH(); err != nil {
+	if err := e.remote.RequireStage(ctx); err != nil {
 		for _, i := range idxs {
-			if ferr := e.failTask(&e.run.Tasks[i], fmt.Sprintf("ssh is not available: %v", err)); ferr != nil {
+			if ferr := e.failTask(&e.run.Tasks[i], fmt.Sprintf("remote transport is not available: %v", err)); ferr != nil {
 				return ferr
 			}
 		}
@@ -58,7 +58,7 @@ func (e *Executor) nativeSmallStage(ctx context.Context) error {
 				dirs = append(dirs, d)
 			}
 			sort.Strings(dirs)
-			if err := e.mkdirRemoteParents(ctx, e.destTarget(), e.run.Config.IPv6, dirs); err != nil {
+			if err := e.remote.MkdirParents(ctx, dirs); err != nil {
 				for _, i := range idxs {
 					if ferr := e.failTask(&e.run.Tasks[i], fmt.Sprintf("create remote parent directories: %v", err)); ferr != nil {
 						return ferr
@@ -169,7 +169,7 @@ func (e *Executor) nativeSmallTask(ctx context.Context, t *state.Task, ckptDir s
 	completed := 0
 	defer func() { e.progressFileDone(label, completed) }()
 	opts := multistream.TransferOptions{
-		SFTP:           e.sftpConfig(),
+		SFTP:           e.remote.SFTPConfig(),
 		Streams:        1, // one file: extra sessions only add overhead
 		Workers:        1,
 		ChunkSize:      nativeChunkSize,

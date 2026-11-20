@@ -38,6 +38,7 @@ import (
 	"github.com/dotfrankruan/CatSync/internal/backend"
 	"github.com/dotfrankruan/CatSync/internal/backend/multistream"
 	"github.com/dotfrankruan/CatSync/internal/bytesize"
+	"github.com/dotfrankruan/CatSync/internal/daemon"
 	"github.com/dotfrankruan/CatSync/internal/discovery"
 	"github.com/dotfrankruan/CatSync/internal/planner"
 	"github.com/dotfrankruan/CatSync/internal/process"
@@ -131,6 +132,27 @@ type Config struct {
 	Streams int
 	// LargeThreshold is the size in bytes at which a file counts as large.
 	LargeThreshold uint64
+	// Transport selects the remote transport: "" or "ssh" keeps the
+	// historical SSH data path; "daemon" uses one bootstrap session plus the
+	// catsyncd mTLS data path.
+	Transport string
+	// DaemonPort is the daemon TCP port; 0 asks the server for an ephemeral
+	// port (the actual port comes from ready).
+	DaemonPort int
+	// DaemonTransport is "tcp" (default) or the experimental "quic".
+	DaemonTransport string
+	// DaemonBootstrap is "direct" (default) or "ssh-forward".
+	DaemonBootstrap string
+	// RemoteCatsyncd is the remote executable name or path.
+	RemoteCatsyncd string
+	// DaemonListen is the remote --listen value; empty derives from the
+	// transport mode and port.
+	DaemonListen string
+	// DaemonAddr overrides the data connection address as host:port.
+	DaemonAddr string
+	// DaemonExplicit records which daemon flags the user set on a resume, so
+	// only those dimensions override the recorded run configuration.
+	DaemonExplicit map[string]bool
 	// AuthRetry enables the interactive re-authentication loop: a stage that
 	// fails because ssh authentication was rejected (for example an expired
 	// certificate) asks the operator to renew the credentials and then retries
@@ -184,6 +206,9 @@ func (c *Config) validateFull() error {
 	}
 	if c.Port < 0 || c.Port > 65535 {
 		return fmt.Errorf("%w: SSH port %d is outside 1..65535", ErrInvalidConfig, c.Port)
+	}
+	if err := c.validateTransportConfig(); err != nil {
+		return err
 	}
 	if strings.TrimSpace(c.StateDir) == "" {
 		return fmt.Errorf("%w: state directory is empty", ErrInvalidConfig)
@@ -267,6 +292,11 @@ type Executor struct {
 	// completed, so a verification downgrade cannot be lost among transfer
 	// progress lines.
 	finalWarnings []string
+
+	// remote is the transport implementation (SSH or daemon) for this
+	// executor; daemonClient owns the one-shot bootstrap session.
+	remote       remoteOps
+	daemonClient *daemon.Client
 }
 
 func newExecutor(cfg Config) (*Executor, error) {
@@ -339,6 +369,9 @@ func (e *Executor) startProgress() {
 		}
 	}
 	e.progress = progressui.NewWithBaseline(e.stderr, total, baseline, e.cfg.ProgressTerminal)
+	if e.effectiveTransport() == "daemon" {
+		e.progress.SetConnLabel("conns")
+	}
 	// Seed the file counters from the run's recorded state so a resume shows
 	// the whole job, not just this process's work.
 	var completed, skipped int
@@ -748,6 +781,7 @@ func Plan(ctx context.Context, cfg Config) (*PlanOutcome, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer e.closeRemote(context.Background())
 	out, err := e.planPhase(ctx)
 	if err != nil {
 		return nil, err
@@ -840,13 +874,13 @@ func (e *Executor) warnRunConnectionPeak(run *state.Run) {
 
 // planPhase performs discovery, manifest collection, and planning.
 func (e *Executor) planPhase(ctx context.Context) (*PlanOutcome, error) {
-	if err := e.requireSSH(); err != nil {
+	if _, err := e.ensureRemote(ctx); err != nil {
 		return nil, err
 	}
 	tools := e.detectTools()
 	var entries []discovery.Entry
 	if e.cfg.direction() == target.RemoteToLocal {
-		root, file, entries, err := e.collectRemoteSource(ctx, e.cfg.Dest, e.cfg.IPv6)
+		root, file, entries, err := e.remote.SourceManifest(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -868,6 +902,9 @@ func (e *Executor) planPhase(ctx context.Context) (*PlanOutcome, error) {
 			}
 		}
 		e.warnConnectionPeak(e.plannedPeak(out))
+		if err := e.precheckDaemon(out); err != nil {
+			return nil, err
+		}
 		return out, nil
 	}
 	srcAbs, err := filepath.Abs(e.cfg.SourceDir)
@@ -895,7 +932,7 @@ func (e *Executor) planPhase(ctx context.Context) (*PlanOutcome, error) {
 	}
 	var dest map[string]discovery.RemoteEntry
 	known := false
-	m, mok, merr := e.collectManifest(ctx, e.cfg.Dest, e.cfg.IPv6)
+	m, mok, merr := e.remote.DestManifest(ctx)
 	switch {
 	case merr != nil && e.cfg.Backend == state.BackendMSCP:
 		// A forced native large-file transfer must never write a file whose
@@ -921,6 +958,9 @@ func (e *Executor) planPhase(ctx context.Context) (*PlanOutcome, error) {
 		}
 	}
 	e.warnConnectionPeak(e.plannedPeak(out))
+	if err := e.precheckDaemon(out); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -935,20 +975,40 @@ func (e *Executor) buildRun(out *PlanOutcome) (*state.Run, error) {
 		return nil, fmt.Errorf("executor: resolve source path: %w", err)
 	}
 	direction := e.cfg.direction()
+	// SSH runs never carry daemon fields; daemon runs record the exact
+	// configured values (including an explicit port zero = ephemeral).
+	transport := e.effectiveTransport()
+	daemonPort, daemonTransport, daemonBootstrap, remoteCatsyncd := 0, "", "", ""
+	daemonListen, daemonAddr := "", ""
+	if transport == "daemon" {
+		daemonPort = e.daemonPort()
+		daemonTransport = e.daemonTransport()
+		daemonBootstrap = e.daemonBootstrap()
+		remoteCatsyncd = e.remoteCatsyncdName()
+		daemonListen = e.cfg.DaemonListen
+		daemonAddr = e.cfg.DaemonAddr
+	}
 	run := &state.Run{
 		ID:      id,
 		WorkDir: srcAbs,
 		Config: state.Config{
-			Direction:      state.Direction(direction),
-			Backend:        e.cfg.Backend,
-			DryRun:         e.cfg.DryRun,
-			Mirror:         e.cfg.Mirror,
-			IPv6:           e.cfg.IPv6,
-			Port:           e.cfg.Port,
-			Verify:         e.cfg.Verify,
-			Jobs:           e.cfg.Jobs,
-			Streams:        e.cfg.Streams,
-			LargeThreshold: e.cfg.LargeThreshold,
+			Direction:       state.Direction(direction),
+			Backend:         e.cfg.Backend,
+			DryRun:          e.cfg.DryRun,
+			Mirror:          e.cfg.Mirror,
+			IPv6:            e.cfg.IPv6,
+			Port:            e.cfg.Port,
+			Verify:          e.cfg.Verify,
+			Jobs:            e.cfg.Jobs,
+			Streams:         e.cfg.Streams,
+			LargeThreshold:  e.cfg.LargeThreshold,
+			Transport:       transport,
+			DaemonPort:      daemonPort,
+			DaemonTransport: daemonTransport,
+			DaemonBootstrap: daemonBootstrap,
+			RemoteCatsyncd:  remoteCatsyncd,
+			DaemonListen:    daemonListen,
+			DaemonAddr:      daemonAddr,
 		},
 		Status:    state.StatusPending,
 		CreatedAt: time.Now().UTC(),
@@ -1006,6 +1066,7 @@ func syncWith(ctx context.Context, cfg Config, prepare func(*Executor)) (*state.
 	if prepare != nil {
 		prepare(e)
 	}
+	defer e.closeRemote(context.Background())
 	// Same source, destination, direction, and command means the same job: if
 	// an interrupted run for it exists, continue that run instead of planning
 	// and transferring its work again.
@@ -1084,6 +1145,7 @@ func resumeWith(ctx context.Context, cfg Config, id string, prepare func(*Execut
 	if prepare != nil {
 		prepare(e)
 	}
+	defer e.closeRemote(context.Background())
 	var run *state.Run
 	if id == "" {
 		run, err = e.latestResumable()
@@ -1107,6 +1169,7 @@ func resumeWith(ctx context.Context, cfg Config, id string, prepare func(*Execut
 	if cfg.Streams > 0 {
 		run.Config.Streams = cfg.Streams
 	}
+	applyDaemonOverrides(run, cfg)
 	// The recorded configuration is authoritative for the transfer
 	// strategy, but the current invocation's program overrides are what
 	// Resume will actually execute, so they must pass the same validation
@@ -1119,19 +1182,26 @@ func resumeWith(ctx context.Context, cfg Config, id string, prepare func(*Execut
 		remote = target.Destination{User: run.Source.User, Host: run.Source.Host, Path: run.Source.Path}
 	}
 	rc := Config{
-		Direction:      direction,
-		SourceDir:      localDir,
-		Dest:           remote,
-		Backend:        run.Config.Backend,
-		Mirror:         run.Config.Mirror,
-		Verify:         run.Config.Verify,
-		Jobs:           run.Config.Jobs,
-		Streams:        run.Config.Streams,
-		LargeThreshold: run.Config.LargeThreshold,
-		Port:           run.Config.Port,
-		StateDir:       cfg.StateDir,
-		Programs:       cfg.Programs,
-		Env:            cfg.Env,
+		Direction:       direction,
+		SourceDir:       localDir,
+		Dest:            remote,
+		Backend:         run.Config.Backend,
+		Mirror:          run.Config.Mirror,
+		Verify:          run.Config.Verify,
+		Jobs:            run.Config.Jobs,
+		Streams:         run.Config.Streams,
+		LargeThreshold:  run.Config.LargeThreshold,
+		Port:            run.Config.Port,
+		StateDir:        cfg.StateDir,
+		Programs:        cfg.Programs,
+		Env:             cfg.Env,
+		Transport:       run.Config.Transport,
+		DaemonPort:      run.Config.DaemonPort,
+		DaemonTransport: run.Config.DaemonTransport,
+		DaemonBootstrap: run.Config.DaemonBootstrap,
+		RemoteCatsyncd:  run.Config.RemoteCatsyncd,
+		DaemonListen:    run.Config.DaemonListen,
+		DaemonAddr:      run.Config.DaemonAddr,
 	}
 	if err := rc.validateFull(); err != nil {
 		return run, fmt.Errorf("executor: run %s configuration no longer valid: %w", run.ID, err)
@@ -1150,6 +1220,24 @@ func resumeWith(ctx context.Context, cfg Config, id string, prepare func(*Execut
 		return run, err
 	}
 	defer func() { _ = lock.Unlock() }()
+	// Resolve the transport before any stage runs; the daemon transport must
+	// also bootstrap and pass every precheck before the effective
+	// configuration is persisted, so a precheck failure never rewrites the
+	// recorded run.
+	if _, err := e.ensureRemote(ctx); err != nil {
+		return run, err
+	}
+	if e.effectiveTransport() == "daemon" {
+		if _, err := e.ensureRemote(ctx); err != nil {
+			return run, err
+		}
+		if err := e.precheckDaemonRun(run); err != nil {
+			return run, err
+		}
+		if err := e.saveRun(); err != nil {
+			return run, err
+		}
+	}
 	if direction == target.RemoteToLocal {
 		if err := os.MkdirAll(run.Destination.Path, 0o755); err != nil {
 			return run, fmt.Errorf("executor: create local destination: %w", err)
@@ -1679,7 +1767,7 @@ func (e *Executor) reconcileAlreadyPresent(ctx context.Context) {
 		manifest, err = collectLocalManifest(e.run.Destination.Path)
 	} else {
 		var known bool
-		manifest, known, err = e.collectManifest(ctx, e.destTarget(), e.run.Config.IPv6)
+		manifest, known, err = e.remote.DestManifest(ctx)
 		if err == nil && !known {
 			err = errors.New("destination metadata unavailable")
 		}

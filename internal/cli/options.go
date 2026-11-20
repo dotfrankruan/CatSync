@@ -51,19 +51,41 @@ type Options struct {
 	OnAuthFailure string
 	// LargeThreshold is the size at which a file counts as large.
 	LargeThreshold bytesize.Size
+	// Transport selects the remote data path: empty (historical SSH on a new
+	// run, recorded value on resume), "ssh", or "daemon".
+	Transport string
+	// DaemonPort is the daemon TCP port (0 = ephemeral).
+	DaemonPort int
+	// DaemonTransport is "tcp" or the experimental "quic".
+	DaemonTransport string
+	// DaemonBootstrap is "direct" or "ssh-forward".
+	DaemonBootstrap string
+	// RemoteCatsyncd is the remote executable name or path.
+	RemoteCatsyncd string
+	// DaemonListen is the remote --listen value.
+	DaemonListen string
+	// DaemonAddr overrides the data connection address.
+	DaemonAddr string
+	// Explicit records which flags the user actually set.
+	Explicit map[string]bool
 }
 
 // defaultOptions returns the baseline configuration exposed in flag help.
 func defaultOptions() Options {
 	return Options{
-		Backend:        "auto",
-		Progress:       "auto",
-		StateDir:       defaultStateDir(),
-		Verify:         "auto",
-		Jobs:           4,
-		Streams:        4,
-		LargeThreshold: bytesize.Size(512 * bytesize.MiB),
-		OnAuthFailure:  "fail",
+		Backend:         "auto",
+		Progress:        "auto",
+		StateDir:        defaultStateDir(),
+		Verify:          "auto",
+		Jobs:            4,
+		Streams:         4,
+		LargeThreshold:  bytesize.Size(512 * bytesize.MiB),
+		OnAuthFailure:   "fail",
+		DaemonPort:      43411,
+		DaemonTransport: "tcp",
+		DaemonBootstrap: "direct",
+		RemoteCatsyncd:  "catsyncd",
+		Explicit:        map[string]bool{},
 	}
 }
 
@@ -99,6 +121,64 @@ func (o *Options) bindSharedFlags(fs *flag.FlagSet) {
 	fs.Var(&o.LargeThreshold, "large-threshold", "size at or above which a file counts as large (e.g. 512MiB)")
 	fs.StringVar(&o.OnAuthFailure, "on-auth-failure", o.OnAuthFailure,
 		"behavior when ssh authentication is rejected: fail (run stays resumable) or retry (ask to renew credentials, then retry the stage)")
+	o.bindDaemonFlags(fs)
+}
+
+// bindDaemonFlags registers the daemon-transport options shared by new runs
+// and resume.
+func (o *Options) bindDaemonFlags(fs *flag.FlagSet) {
+	fs.StringVar(&o.Transport, "transport", o.Transport,
+		"remote data transport: ssh (default), or daemon (one-shot catsyncd over pinned mTLS)")
+	fs.IntVar(&o.DaemonPort, "daemon-port", o.DaemonPort,
+		"daemon TCP port (0 selects an ephemeral port; default 43411)")
+	fs.StringVar(&o.DaemonTransport, "daemon-transport", o.DaemonTransport,
+		"daemon data transport: tcp (default) or quic (experimental)")
+	fs.StringVar(&o.DaemonBootstrap, "daemon-bootstrap", o.DaemonBootstrap,
+		"how catsync reaches the daemon: direct (default) or ssh-forward")
+	fs.StringVar(&o.RemoteCatsyncd, "remote-catsyncd", o.RemoteCatsyncd,
+		"catsyncd executable on the remote host (default catsyncd); catsync never installs it")
+	fs.StringVar(&o.DaemonListen, "daemon-listen", o.DaemonListen,
+		"listen address passed to catsyncd (empty derives from the port and bootstrap mode)")
+	fs.StringVar(&o.DaemonAddr, "daemon-addr", o.DaemonAddr,
+		"override the daemon data address as host:port")
+}
+
+// recordExplicit records which flags the user set, so resume overrides only
+// the dimensions that were actually specified.
+func (o *Options) recordExplicit(fs *flag.FlagSet) {
+	o.Explicit = map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { o.Explicit[f.Name] = true })
+}
+
+// validateDaemonFlags checks the daemon option values and rejects transports
+// this build does not implement yet.
+func (o *Options) validateDaemonFlags() error {
+	switch o.Transport {
+	case "", "ssh", "daemon":
+	default:
+		return fmt.Errorf("--transport %q is not valid: want ssh or daemon", o.Transport)
+	}
+	if o.DaemonPort < 0 || o.DaemonPort > 65535 {
+		return fmt.Errorf("--daemon-port must be between 0 and 65535, got %d", o.DaemonPort)
+	}
+	switch o.DaemonTransport {
+	case "tcp":
+	case "quic":
+		return fmt.Errorf("--daemon-transport quic is not implemented yet; use tcp")
+	default:
+		return fmt.Errorf("--daemon-transport %q is not valid: want tcp or quic", o.DaemonTransport)
+	}
+	switch o.DaemonBootstrap {
+	case "direct":
+	case "ssh-forward":
+		return fmt.Errorf("--daemon-bootstrap ssh-forward is not implemented yet; use direct")
+	default:
+		return fmt.Errorf("--daemon-bootstrap %q is not valid: want direct or ssh-forward", o.DaemonBootstrap)
+	}
+	if strings.TrimSpace(o.RemoteCatsyncd) == "" {
+		return errors.New("--remote-catsyncd must not be empty")
+	}
+	return nil
 }
 
 // validateOutput checks the options shared by every command.
@@ -153,6 +233,9 @@ func (o *Options) Validate() error {
 	}
 	if o.Port < 0 || o.Port > 65535 {
 		return fmt.Errorf("--port must be between 1 and 65535, got %d", o.Port)
+	}
+	if err := o.validateDaemonFlags(); err != nil {
+		return err
 	}
 	return nil
 }
