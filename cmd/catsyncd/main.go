@@ -90,8 +90,9 @@ func runServe(args []string) int {
 	once := fs.Bool("once", false, "serve exactly one bootstrap session and exit (required)")
 	listen := fs.String("listen", ":43411", "TCP listen address; port 0 selects an ephemeral port")
 	sftpServer := fs.String("sftp-server", "", "path to the OpenSSH sftp-server executable")
+	rsyncPath := fs.String("rsync", "", "path to the rsync executable used by the exec channel")
 	maxSFTP := fs.Int("max-sftp-conns", 64, "maximum concurrent SFTP connections")
-	maxExec := fs.Int("max-exec-conns", 64, "maximum concurrent exec connections (unused in M1)")
+	maxExec := fs.Int("max-exec-conns", 64, "maximum concurrent exec connections (rsync)")
 	maxControl := fs.Int("max-control-conns", 16, "maximum concurrent control RPC connections")
 	maxPending := fs.Int("max-pending-handshakes", 64, "maximum concurrent TLS handshakes")
 	maxConns := fs.Int("max-conns", 256, "global connection budget")
@@ -117,6 +118,7 @@ func runServe(args []string) int {
 		Listen:           *listen,
 		RequestedPort:    requestedPort,
 		SFTPPath:         daemon.ResolveSFTPPath(*sftpServer),
+		RsyncPath:        daemon.ResolveRsyncPath(*rsyncPath),
 		Limits:           protocolLimits(*maxSFTP, *maxExec, *maxControl, *maxPending, *maxConns),
 		CertTTL:          *certTTL,
 		IdleTimeout:      *idle,

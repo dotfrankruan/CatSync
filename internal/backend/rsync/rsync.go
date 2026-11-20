@@ -61,6 +61,10 @@ type Config struct {
 	Dest target.Destination
 	// SSH carries SSH transport options.
 	SSH backend.SSH
+	// Rsh overrides the -e transport value (daemon mode uses
+	// "<absolute catsync> rsh"). It is validated like any other transport
+	// token sequence: no NUL, newline, or control characters.
+	Rsh string
 	// DryRun adds --dry-run: rsync reports what it would transfer.
 	DryRun bool
 	// PartialDir is the relative --partial-dir; empty means
@@ -155,6 +159,11 @@ func (c *Config) Command() (argv []string, stdin []byte, err error) {
 		"--files-from=-",
 		"--from0",
 	}
+	if c.Rsh != "" {
+		if err := validateRsh(c.Rsh); err != nil {
+			return nil, nil, err
+		}
+	}
 	if c.NoImpliedDirs {
 		args = append(args, "--no-implied-dirs")
 	}
@@ -164,7 +173,7 @@ func (c *Config) Command() (argv []string, stdin []byte, err error) {
 	if c.DryRun {
 		args = append(args, "--dry-run")
 	}
-	args = append(args, "-e", c.SSH.RsyncTransport())
+	args = append(args, "-e", c.transportValue())
 	// Both local operands are absolute and the remote endpoint was validated;
 	// "--" ends option parsing for defense in depth.
 	if direction == target.RemoteToLocal {
@@ -173,6 +182,42 @@ func (c *Config) Command() (argv []string, stdin []byte, err error) {
 		args = append(args, "--", withTrailingSlash(c.SourceDir), c.Dest.String())
 	}
 	return args, payload.Bytes(), nil
+}
+
+// transportValue returns the rsync -e value: the daemon helper override when
+// set, otherwise the historical ssh transport.
+func (c Config) transportValue() string {
+	if c.Rsh != "" {
+		return c.Rsh
+	}
+	return c.SSH.RsyncTransport()
+}
+
+// transportValue mirrors Config.transportValue for mirror runs.
+func (c *MirrorConfig) transportValue() string {
+	if c.Rsh != "" {
+		return c.Rsh
+	}
+	return c.SSH.RsyncTransport()
+}
+
+// validateRsh accepts only CatSync's own helper form: an absolute executable
+// (optionally shell-quoted) followed by the "rsh" argument, with no control
+// characters. A bare ssh value is not accepted here so a mistake cannot
+// silently run a different transport.
+func validateRsh(v string) error {
+	if v == "" || len(v) > 4096 {
+		return errors.New("rsync: -e transport is empty or too long")
+	}
+	for _, r := range v {
+		if r < 0x20 || r == 0x7f {
+			return errors.New("rsync: -e transport contains control characters")
+		}
+	}
+	if !strings.HasSuffix(v, " rsh") {
+		return errors.New("rsync: -e transport override must end with \" rsh\"")
+	}
+	return nil
 }
 
 func remoteWithTrailingSlash(remote target.Destination) string {
@@ -292,6 +337,7 @@ type MirrorConfig struct {
 	SourceDir string
 	Dest      target.Destination
 	SSH       backend.SSH
+	Rsh       string
 	DryRun    bool
 	Env       []string
 	Stdout    io.Writer
@@ -303,7 +349,7 @@ type MirrorConfig struct {
 func (c *MirrorConfig) Command() ([]string, error) {
 	base := Config{
 		Program: c.Program, Direction: c.Direction, SourceDir: c.SourceDir,
-		Dest: c.Dest, SSH: c.SSH, PartialDir: DefaultPartialDir,
+		Dest: c.Dest, SSH: c.SSH, Rsh: c.Rsh, PartialDir: DefaultPartialDir,
 	}
 	// Reuse endpoint and transport validation without using the resulting
 	// file-list command.
@@ -330,7 +376,7 @@ func (c *MirrorConfig) Command() ([]string, error) {
 	if c.Progress != nil {
 		args = append(args, "--info=progress2", "--outbuf=L")
 	}
-	args = append(args, "-e", c.SSH.RsyncTransport(), "--")
+	args = append(args, "-e", c.transportValue(), "--")
 	direction := c.Direction
 	if direction == "" {
 		direction = target.LocalToRemote

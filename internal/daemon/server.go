@@ -27,6 +27,9 @@ type ServerConfig struct {
 	// SFTPPath is the resolved sftp-server executable; empty disables the
 	// SFTP capability.
 	SFTPPath string
+	// RsyncPath is the resolved absolute rsync executable; empty disables
+	// the exec capability (the server never runs an unvalidated program).
+	RsyncPath string
 	// Limits bounds concurrent work. Zero fields default.
 	Limits protocol.Limits
 	// Manifest bounds traversal memory and stream size; zero fields default.
@@ -92,7 +95,7 @@ func (c *ServerConfig) applyDefaults() {
 func (c *ServerConfig) features() protocol.Features {
 	return protocol.Features{
 		SFTP:     c.SFTPPath != "",
-		Exec:     false, // exec is not implemented in M1
+		Exec:     c.RsyncPath != "",
 		Manifest: true,
 		Metadata: true,
 		Hash:     true,
@@ -326,6 +329,9 @@ func enabledALPN(f protocol.Features) []string {
 	if f.SFTP {
 		protos = append(protos, protocol.ALPNSFTP)
 	}
+	if f.Exec {
+		protos = append(protos, protocol.ALPNExec)
+	}
 	return protos
 }
 
@@ -397,6 +403,10 @@ func (s *server) handleConn(conn net.Conn) {
 			_ = tc.Close()
 			return
 		}
+		return
+	}
+	if alpn == protocol.ALPNExec {
+		s.handleExecConn(tlsConn)
 		return
 	}
 	// SFTP: one sftp-server child per connection.

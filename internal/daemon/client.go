@@ -202,6 +202,7 @@ type Client struct {
 	dialAddr string
 	httpTLS  *tls.Config
 	sftpTLS  *tls.Config
+	execTLS  *tls.Config
 	http     *http.Client
 
 	ctx         context.Context
@@ -308,6 +309,7 @@ func Bootstrap(ctx context.Context, cfg BootstrapConfig) (*Client, error) {
 	}
 	httpTLS := clientTLSConfig(clientPair, serverCert, []string{protocol.ALPNHTTP})
 	sftpTLS := clientTLSConfig(clientPair, serverCert, []string{protocol.ALPNSFTP})
+	execTLS := clientTLSConfig(clientPair, serverCert, []string{protocol.ALPNExec})
 	if err := c.writer.send(&readyAckMsg{
 		Type: msgReadyAck, Protocol: protocol.Version, SessionID: ready.SessionID,
 		ServerNonce: hello.ServerNonce, ClientNonce: clientNonce,
@@ -327,7 +329,7 @@ func Bootstrap(ctx context.Context, cfg BootstrapConfig) (*Client, error) {
 	}
 
 	c.hello, c.ready = *hello, *ready
-	c.dialAddr, c.httpTLS, c.sftpTLS = dialAddr, httpTLS, sftpTLS
+	c.dialAddr, c.httpTLS, c.sftpTLS, c.execTLS = dialAddr, httpTLS, sftpTLS, execTLS
 	c.http = &http.Client{Transport: &http.Transport{
 		DisableKeepAlives: true,
 		DialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {

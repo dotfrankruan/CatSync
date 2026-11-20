@@ -43,6 +43,7 @@ import (
 	"github.com/dotfrankruan/CatSync/internal/planner"
 	"github.com/dotfrankruan/CatSync/internal/process"
 	progressui "github.com/dotfrankruan/CatSync/internal/progress"
+	"github.com/dotfrankruan/CatSync/internal/rsh"
 	"github.com/dotfrankruan/CatSync/internal/state"
 	"github.com/dotfrankruan/CatSync/internal/target"
 )
@@ -297,6 +298,12 @@ type Executor struct {
 	// executor; daemonClient owns the one-shot bootstrap session.
 	remote       remoteOps
 	daemonClient *daemon.Client
+
+	// Daemon mode starts one local rsh agent so rsync's -e transport never
+	// opens a second ssh session; these fields hold its environment.
+	rshAgent   *rsh.Agent
+	rshEnv     []string
+	rshCommand string
 }
 
 func newExecutor(cfg Config) (*Executor, error) {
@@ -1450,6 +1457,11 @@ func (e *Executor) revertAuthFailedTasks() {
 }
 
 func (e *Executor) execute(ctx context.Context) (retErr error) {
+	if e.effectiveTransport() == "daemon" {
+		if err := e.ensureDaemonAgent(ctx); err != nil {
+			return err
+		}
+	}
 	defer func() {
 		if e.progress != nil {
 			e.progress.Finish(retErr == nil)

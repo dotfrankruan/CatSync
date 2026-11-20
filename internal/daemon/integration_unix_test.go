@@ -700,3 +700,54 @@ func (oneConn) RemoteAddr() net.Addr             { return nil }
 func (oneConn) SetDeadline(time.Time) error      { return nil }
 func (oneConn) SetReadDeadline(time.Time) error  { return nil }
 func (oneConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestExecRejectsUnauthorizedCommands(t *testing.T) {
+	rsyncPath := ResolveRsyncPath("")
+	if rsyncPath == "" {
+		t.Skip("rsync is not installed")
+	}
+	ts := startTestServer(t, func(cfg *ServerConfig) { cfg.RsyncPath = rsyncPath })
+	c := ts.client
+	if !c.Features().Exec {
+		t.Fatal("exec feature not advertised despite a resolved rsync")
+	}
+	cases := []struct {
+		program string
+		args    []string
+		want    string
+	}{
+		{"sh", []string{"-c", "true"}, protocol.CodeExecRejected},
+		{"rsync", []string{"--server", "--rsh=sh", ".", "/tmp"}, protocol.CodeExecRejected},
+		{"rsync", []string{"--server", "-log", ".", "relative"}, protocol.CodeExecRejected},
+		{"rsync", []string{"--server", "-log", ".", "/tmp/a", "/tmp/b"}, protocol.CodeExecRejected},
+	}
+	for _, tc := range cases {
+		sess, err := c.Exec(context.Background(), tc.program, tc.args)
+		if err != nil {
+			continue // a handshake-level rejection is fine too
+		}
+		_, werr := sess.Wait(context.Background())
+		sess.Close()
+		if werr == nil || !strings.Contains(werr.Error(), tc.want) {
+			t.Errorf("%q %v: error = %v, want %s", tc.program, tc.args, werr, tc.want)
+		}
+	}
+	if code, _ := ts.shutdown(); code != 0 {
+		t.Errorf("exit = %d", code)
+	}
+}
+
+func TestExecDisabledWithoutRsync(t *testing.T) {
+	ts := startTestServer(t, func(cfg *ServerConfig) { cfg.RsyncPath = "" })
+	if ts.client.Features().Exec {
+		t.Fatal("exec advertised without a resolved rsync")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := ts.client.Exec(ctx, "rsync", []string{"--server", "-log", ".", "/tmp"}); err == nil {
+		t.Error("exec handshake succeeded while the capability is disabled")
+	}
+	if code, _ := ts.shutdown(); code != 0 {
+		t.Errorf("exit = %d", code)
+	}
+}

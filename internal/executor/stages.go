@@ -362,9 +362,10 @@ func (e *Executor) runSmallBatch(ctx, stageCtx context.Context, batch partition.
 		SourceDir:     e.localRoot(),
 		Dest:          e.destTarget(),
 		SSH:           e.sshOpts(e.run.Config.IPv6),
+		Rsh:           e.rsyncRsh(),
 		Paths:         paths,
 		NoImpliedDirs: true,
-		Env:           e.cfg.Env,
+		Env:           e.rsyncEnv(),
 		Stdout:        &stdout,
 		Stderr:        &stderr,
 		Progress:      e.addProgress,
@@ -561,8 +562,9 @@ func (e *Executor) rsyncStage(ctx context.Context) error {
 		SourceDir: e.localRoot(),
 		Dest:      e.destTarget(),
 		SSH:       e.sshOpts(e.run.Config.IPv6),
+		Rsh:       e.rsyncRsh(),
 		Paths:     paths,
-		Env:       e.cfg.Env,
+		Env:       e.rsyncEnv(),
 		Stdout:    e.stdout,
 		Stderr:    diag,
 		Progress:  e.addFileProgress(label),
@@ -627,7 +629,7 @@ func (e *Executor) mirrorStage(ctx context.Context) error {
 	cfg := rsync.MirrorConfig{
 		Program: e.progs.rsync(), Direction: e.transferDirection(),
 		SourceDir: e.localRoot(), Dest: e.destTarget(),
-		SSH: e.sshOpts(e.run.Config.IPv6), Env: e.cfg.Env,
+		SSH: e.sshOpts(e.run.Config.IPv6), Rsh: e.rsyncRsh(), Env: e.rsyncEnv(),
 		Stdout: e.stdout, Stderr: e.stderr, Progress: e.addFileProgress("mirror reconcile"),
 	}
 	e.progressFileStart("mirror reconcile", 0, 0)
@@ -675,7 +677,7 @@ func (e *Executor) mirrorPreview(ctx context.Context) error {
 	cfg := rsync.MirrorConfig{
 		Program: e.progs.rsync(), Direction: e.transferDirection(),
 		SourceDir: e.localRoot(), Dest: e.destTarget(),
-		SSH: e.sshOpts(e.run.Config.IPv6), DryRun: true, Env: e.cfg.Env,
+		SSH: e.sshOpts(e.run.Config.IPv6), Rsh: e.rsyncRsh(), DryRun: true, Env: e.rsyncEnv(),
 		Stdout: e.stdout, Stderr: e.stderr,
 	}
 	return cfg.Run(ctx)

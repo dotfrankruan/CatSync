@@ -6,8 +6,10 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -24,11 +26,12 @@ import (
 // bootstrap, so executor daemon tests exercise the real bootstrap, mTLS,
 // RPC, and SFTP forwarding paths without an external process.
 type inProcDaemonTransport struct {
-	t        *testing.T
-	sftpPath string
-	limits   protocol.Limits
-	mu       sync.Mutex
-	sessions []*inProcDaemonSession
+	t         *testing.T
+	sftpPath  string
+	rsyncPath string
+	limits    protocol.Limits
+	mu        sync.Mutex
+	sessions  []*inProcDaemonSession
 }
 
 func (tr *inProcDaemonTransport) Start(ctx context.Context) (daemon.ControlSession, error) {
@@ -40,6 +43,7 @@ func (tr *inProcDaemonTransport) Start(ctx context.Context) (daemon.ControlSessi
 		Listen:           "127.0.0.1:0",
 		Version:          "test",
 		SFTPPath:         tr.sftpPath,
+		RsyncPath:        tr.rsyncPath,
 		Limits:           tr.limits,
 		IdleTimeout:      5 * time.Second,
 		DrainTimeout:     10 * time.Second,
@@ -385,4 +389,187 @@ func TestDaemonResumeAfterInterrupt(t *testing.T) {
 		t.Fatalf("resume = %s (%q)", resumed.Status, resumed.Error)
 	}
 	requireFileEqual(t, filepath.Join(local, "big.bin"), filepath.Join(remote, "big.bin"))
+}
+
+var (
+	buildCatsyncOnce sync.Once
+	builtCatsyncPath string
+	buildCatsyncErr  error
+)
+
+// realCatsyncBinary builds cmd/catsync once so rsync's -e helper can run the
+// actual hidden rsh command instead of the test binary.
+func realCatsyncBinary(t *testing.T) string {
+	t.Helper()
+	buildCatsyncOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "catsync-bin-")
+		if err != nil {
+			buildCatsyncErr = err
+			return
+		}
+		out := filepath.Join(dir, "catsync")
+		cmd := exec.Command("go", "build", "-o", out, "github.com/dotfrankruan/CatSync/cmd/catsync")
+		cmd.Dir = repoRoot(t)
+		if data, err := cmd.CombinedOutput(); err != nil {
+			buildCatsyncErr = fmt.Errorf("build catsync: %v: %s", err, data)
+			return
+		}
+		builtCatsyncPath = out
+	})
+	if buildCatsyncErr != nil {
+		t.Fatalf("%v", buildCatsyncErr)
+	}
+	return builtCatsyncPath
+}
+
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("go.mod not found")
+		}
+		dir = parent
+	}
+}
+
+func TestDaemonMixedTreeUsesSingleBootstrap(t *testing.T) {
+	sftpPath := daemon.ResolveSFTPPath("")
+	rsyncPath := daemon.ResolveRsyncPath("")
+	if sftpPath == "" || rsyncPath == "" {
+		t.Skip("sftp-server or rsync is not installed")
+	}
+	exe := realCatsyncBinary(t)
+	oldExe := catsyncExecutable
+	catsyncExecutable = func() (string, error) { return exe, nil }
+	t.Cleanup(func() { catsyncExecutable = oldExe })
+
+	tr := &inProcDaemonTransport{t: t, sftpPath: sftpPath, rsyncPath: rsyncPath, limits: protocol.Limits{MaxSFTPConns: 8, MaxExecConns: 8, MaxControlConns: 8, MaxPendingHandshake: 8, MaxConns: 64}}
+	installDaemonTransport(t, tr)
+
+	// Any real ssh invocation would fail loudly; daemon mode must not spawn
+	// one for rsync or metadata.
+	badSSH := filepath.Join(t.TempDir(), "ssh")
+	if err := os.WriteFile(badSSH, []byte("#!/bin/sh\necho 'ssh must not run in daemon mode' >&2\nexit 99\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CATSYNC_SSH", badSSH)
+
+	local := t.TempDir()
+	mtime := time.Unix(1_700_200_000, 987_654_321)
+	writeDaemonFile(t, filepath.Join(local, "big.bin"), 8<<10, mtime)
+	writeDaemonFile(t, filepath.Join(local, "small1.txt"), 100, mtime)
+	writeDaemonFile(t, filepath.Join(local, "small2.txt"), 200, mtime)
+	writeDaemonFile(t, filepath.Join(local, "sub", "nested.txt"), 300, mtime)
+	writeDaemonFile(t, filepath.Join(local, "unicode-文件.txt"), 50, mtime)
+	writeDaemonFile(t, filepath.Join(local, "with space.txt"), 60, mtime)
+	if err := os.WriteFile(filepath.Join(local, "empty.bin"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	remote := t.TempDir()
+	cfg := daemonTestConfig(t, target.LocalToRemote, local, remote, state.BackendAuto, 2, 2)
+	cfg.LargeThreshold = 1 << 10
+	cfg.Verify = state.VerifySHA256
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		if run != nil {
+			for _, task := range run.Tasks {
+				t.Logf("task %s (%s): %s %s", task.Path, task.Backend, task.Status, task.Error)
+			}
+		}
+		t.Fatalf("Sync mixed tree: %v", err)
+	}
+	if run.Status != state.StatusCompleted {
+		t.Fatalf("run = %s (%q)", run.Status, run.Error)
+	}
+	for _, name := range []string{"big.bin", "small1.txt", "small2.txt", "sub/nested.txt", "unicode-文件.txt", "with space.txt", "empty.bin"} {
+		requireFileEqual(t, filepath.Join(local, filepath.FromSlash(name)), filepath.Join(remote, filepath.FromSlash(name)))
+	}
+	tr.mu.Lock()
+	sessions := len(tr.sessions)
+	tr.mu.Unlock()
+	if sessions != 1 {
+		t.Fatalf("bootstrap sessions = %d, want exactly 1 for the whole run", sessions)
+	}
+}
+
+// daemonMixedHarness builds a real mixed tree (native large + rsync small +
+// special names) and returns the local root.
+func daemonMixedHarness(t *testing.T) (string, string, *inProcDaemonTransport) {
+	t.Helper()
+	sftpPath := daemon.ResolveSFTPPath("")
+	rsyncPath := daemon.ResolveRsyncPath("")
+	if sftpPath == "" || rsyncPath == "" {
+		t.Skip("sftp-server or rsync is not installed")
+	}
+	exe := realCatsyncBinary(t)
+	oldExe := catsyncExecutable
+	catsyncExecutable = func() (string, error) { return exe, nil }
+	t.Cleanup(func() { catsyncExecutable = oldExe })
+	tr := &inProcDaemonTransport{t: t, sftpPath: sftpPath, rsyncPath: rsyncPath, limits: protocol.Limits{MaxSFTPConns: 8, MaxExecConns: 8, MaxControlConns: 8, MaxPendingHandshake: 8, MaxConns: 64}}
+	installDaemonTransport(t, tr)
+	local := t.TempDir()
+	mtime := time.Unix(1_700_300_000, 111_222_333)
+	writeDaemonFile(t, filepath.Join(local, "big.bin"), 8<<10, mtime)
+	writeDaemonFile(t, filepath.Join(local, "small1.txt"), 100, mtime)
+	writeDaemonFile(t, filepath.Join(local, "sub", "nested.txt"), 300, mtime)
+	writeDaemonFile(t, filepath.Join(local, "unicode-文件.txt"), 50, mtime)
+	writeDaemonFile(t, filepath.Join(local, "with\nnewline.txt"), 70, mtime)
+	writeDaemonFile(t, filepath.Join(local, "with space.txt"), 60, mtime)
+	return local, t.TempDir(), tr
+}
+
+func TestDaemonMixedTreeDownload(t *testing.T) {
+	remote, localDest, _ := daemonMixedHarness(t)
+	cfg := daemonTestConfig(t, target.RemoteToLocal, localDest, remote, state.BackendAuto, 2, 2)
+	cfg.LargeThreshold = 1 << 10
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		if run != nil {
+			for _, task := range run.Tasks {
+				t.Logf("task %s (%s): %s %s", task.Path, task.Backend, task.Status, task.Error)
+			}
+		}
+		t.Fatalf("Sync download: %v", err)
+	}
+	if run.Status != state.StatusCompleted {
+		t.Fatalf("run = %s (%q)", run.Status, run.Error)
+	}
+	for _, name := range []string{"big.bin", "small1.txt", "sub/nested.txt", "unicode-文件.txt", "with\nnewline.txt", "with space.txt"} {
+		requireFileEqual(t, filepath.Join(remote, filepath.FromSlash(name)), filepath.Join(localDest, filepath.FromSlash(name)))
+	}
+}
+
+func TestDaemonMirrorDeletesExtraneous(t *testing.T) {
+	local, remote, _ := daemonMixedHarness(t)
+	cfg := daemonTestConfig(t, target.LocalToRemote, local, remote, state.BackendAuto, 2, 2)
+	cfg.LargeThreshold = 1 << 10
+	cfg.Mirror = true
+	run, err := Sync(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("initial sync: %v", err)
+	}
+	if run.Status != state.StatusCompleted {
+		t.Fatalf("run = %s (%q)", run.Status, run.Error)
+	}
+	extra := filepath.Join(remote, "extraneous.txt")
+	if err := os.WriteFile(extra, []byte("delete me"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg2 := daemonTestConfig(t, target.LocalToRemote, local, remote, state.BackendAuto, 2, 2)
+	cfg2.LargeThreshold = 1 << 10
+	cfg2.Mirror = true
+	if _, err := Sync(context.Background(), cfg2); err != nil {
+		t.Fatalf("mirror sync: %v", err)
+	}
+	if _, err := os.Stat(extra); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("mirror did not delete the extraneous remote file: %v", err)
+	}
 }

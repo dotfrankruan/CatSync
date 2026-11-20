@@ -52,9 +52,15 @@ func ResolveSFTPPath(explicit string) string {
 	return ""
 }
 
-// ResolveRsyncPath finds rsync; exec is not implemented in M1, but probe
-// reports availability so users can see what a later milestone will use.
-func ResolveRsyncPath() string {
+// ResolveRsyncPath finds the absolute rsync executable used by the exec
+// channel: an explicit flag wins, then CATSYNC_RSYNC_SERVER, then PATH.
+func ResolveRsyncPath(explicit string) string {
+	if explicit != "" {
+		return executablePath(explicit)
+	}
+	if env := os.Getenv("CATSYNC_RSYNC_SERVER"); env != "" {
+		return executablePath(env)
+	}
 	if p, err := exec.LookPath("rsync"); err == nil {
 		return p
 	}
@@ -75,10 +81,10 @@ func executablePath(p string) string {
 // Probe builds the capability report for this host.
 func Probe(version string) ProbeReport {
 	sftp := ResolveSFTPPath("")
-	rsync := ResolveRsyncPath()
-	notes := "exec is not implemented in this build"
+	rsync := ResolveRsyncPath("")
+	notes := ""
 	if rsync == "" {
-		notes += "; rsync not found (needed only by later milestones)"
+		notes = "rsync not found; the exec channel is disabled (rsync batches fall back to ssh)"
 	}
 	return ProbeReport{
 		Version:     version,
@@ -87,7 +93,7 @@ func Probe(version string) ProbeReport {
 		DefaultPort: DefaultPort,
 		Features: protocol.Features{
 			SFTP:     sftp != "",
-			Exec:     false,
+			Exec:     rsync != "",
 			Manifest: true,
 			Metadata: true,
 			Hash:     true,

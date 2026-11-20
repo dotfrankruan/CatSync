@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -17,6 +19,7 @@ import (
 	"github.com/dotfrankruan/CatSync/internal/discovery"
 	"github.com/dotfrankruan/CatSync/internal/partition"
 	"github.com/dotfrankruan/CatSync/internal/planner"
+	"github.com/dotfrankruan/CatSync/internal/rsh"
 	"github.com/dotfrankruan/CatSync/internal/state"
 	"github.com/dotfrankruan/CatSync/internal/target"
 )
@@ -274,6 +277,9 @@ func (r daemonRemote) Hashes(ctx context.Context, tool remoteHashTool, tasks []*
 		abs = append(abs, p)
 		relOf[p] = t.Path
 	}
+	// The RPC stream contract is byte-order increasing paths; sort the
+	// request here rather than making every caller do it.
+	sort.Strings(abs)
 	hashes, err := r.client.Hash(ctx, abs)
 	if err != nil {
 		return nil, err
@@ -442,6 +448,12 @@ func (e *Executor) effectiveIPv6() bool {
 
 // closeRemote shuts the daemon session down and forgets it.
 func (e *Executor) closeRemote(ctx context.Context) {
+	if e.rshAgent != nil {
+		e.rshAgent.Close()
+		e.rshAgent = nil
+		e.rshEnv = nil
+		e.rshCommand = ""
+	}
 	if e.daemonClient != nil {
 		_ = e.daemonClient.Close()
 		e.daemonClient = nil
@@ -502,15 +514,31 @@ func (e *Executor) precheckDaemon(out *PlanOutcome) error {
 		streams = 1
 	}
 	sfwPeak, execPeak := e.plannedBudget(out, jobs, streams, 0, int(e.cfg.LargeThreshold))
+	needExec := e.cfg.Mirror
+	if out.Result != nil {
+		for _, d := range out.Result.Decisions {
+			if d.Status == planner.StatusPending && (d.Backend == state.BackendFPSync || d.Backend == state.BackendRsync) {
+				needExec = true
+			}
+		}
+	}
+	if e.cfg.Mirror {
+		execPeak++
+	}
 	lim := client.Limits()
 	if err := e.checkCapacity("SFTP", sfwPeak, lim.MaxSFTPConns); err != nil {
 		return err
 	}
-	// rsync still uses SSH during M2; exec capacity becomes mandatory when
-	// M3 routes it over the daemon.
-	_ = execPeak
 	if sfwPeak > 0 && !client.Features().SFTP {
 		return fmt.Errorf("%w: the remote daemon has no sftp-server; install OpenSSH's sftp-server on the remote host", protocolError(protocol.CodeFeatureUnavailable))
+	}
+	if needExec {
+		if err := e.checkCapacity("exec", execPeak, lim.MaxExecConns); err != nil {
+			return err
+		}
+		if !client.Features().Exec {
+			return fmt.Errorf("%w: the remote daemon cannot run rsync (exec channel disabled); install rsync on the remote host or use --transport ssh", protocolError(protocol.CodeFeatureUnavailable))
+		}
 	}
 	return e.validateDaemonPaths(out)
 }
@@ -553,13 +581,28 @@ func (e *Executor) precheckDaemonRun(run *state.Run) error {
 	}
 	batches, _ := partition.Pack(fpsync, partition.Config{MaxFiles: jobs, MaxBytes: run.Config.LargeThreshold})
 	sfwPeak := min(large, jobs)*streams + min(smallSFTP, jobs)
-	_ = min(len(batches), jobs) + btoi(conservative > 0)
+	execPeak := min(len(batches), jobs) + btoi(conservative > 0)
+	needExec := run.Config.Mirror
+	if len(batches) > 0 || conservative > 0 {
+		needExec = true
+	}
+	if run.Config.Mirror {
+		execPeak++
+	}
 	lim := client.Limits()
 	if err := e.checkCapacity("SFTP", sfwPeak, lim.MaxSFTPConns); err != nil {
 		return err
 	}
 	if sfwPeak > 0 && !client.Features().SFTP {
 		return fmt.Errorf("%w: the remote daemon has no sftp-server", protocolError(protocol.CodeFeatureUnavailable))
+	}
+	if needExec {
+		if err := e.checkCapacity("exec", execPeak, lim.MaxExecConns); err != nil {
+			return err
+		}
+		if !client.Features().Exec {
+			return fmt.Errorf("%w: the remote daemon cannot run rsync (exec channel disabled)", protocolError(protocol.CodeFeatureUnavailable))
+		}
 	}
 	for _, t := range run.Tasks {
 		if !utf8.ValidString(t.Path) {
@@ -668,4 +711,55 @@ func applyDaemonOverrides(run *state.Run, cfg Config) {
 	if set("daemon-addr") {
 		run.Config.DaemonAddr = cfg.DaemonAddr
 	}
+}
+
+// ensureDaemonAgent starts the single per-run local rsh agent that bridges
+// rsync's -e helper to the daemon exec channel. It never starts a second
+// ssh process: the helper only talks to this local Unix socket.
+func (e *Executor) ensureDaemonAgent(ctx context.Context) error {
+	if e.effectiveTransport() != "daemon" {
+		return nil
+	}
+	if e.rshAgent != nil {
+		return nil
+	}
+	if e.daemonClient == nil {
+		return errors.New("executor: daemon session is not ready for exec")
+	}
+	exe, err := catsyncExecutable()
+	if err != nil {
+		return fmt.Errorf("executor: locate catsync executable for rsh: %w", err)
+	}
+	endpoint := e.remoteEndpoint()
+	agent, err := rsh.Start(ctx, endpoint.Host, endpoint.User, e.daemonClient)
+	if err != nil {
+		return fmt.Errorf("executor: start rsh agent: %w", err)
+	}
+	e.rshAgent = agent
+	e.rshEnv = agent.Env()
+	e.rshCommand = discovery.ShellQuote(exe) + " rsh"
+	return nil
+}
+
+// catsyncExecutable is replaceable so tests can point the rsh helper at a
+// real catsync binary built from the same tree.
+var catsyncExecutable = os.Executable
+
+// rsyncRsh is the daemon -e override (empty for ssh runs).
+func (e *Executor) rsyncRsh() string {
+	if e.effectiveTransport() == "daemon" {
+		return e.rshCommand
+	}
+	return ""
+}
+
+// rsyncEnv returns the environment for an rsync process: the user's
+// additions plus the local agent credentials in daemon mode.
+func (e *Executor) rsyncEnv() []string {
+	if e.effectiveTransport() != "daemon" || len(e.rshEnv) == 0 {
+		return e.cfg.Env
+	}
+	out := make([]string, 0, len(e.cfg.Env)+len(e.rshEnv))
+	out = append(out, e.cfg.Env...)
+	return append(out, e.rshEnv...)
 }

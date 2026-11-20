@@ -4,8 +4,8 @@ import "testing"
 
 func TestProbeFeaturesAreHonest(t *testing.T) {
 	r := Probe("test")
-	if r.Features.Exec {
-		t.Error("probe advertises exec in M1")
+	if r.Features.Exec != (r.Details.Rsync != "") {
+		t.Errorf("exec feature %v does not match resolved rsync %q", r.Features.Exec, r.Details.Rsync)
 	}
 	if !r.Features.Manifest || !r.Features.Metadata || !r.Features.Hash || !r.Features.Stat || !r.Features.SameFile {
 		t.Errorf("probe features = %+v", r.Features)

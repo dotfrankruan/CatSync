@@ -459,3 +459,42 @@ func TestCommandNoImpliedDirs(t *testing.T) {
 		}
 	}
 }
+
+func TestRshOverrideReplacesSSHTransport(t *testing.T) {
+	c := Config{
+		Program: "/usr/bin/rsync", SourceDir: "/src", Dest: target.Destination{User: "u", Host: "h", Path: "/dst"},
+		Rsh: "/opt/catsync rsh", Paths: []string{"a"},
+	}
+	argv, _, err := c.Command()
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(argv, " ")
+	if !strings.Contains(joined, "-e /opt/catsync rsh") {
+		t.Errorf("argv missing rsh override: %v", argv)
+	}
+	if strings.Contains(joined, " -e ssh ") {
+		t.Errorf("argv still uses ssh transport: %v", argv)
+	}
+	bad := []string{"ssh", "sh -c x", "/opt/catsync rsh\nexit", "/opt/catsync"}
+	for _, rsh := range bad {
+		c.Rsh = rsh
+		if _, _, err := c.Command(); err == nil {
+			t.Errorf("Rsh %q accepted", rsh)
+		}
+	}
+}
+
+func TestMirrorRshOverride(t *testing.T) {
+	c := MirrorConfig{
+		Program: "/usr/bin/rsync", SourceDir: "/src", Dest: target.Destination{Host: "h", Path: "/dst"},
+		Rsh: "/opt/catsync rsh",
+	}
+	argv, err := c.Command()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(argv, " "), "-e /opt/catsync rsh") {
+		t.Errorf("mirror argv missing rsh override: %v", argv)
+	}
+}

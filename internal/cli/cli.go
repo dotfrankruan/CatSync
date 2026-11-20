@@ -55,6 +55,9 @@ func Run(args []string, stdout, stderr io.Writer, version string) int {
 		return runDoctorCommand(rest, stdout, stderr)
 	case "daemon":
 		return runDaemonCommand(rest, stdout, stderr)
+	case "rsh":
+		// Hidden transport helper spawned by local rsync in daemon mode.
+		return runRshCommand(rest, stdout, stderr)
 	case "plan", "copy", "sync":
 		return runTransferCommand(name, rest, stdout, stderr)
 	case "resume", "status":
