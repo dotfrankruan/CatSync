@@ -30,6 +30,7 @@ const usageText = `Usage: catsync <command> [options]
 
 Commands:
   doctor    check external tools (rsync, ssh)
+  daemon    one-shot catsyncd diagnostics (daemon probe)
   plan      build a transfer plan between one local and one remote endpoint
   copy      copy source entries without deleting destination-only entries
   sync      make destination an exact archive mirror of source
@@ -52,6 +53,8 @@ func Run(args []string, stdout, stderr io.Writer, version string) int {
 	switch name {
 	case "doctor":
 		return runDoctorCommand(rest, stdout, stderr)
+	case "daemon":
+		return runDaemonCommand(rest, stdout, stderr)
 	case "plan", "copy", "sync":
 		return runTransferCommand(name, rest, stdout, stderr)
 	case "resume", "status":

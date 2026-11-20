@@ -12,6 +12,7 @@ BINDIR ?= $(PREFIX)/bin
 
 build:
 	$(GO) build -ldflags "$(LDFLAGS)" -o bin/catsync ./cmd/catsync
+	$(GO) build -ldflags "$(LDFLAGS)" -o bin/catsyncd ./cmd/catsyncd
 
 test:
 	$(GO) test ./...
@@ -31,9 +32,11 @@ platforms:
 cross:
 	@for target in $(PLATFORMS); do \
 	  os=$${target%/*}; arch=$${target#*/}; \
-	  echo "GOOS=$$os GOARCH=$$arch go build -o dist/catsync-$$os-$$arch"; \
+	  echo "GOOS=$$os GOARCH=$$arch go build catsync catsyncd"; \
 	  GOOS=$$os GOARCH=$$arch $(GO) build -ldflags "$(LDFLAGS)" \
 	    -o dist/catsync-$$os-$$arch ./cmd/catsync || exit 1; \
+	  GOOS=$$os GOARCH=$$arch $(GO) build -ldflags "$(LDFLAGS)" \
+	    -o dist/catsyncd-$$os-$$arch ./cmd/catsyncd || exit 1; \
 	done
 
 # release builds the same binaries into versioned, checksummed archives that the
@@ -48,6 +51,7 @@ release:
 	  mkdir -p "$$dir"; \
 	  echo "building $$name"; \
 	  GOOS=$$os GOARCH=$$arch $(GO) build -ldflags "$(LDFLAGS)" -o "$$dir/catsync" ./cmd/catsync || exit 1; \
+	  GOOS=$$os GOARCH=$$arch $(GO) build -ldflags "$(LDFLAGS)" -o "$$dir/catsyncd" ./cmd/catsyncd || exit 1; \
 	  cp LICENSE README.md "$$dir/" 2>/dev/null || cp LICENSE "$$dir/"; \
 	  tar -czf "dist/release/$$name.tar.gz" -C "dist/release" "$$name" || exit 1; \
 	  rm -rf "$$dir"; \
@@ -64,11 +68,12 @@ clean:
 install: build
 	@mkdir -p "$(DESTDIR)$(BINDIR)"
 	install -m 0755 bin/catsync "$(DESTDIR)$(BINDIR)/catsync"
-	@echo "installed $(DESTDIR)$(BINDIR)/catsync"
+	install -m 0755 bin/catsyncd "$(DESTDIR)$(BINDIR)/catsyncd"
+	@echo "installed $(DESTDIR)$(BINDIR)/catsync and catsyncd"
 	@case ":$$PATH:" in *":$(BINDIR):"*) ;; \
 	  *) echo "note: $(BINDIR) is not in PATH; add it with:"; \
 	     echo "      export PATH=\"$(BINDIR):$$PATH\"";; esac
 
 uninstall:
-	rm -f "$(DESTDIR)$(BINDIR)/catsync"
-	@echo "removed $(DESTDIR)$(BINDIR)/catsync"
+	rm -f "$(DESTDIR)$(BINDIR)/catsync" "$(DESTDIR)$(BINDIR)/catsyncd"
+	@echo "removed $(DESTDIR)$(BINDIR)/catsync and catsyncd"

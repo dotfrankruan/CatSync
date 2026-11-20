@@ -64,7 +64,8 @@ From source: `make install` (Go 1.23+), or `go install github.com/dotfrankruan/C
 
 Pushing a `v*` tag runs the release workflow: it re-runs the full check suite,
 builds `linux/amd64`, `linux/arm64`, `darwin/amd64`, and `darwin/arm64`
-archives with the tag baked in, and publishes them with `SHA256SUMS` and
+archives containing `catsync` and the one-shot `catsyncd` agent, with the tag
+baked in, and publishes them with `SHA256SUMS` and
 generated notes on the GitHub releases page.
 
 ```sh
@@ -79,7 +80,7 @@ tag and bumping the Homebrew formula.
 ## Quick start
 
 ```sh
-make install            # builds and installs to ~/.local/bin/catsync
+make install            # builds and installs catsync and catsyncd to ~/.local/bin
 catsync doctor          # check ssh and rsync
 
 catsync plan ./data user@host:/srv/data       # what would be transferred
