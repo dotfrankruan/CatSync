@@ -50,3 +50,12 @@ jobs:
 
       - name: Cross build
         run: make cross
+
+      - name: Verify cross-built binaries
+        run: |
+          for cpu in amd64 arm64; do
+            for os in linux darwin; do
+              test -x "dist/catsync-${os}-${cpu}"
+              test -x "dist/catsyncd-${os}-${cpu}"
+            done
+          done

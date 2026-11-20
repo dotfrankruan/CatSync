@@ -573,3 +573,33 @@ func TestDaemonMirrorDeletesExtraneous(t *testing.T) {
 		t.Errorf("mirror did not delete the extraneous remote file: %v", err)
 	}
 }
+
+func TestDaemonForwardTargets(t *testing.T) {
+	cfg := Config{Transport: "daemon", DaemonBootstrap: "ssh-forward", DaemonPort: 43411}
+	e := &Executor{cfg: cfg}
+	listen, addr, port, err := e.daemonBootstrapTargets()
+	if err != nil {
+		t.Fatalf("forward targets: %v", err)
+	}
+	if listen != "127.0.0.1:43411" {
+		t.Errorf("listen = %q", listen)
+	}
+	if port < 1 || port > 65535 || addr != fmt.Sprintf("127.0.0.1:%d", port) {
+		t.Errorf("forward port=%d addr=%q", port, addr)
+	}
+	bad := []Config{
+		{Transport: "daemon", DaemonBootstrap: "ssh-forward", DaemonPort: 0},
+		{Transport: "daemon", DaemonBootstrap: "ssh-forward", DaemonPort: 43411, DaemonListen: "0.0.0.0:43411"},
+	}
+	for _, c := range bad {
+		ec := &Executor{cfg: c}
+		if _, _, _, err := ec.daemonBootstrapTargets(); err == nil {
+			t.Errorf("accepted invalid forward config %+v", c)
+		}
+	}
+	direct := &Executor{cfg: Config{Transport: "daemon", DaemonBootstrap: "direct", DaemonPort: 0}}
+	l, a, p, err := direct.daemonBootstrapTargets()
+	if err != nil || p != 0 || l != ":0" || a != "" {
+		t.Errorf("direct targets = %q %q %d %v", l, a, p, err)
+	}
+}

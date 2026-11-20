@@ -25,6 +25,18 @@ gh run list --workflow=release.yml
 gh release view v0.1.0
 ```
 
+## 1b. Verify the archives
+
+`make release` writes one archive per platform; each must contain both
+`catsync` and `catsyncd` at the archive root. CI and the release workflow
+check this automatically. If the Homebrew formula is updated, it must install
+both binaries and test both `catsync version` and `catsyncd version`.
+
+The repository ships `packaging/homebrew/catsync.rb` as the formula source
+with hash placeholders and `packaging/homebrew/render.sh` to fill them from
+`dist/release/SHA256SUMS`. Publishing to the tap is a separate, manual step
+and is not performed by CatSync.
+
 ## 2. Bump the Homebrew formula
 
 The formula pins the release URLs and their SHA-256 values, so it must be

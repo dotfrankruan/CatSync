@@ -414,7 +414,6 @@ func TestDaemonTransportFlagValidation(t *testing.T) {
 	}{
 		{[]string{"--transport", "bogus"}, "--transport"},
 		{[]string{"--daemon-transport", "quic"}, "not implemented yet"},
-		{[]string{"--daemon-bootstrap", "ssh-forward"}, "not implemented yet"},
 		{[]string{"--daemon-port", "70000"}, "--daemon-port"},
 	}
 	for _, tc := range cases {
@@ -432,9 +431,21 @@ func TestDaemonTransportFlagValidation(t *testing.T) {
 	// runtime error only for bogus transport values, so use a fake ssh that
 	// fails fast while still proving the flag set is accepted).
 	t.Setenv("CATSYNC_SSH", filepath.Join(t.TempDir(), "no-ssh"))
-	code, _, stderr := run(t, "plan", "--transport", "daemon", "--daemon-port", "0",
-		"--remote-catsyncd", "/opt/catsyncd", "--state-dir", t.TempDir(), src, "host:/data")
-	if code == ExitUsage {
-		t.Errorf("valid daemon flags rejected: %s", stderr)
+	for _, extra := range [][]string{
+		{"--transport", "daemon", "--daemon-port", "0", "--remote-catsyncd", "/opt/catsyncd"},
+		{"--transport", "daemon", "--daemon-bootstrap", "ssh-forward", "--daemon-port", "43411"},
+	} {
+		args := append([]string{"plan"}, extra...)
+		args = append(args, "--state-dir", t.TempDir(), src, "host:/data")
+		code, _, stderr := run(t, args...)
+		if code == ExitUsage {
+			t.Errorf("valid daemon flags %v rejected: %s", extra, stderr)
+		}
+	}
+	// ssh-forward with an ephemeral port cannot work.
+	code, _, stderr := run(t, "plan", "--transport", "daemon", "--daemon-bootstrap", "ssh-forward",
+		"--daemon-port", "0", "--state-dir", t.TempDir(), src, "host:/data")
+	if code != ExitUsage || !strings.Contains(stderr, "fixed --daemon-port") {
+		t.Errorf("ssh-forward with port 0: exit=%d stderr=%q", code, stderr)
 	}
 }

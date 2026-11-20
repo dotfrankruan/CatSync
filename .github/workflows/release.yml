@@ -36,6 +36,15 @@ jobs:
       - name: Build release archives
         run: make release VERSION="${{ github.ref_name }}"
 
+      - name: Verify release archives
+        run: |
+          for archive in dist/release/*.tar.gz; do
+            tar -tzf "$archive" | grep -q '/catsync$'
+            tar -tzf "$archive" | grep -q '/catsyncd$'
+          done
+          # Every archive must have a checksum entry.
+          (cd dist/release && sha256sum -c SHA256SUMS)
+
       - name: Publish the GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

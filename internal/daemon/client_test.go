@@ -72,3 +72,40 @@ func TestManifestRejectsMissingEndAndRecordsAfterEnd(t *testing.T) {
 		})
 	}
 }
+
+func TestSSHTransportForwardCommand(t *testing.T) {
+	tr := SSHTransport{Host: "h", User: "u", Listen: "127.0.0.1:43411", ForwardLocalPort: 49001}
+	argv, err := tr.command()
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(argv, " ")
+	if !strings.Contains(joined, "-o ExitOnForwardFailure=yes") {
+		t.Errorf("argv lacks ExitOnForwardFailure: %v", argv)
+	}
+	if !strings.Contains(joined, "-L 127.0.0.1:49001:127.0.0.1:43411") {
+		t.Errorf("argv lacks forwarding spec: %v", argv)
+	}
+	last := argv[len(argv)-1]
+	if !strings.Contains(last, "127.0.0.1:43411") || !strings.Contains(last, "serve --once --listen") {
+		t.Errorf("remote command is not loopback-bound: %v", argv)
+	}
+	direct := SSHTransport{Host: "h", Listen: "127.0.0.1:43411"}
+	dargv, err := direct.command()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.Join(dargv, " "), "-L ") {
+		t.Errorf("direct transport forwarded unexpectedly: %v", dargv)
+	}
+	bad := []SSHTransport{
+		{Host: "h", Listen: "0.0.0.0:43411", ForwardLocalPort: 49001},
+		{Host: "h", Listen: "127.0.0.1:0", ForwardLocalPort: 49001},
+		{Host: "h", Listen: "127.0.0.1:43411", ForwardLocalPort: 70000},
+	}
+	for _, b := range bad {
+		if _, err := b.command(); err == nil {
+			t.Errorf("accepted invalid forward transport %+v", b)
+		}
+	}
+}

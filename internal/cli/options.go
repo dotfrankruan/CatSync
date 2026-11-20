@@ -171,7 +171,12 @@ func (o *Options) validateDaemonFlags() error {
 	switch o.DaemonBootstrap {
 	case "direct":
 	case "ssh-forward":
-		return fmt.Errorf("--daemon-bootstrap ssh-forward is not implemented yet; use direct")
+		if o.DaemonPort == 0 && o.Explicit["daemon-port"] {
+			return fmt.Errorf("--daemon-bootstrap ssh-forward needs a fixed --daemon-port; port 0 cannot be forwarded")
+		}
+		if o.DaemonTransport == "quic" {
+			return fmt.Errorf("--daemon-bootstrap ssh-forward is incompatible with --daemon-transport quic")
+		}
 	default:
 		return fmt.Errorf("--daemon-bootstrap %q is not valid: want direct or ssh-forward", o.DaemonBootstrap)
 	}

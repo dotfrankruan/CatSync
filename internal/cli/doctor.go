@@ -127,6 +127,11 @@ func runDoctor(stdout, stderr io.Writer, opts Options, timeout time.Duration) in
 	if !opts.Quiet {
 		fmt.Fprintln(stdout, "doctor: all required tools are available")
 	}
+	if opts.Verbose && !opts.Quiet {
+		fmt.Fprintln(stdout, "daemon transport: install catsyncd yourself on each remote host (CatSync never does);")
+		fmt.Fprintln(stdout, "                  remote native transfers need OpenSSH sftp-server, small batches and mirror need rsync")
+		fmt.Fprintln(stdout, "                  check a remote host with: catsync daemon probe USER@HOST")
+	}
 	return ExitOK
 }
 

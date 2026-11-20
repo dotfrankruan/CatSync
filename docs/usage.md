@@ -200,6 +200,79 @@ The default is `fail`: the run stops with an actionable message and stays
 resumable, so `catsync resume` continues later. The prompt is only shown on a
 terminal; without one the run fails instead of blocking.
 
+
+## Daemon transport (one-shot `catsyncd`)
+
+The historical transport opens one ssh connection per data stream and relies
+on remote `touch`, `test -ef`, `find`, shell quoting, and GNU coreutils for a
+few metadata operations. The optional daemon transport removes that
+dependency for the remote side and uses exactly one ssh session per run:
+
+```bash
+catsync plan --transport daemon ~/src user@host:/data
+catsync copy --transport daemon ~/src user@host:/data
+catsync resume --transport daemon <RUN_ID>
+```
+
+How it works:
+
+1. CatSync starts one ssh session that runs
+   `catsyncd serve --once --listen ...`. Nothing is installed automatically;
+   `catsyncd` must already exist on the remote host (`--remote-catsyncd PATH`
+   selects it).
+2. Both sides create a fresh ECDSA P-256 leaf certificate in memory and
+   exchange it over the authenticated ssh channel. They pin the exact peer
+   certificate, then open mutual TLS 1.3 connections with a run-specific
+   session id and nonces. Certificates, keys, and nonces are never stored in
+   run state, logs, or argv.
+3. All data plane traffic - native SFTP streams, rsync exec, manifest,
+   hash, stat, mkdir, metadata, samefile - uses those pinned mTLS
+   connections. Native transfers and `--jobs/--streams` semantics are
+   unchanged; the daemon server enforces its own connection budgets and
+   fails with `CONNECTION_LIMIT` before any write if the plan would exceed
+   them.
+4. When the run ends the client sends `bye`; the server drains, closes data
+   connections before terminating children, reports final counters, and
+   exits. Interrupted runs leave checkpoints and resume exactly as before;
+   resume creates new ephemeral identities and bootstraps a new one-shot
+   server.
+
+Options (also accepted by `resume` to override only the recorded values):
+
+| Flag | Meaning |
+| --- | --- |
+| `--transport=ssh|daemon` | Data transport. Default `ssh` on new runs; resume inherits the recorded value. |
+| `--daemon-port N` | Daemon TCP/UDP port. `0` requests an ephemeral port and is distinct from unset. Default 43411. |
+| `--daemon-transport tcp|quic` | `tcp` is implemented. `quic` is experimental and not available in this build; it is rejected explicitly. |
+| `--daemon-bootstrap direct|ssh-forward` | `direct` dials the mTLS port directly. `ssh-forward` uses the same ssh bootstrap process with `-L 127.0.0.1:<local>:127.0.0.1:<daemon-port>`; the inner connections are still mTLS. Requires a fixed non-zero port and a loopback listen address. |
+| `--remote-catsyncd PATH` | Name or absolute path of the remote `catsyncd`. CatSync never installs or uploads it. |
+| `--daemon-listen ADDR` | Value passed to `catsyncd serve --listen`. With ssh-forward it must be loopback. |
+| `--daemon-addr HOST:PORT` | Override the data connection address (advanced: proxies/NAT). |
+
+Prerequisites on the remote host: an executable `catsyncd`, a working
+OpenSSH `sftp-server` for native transfers, and (only if the plan contains
+small batches or mirror stages) `rsync`. `catsync daemon probe USER@HOST`
+runs the read-only capability probe over one ssh session and prints what the
+remote host can do; missing software is reported, never installed.
+
+Security and failure behavior:
+
+- The remote listener only binds after the client certificate is verified and
+  pinned. TLS requires 1.3, mutual authentication, the pinned leaf, and a
+  known ALPN. Unauthenticated or wrong-pin connections cannot execute an RPC
+  or start a child process.
+- `exec` only runs a fixed absolute `rsync` with a strictly validated
+  `--server` argument vector; no shell, arbitrary program, or environment
+  passthrough. See docs/architecture.md.
+- The ssh-forward mode keeps using ssh for transport, so data does travel
+  through the ssh process; the inner mTLS layer and pinning still apply.
+- QUIC is not implemented in this build. The flags and probe report it as
+  unavailable; do not plan around it yet.
+
+Non-UTF-8 file names are not representable in the daemon protocol: planning
+fails with `UNSUPPORTED_PATH_ENCODING` before any remote write. Use the
+default ssh transport for trees containing such names.
+
 ## Options
 
 | Flag | Default | Meaning |

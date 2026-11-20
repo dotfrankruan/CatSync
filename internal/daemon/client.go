@@ -48,16 +48,16 @@ type SSHTransport struct {
 	Listen         string // remote --listen value; default ":43411"
 	Env            []string
 	Stderr         io.Writer
+	// ForwardLocalPort enables ssh TCP forwarding for the bootstrap: the
+	// same ssh process also exposes 127.0.0.1:<ForwardLocalPort> and
+	// forwards it to the daemon's loopback listener.
+	ForwardLocalPort int
 }
 
-// Start implements ControlTransport.
-func (t SSHTransport) Start(ctx context.Context) (ControlSession, error) {
+// command builds the ssh argv for this transport.
+func (t SSHTransport) command() ([]string, error) {
 	if t.Host == "" {
 		return nil, protocol.NewError(protocol.CodeInvalidArgument, "bootstrap host is empty")
-	}
-	prog := t.Program
-	if prog == "" {
-		prog = "ssh"
 	}
 	remote := t.RemoteCatsyncd
 	if remote == "" {
@@ -67,7 +67,6 @@ func (t SSHTransport) Start(ctx context.Context) (ControlSession, error) {
 	if listen == "" {
 		listen = ":43411"
 	}
-	remoteCmd := discovery.ShellQuote(remote) + " serve --once --listen " + discovery.ShellQuote(listen)
 	args := []string{"-T"}
 	if t.IPv6 {
 		args = append(args, "-6")
@@ -75,11 +74,39 @@ func (t SSHTransport) Start(ctx context.Context) (ControlSession, error) {
 	if t.Port != 0 {
 		args = append(args, "-p", strconv.Itoa(t.Port))
 	}
+	if t.ForwardLocalPort != 0 {
+		if t.ForwardLocalPort < 1 || t.ForwardLocalPort > 65535 {
+			return nil, protocol.NewError(protocol.CodeInvalidArgument, "forward local port %d is outside 1..65535", t.ForwardLocalPort)
+		}
+		host, portStr, err := net.SplitHostPort(listen)
+		if err != nil || portStr == "0" || host != "127.0.0.1" {
+			return nil, protocol.NewError(protocol.CodeInvalidArgument, "ssh-forward requires a loopback fixed daemon listen address, got %q", listen)
+		}
+		if _, err := strconv.Atoi(portStr); err != nil {
+			return nil, protocol.NewError(protocol.CodeInvalidArgument, "ssh-forward daemon listen port is not numeric: %q", listen)
+		}
+		args = append(args, "-o", "ExitOnForwardFailure=yes",
+			"-L", fmt.Sprintf("127.0.0.1:%d:127.0.0.1:%s", t.ForwardLocalPort, portStr))
+	}
+	remoteCmd := discovery.ShellQuote(remote) + " serve --once --listen " + discovery.ShellQuote(listen)
 	who := t.Host
 	if t.User != "" {
 		who = t.User + "@" + t.Host
 	}
 	args = append(args, who, remoteCmd)
+	return args, nil
+}
+
+// Start implements ControlTransport.
+func (t SSHTransport) Start(ctx context.Context) (ControlSession, error) {
+	args, err := t.command()
+	if err != nil {
+		return nil, err
+	}
+	prog := t.Program
+	if prog == "" {
+		prog = "ssh"
+	}
 
 	clientTxR, clientTxW, err := os.Pipe()
 	if err != nil {
@@ -337,10 +364,27 @@ func Bootstrap(ctx context.Context, cfg BootstrapConfig) (*Client, error) {
 		},
 	}}
 	// After ACTIVE (never earlier) prove one pinned data connection works
-	// before any RPC or write is attempted.
-	dialCtx, cancel := context.WithTimeout(ctx, cfg.HandshakeTimeout)
-	conn, derr := dialTLS(dialCtx, dialAddr, httpTLS, protocol.ALPNHTTP)
-	cancel()
+	// before any RPC or write is attempted. With ssh forwarding the local
+	// forward may need a moment after active_ack, so retry within the
+	// handshake budget instead of failing on the first dial.
+	deadline := time.Now().Add(cfg.HandshakeTimeout)
+	var conn net.Conn
+	var derr error
+	for {
+		attemptCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		conn, derr = dialTLS(attemptCtx, dialAddr, httpTLS, protocol.ALPNHTTP)
+		cancel()
+		if derr == nil || time.Now().After(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			derr = ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+			continue
+		}
+		break
+	}
 	if derr != nil {
 		return fail(derr)
 	}

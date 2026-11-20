@@ -58,7 +58,31 @@ tar -xzf catsync_v0.1.0_darwin_arm64.tar.gz
 install -m 0755 catsync_v0.1.0_darwin_arm64/catsync ~/.local/bin/catsync
 ```
 
-From source: `make install` (Go 1.23+), or `go install github.com/dotfrankruan/CatSync/cmd/catsync@latest`.
+From source: `make install` (Go 1.23+; installs `catsync` and `catsyncd`),
+`go install github.com/dotfrankruan/CatSync/cmd/catsync@latest`, and separately
+`go install github.com/dotfrankruan/CatSync/cmd/catsyncd@latest` if you want the
+opt-in daemon transport.
+
+## Daemon transport (opt-in)
+
+CatSync can use a one-shot remote agent, `catsyncd`, instead of opening one
+ssh data channel per SFTP stream or rsync batch:
+
+```bash
+catsync copy --transport daemon ~/src user@host:/data
+```
+
+The run starts exactly one ssh bootstrap session. Over that authenticated
+channel the two sides exchange fresh in-memory ECDSA certificates, then use
+pinned mutual TLS 1.3 for the data plane (SFTP streams, rsync exec, RPC).
+The certificates and session nonces exist only for that run and are never
+written to disk or state. `catsyncd` must already be installed by you on the
+remote host and should be an absolute path or on the remote `PATH`; CatSync
+never downloads, copies, or installs it. Default behavior without
+`--transport daemon` is unchanged: plain ssh, exactly as before.
+
+See [docs/usage.md](docs/usage.md#daemon-transport-one-shot-catsyncd) for
+options, security model, resume behavior, and limitations.
 
 ## Releases
 

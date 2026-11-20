@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path"
 	"sort"
@@ -366,15 +367,16 @@ func (e *Executor) sshSFTPConfig() multistream.SFTPConfig {
 // daemonTransportOptions carries the SSH bootstrap command inputs. It is a
 // struct so tests can replace the transport factory.
 type daemonTransportOptions struct {
-	Program        string
-	User           string
-	Host           string
-	Port           int
-	IPv6           bool
-	RemoteCatsyncd string
-	Listen         string
-	Env            []string
-	Stderr         io.Writer
+	Program          string
+	User             string
+	Host             string
+	Port             int
+	IPv6             bool
+	RemoteCatsyncd   string
+	Listen           string
+	Env              []string
+	Stderr           io.Writer
+	ForwardLocalPort int
 }
 
 // newDaemonControlTransport builds the production SSH bootstrap transport.
@@ -383,7 +385,7 @@ var newDaemonControlTransport = func(o daemonTransportOptions) daemon.ControlTra
 	return daemon.SSHTransport{
 		Program: o.Program, User: o.User, Host: o.Host, Port: o.Port,
 		IPv6: o.IPv6, RemoteCatsyncd: o.RemoteCatsyncd, Listen: o.Listen,
-		Env: o.Env, Stderr: o.Stderr,
+		Env: o.Env, Stderr: o.Stderr, ForwardLocalPort: o.ForwardLocalPort,
 	}
 }
 
@@ -406,22 +408,24 @@ func (e *Executor) ensureRemote(ctx context.Context) (remoteOps, error) {
 	if e.daemonTransport() != "tcp" {
 		return nil, fmt.Errorf("%w: daemon transport %q is not implemented yet (only tcp)", ErrInvalidConfig, e.daemonTransport())
 	}
-	if e.daemonBootstrap() != "direct" {
-		return nil, fmt.Errorf("%w: daemon bootstrap %q is not implemented yet (only direct)", ErrInvalidConfig, e.daemonBootstrap())
-	}
 	endpoint := e.remoteEndpoint()
+	listen, daemonAddr, forwardLocalPort, err := e.daemonBootstrapTargets()
+	if err != nil {
+		return nil, err
+	}
 	opts := daemonTransportOptions{
 		Program: e.progs.sshProgram(), User: endpoint.User, Host: endpoint.Host,
 		Port: e.effectivePort(), IPv6: e.effectiveIPv6(),
 		RemoteCatsyncd: e.remoteCatsyncdName(),
-		Listen:         e.daemonListen(),
+		Listen:         listen,
 		Env:            e.cfg.Env, Stderr: e.stderr,
+		ForwardLocalPort: forwardLocalPort,
 	}
 	client, err := daemon.Bootstrap(ctx, daemon.BootstrapConfig{
 		Transport:  newDaemonControlTransport(opts),
 		Version:    "catsync",
 		Host:       endpoint.Host,
-		DaemonAddr: e.daemonAddr(),
+		DaemonAddr: daemonAddr,
 		Stderr:     e.stderr,
 	})
 	if err != nil {
@@ -711,6 +715,52 @@ func applyDaemonOverrides(run *state.Run, cfg Config) {
 	if set("daemon-addr") {
 		run.Config.DaemonAddr = cfg.DaemonAddr
 	}
+}
+
+// daemonBootstrapTargets resolves the listen address, the client dial
+// address, and (for ssh-forward) the local forwarding port.
+func (e *Executor) daemonBootstrapTargets() (listen, daemonAddr string, forwardPort int, err error) {
+	switch e.daemonBootstrap() {
+	case "direct":
+		return e.daemonListen(), e.daemonAddr(), 0, nil
+	case "ssh-forward":
+	default:
+		return "", "", 0, fmt.Errorf("%w: unknown daemon bootstrap %q", ErrInvalidConfig, e.daemonBootstrap())
+	}
+	if e.daemonTransport() != "tcp" {
+		return "", "", 0, fmt.Errorf("%w: ssh-forward is incompatible with daemon transport %q", ErrInvalidConfig, e.daemonTransport())
+	}
+	port := e.daemonPort()
+	if port == 0 {
+		return "", "", 0, fmt.Errorf("%w: ssh-forward needs a fixed --daemon-port (port 0 cannot be forwarded)", ErrInvalidConfig)
+	}
+	listen = fmt.Sprintf("127.0.0.1:%d", port)
+	if explicit := e.cfg.DaemonListen; explicit != "" {
+		host, _, herr := net.SplitHostPort(explicit)
+		if herr != nil || host != "127.0.0.1" {
+			return "", "", 0, fmt.Errorf("%w: ssh-forward requires --daemon-listen on loopback, got %q", ErrInvalidConfig, explicit)
+		}
+		listen = explicit
+	}
+	lp, lerr := freeTCPPort()
+	if lerr != nil {
+		return "", "", 0, fmt.Errorf("executor: choose forwarding port: %w", lerr)
+	}
+	return listen, fmt.Sprintf("127.0.0.1:%d", lp), lp, nil
+}
+
+// freeTCPPort reserves and releases a local loopback port for ssh -L. The
+// ssh option ExitOnForwardFailure makes a lost race a clean bootstrap error.
+func freeTCPPort() (int, error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	if err := ln.Close(); err != nil {
+		return 0, err
+	}
+	return port, nil
 }
 
 // ensureDaemonAgent starts the single per-run local rsh agent that bridges

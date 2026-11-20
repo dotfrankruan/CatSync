@@ -197,6 +197,59 @@ whose only copy state vanished. A resume-time recovery pass retires
 references left on durably completed tasks, and a fully successful run
 removes its per-run checkpoint directory.
 
+
+## Daemon transport
+
+The daemon transport is an opt-in alternative data path. The planner,
+backend selection, stages, checkpoint format, resume reconciliation, publish
+order, and progress accounting are unchanged; only the `remoteOps`
+implementation and backend transports differ.
+
+Bootstrap (one ssh session per run):
+
+```
+server_hello -> client_hello -> bind -> ready -> ready_ack -> active_ack
+```
+
+Both sides generate an ECDSA P-256 self-signed leaf per run. The client
+verifies the server leaf (EKU, validity) and pins its exact DER; the server
+does the same for the client. The listener is created only after the client
+identity is verified and pinned; the accept loop starts only after
+`active_ack`. Mutual TLS 1.3 with a single pinned certificate per side is
+used for every data connection. Frame/line bounds, duplicate-key rejection,
+unknown-field rejection, and version checks are enforced on all control and
+RPC JSON; any protocol violation closes the run instead of guessing.
+
+Data plane:
+
+- `catsync-http/1.1`: strict JSON RPC over mTLS. Six frozen operations:
+  manifest (three distinct modes: `dest_tree`, `source_tree`, `source_file`),
+  mkdir, metadata (mode and/or exact nanosecond mtime), streaming SHA-256,
+  stat, samefile. Streams are NDJSON and only a final `end{count}` record
+  makes a manifest/hash result valid; truncation, duplicates, unsorted
+  paths, count mismatches, and data after `end` fail the whole result.
+- `catsync-sftp/1`: a raw byte tunnel to a per-connection `sftp-server`
+  child, so each logical SFTP stream is a real OpenSSH SFTP session and the
+  native multistream backend keeps its `jobs x streams` semantics.
+- `catsync-exec/1`: one framed rsync server process per stream. The start
+  record names only `rsync`; arguments must be a `--server [--sender] ...
+  . <one absolute path>` shape with allowlisted flags, learned from real
+  rsync 3.5 golden argv. stdout/stderr/stdin are separate frames, exit codes
+  propagate, and cancellation or connection loss terminates and reaps the
+  child process group.
+
+Resource accounting is separated into RPC, SFTP, exec, and child counters.
+DRAINING closes the listener, rejects pending handshakes, waits boundedly
+for RPC, closes data connections before terminating children, reaps
+children, verifies zero counters, then sends `bye_ack`. A precheck failure
+or a resource-budget violation happens before any run state or remote data
+write.
+
+The local rsh agent bridges rsync's `-e "<catsync> rsh"` to the exec channel:
+a private 0700 directory, a 0600 Unix socket, same-uid peer credentials,
+and a random per-run token passed only through the environment. This is what
+keeps direct daemon mode at exactly one ssh session.
+
 ## Compatibility and limitations
 
 Program overrides (diagnostics and tests): `CATSYNC_SSH` and `CATSYNC_RSYNC`
