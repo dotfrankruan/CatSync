@@ -162,9 +162,7 @@ func (o *Options) validateDaemonFlags() error {
 		return fmt.Errorf("--daemon-port must be between 0 and 65535, got %d", o.DaemonPort)
 	}
 	switch o.DaemonTransport {
-	case "tcp":
-	case "quic":
-		return fmt.Errorf("--daemon-transport quic is not implemented yet; use tcp")
+	case "tcp", "quic":
 	default:
 		return fmt.Errorf("--daemon-transport %q is not valid: want tcp or quic", o.DaemonTransport)
 	}

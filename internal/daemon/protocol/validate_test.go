@@ -50,3 +50,13 @@ func TestHTTPStatus(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateRejectsInvalidUTF8(t *testing.T) {
+	bad := string([]byte{'x', 0xff, 'y'})
+	if err := ValidateRelPath(bad); err == nil || !strings.Contains(err.Error(), CodeUnsupportedPathEncoding) {
+		t.Errorf("ValidateRelPath(%q) = %v, want %s", bad, err, CodeUnsupportedPathEncoding)
+	}
+	if err := ValidateAbsPath("/" + bad); err == nil || !strings.Contains(err.Error(), CodeUnsupportedPathEncoding) {
+		t.Errorf("ValidateAbsPath = %v, want %s", err, CodeUnsupportedPathEncoding)
+	}
+}

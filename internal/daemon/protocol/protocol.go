@@ -171,6 +171,11 @@ type Limits struct {
 	MaxControlConns     int `json:"max_control_conns"`
 	MaxPendingHandshake int `json:"max_pending_handshakes"`
 	MaxConns            int `json:"max_conns"`
+	// QUIC stream budgets (M5). Zero means the TCP-style defaults.
+	MaxSFTPStreams    int `json:"max_sftp_streams,omitempty"`
+	MaxExecStreams    int `json:"max_exec_streams,omitempty"`
+	MaxControlStreams int `json:"max_control_streams,omitempty"`
+	MaxQUICStreams    int `json:"max_quic_streams,omitempty"`
 }
 
 // ValidateAbsPath checks an absolute remote path: valid UTF-8, no NUL,

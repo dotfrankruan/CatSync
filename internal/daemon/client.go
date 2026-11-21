@@ -17,6 +17,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/quic-go/quic-go"
+
 	"github.com/dotfrankruan/CatSync/internal/daemon/protocol"
 	"github.com/dotfrankruan/CatSync/internal/daemon/strictjson"
 	"github.com/dotfrankruan/CatSync/internal/discovery"
@@ -52,6 +54,9 @@ type SSHTransport struct {
 	// same ssh process also exposes 127.0.0.1:<ForwardLocalPort> and
 	// forwards it to the daemon's loopback listener.
 	ForwardLocalPort int
+	// DaemonTransport is "tcp" (default) or "quic"; quic makes the remote
+	// catsyncd bind UDP instead of TCP.
+	DaemonTransport string
 }
 
 // command builds the ssh argv for this transport.
@@ -89,6 +94,9 @@ func (t SSHTransport) command() ([]string, error) {
 			"-L", fmt.Sprintf("127.0.0.1:%d:127.0.0.1:%s", t.ForwardLocalPort, portStr))
 	}
 	remoteCmd := discovery.ShellQuote(remote) + " serve --once --listen " + discovery.ShellQuote(listen)
+	if t.DaemonTransport == "quic" {
+		remoteCmd += " --transport quic"
+	}
 	who := t.Host
 	if t.User != "" {
 		who = t.User + "@" + t.Host
@@ -209,6 +217,13 @@ type BootstrapConfig struct {
 	Stderr    io.Writer
 	// Host is the dial host for the data connection (the SSH target host).
 	Host string
+	// DataTransport is "tcp" (default) or "quic". QUIC uses one connection
+	// and multiplexed streams; TCP keeps the per-connection TLS model.
+	DataTransport string
+	// QUIC receive windows override the tested defaults when non-zero.
+	QUICInitialStreamWindow uint64
+	QUICMaxStreamWindow     uint64
+	QUICMaxConnWindow       uint64
 	// DaemonAddr optionally overrides the data address as host:port.
 	DaemonAddr string
 
@@ -226,11 +241,14 @@ type Client struct {
 	reader *controlReader
 	writer *controlWriter
 
-	dialAddr string
-	httpTLS  *tls.Config
-	sftpTLS  *tls.Config
-	execTLS  *tls.Config
-	http     *http.Client
+	dialAddr  string
+	transport string
+	httpTLS   *tls.Config
+	sftpTLS   *tls.Config
+	execTLS   *tls.Config
+	quicTLS   *tls.Config
+	quicConn  *quic.Conn
+	http      *http.Client
 
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -322,7 +340,11 @@ func Bootstrap(ctx context.Context, cfg BootstrapConfig) (*Client, error) {
 	if ready.ServerNonce != hello.ServerNonce || ready.ClientNonce != clientNonce {
 		return fail(protocol.NewError(protocol.CodeBootstrapProtocolError, "ready did not bind both nonces"))
 	}
-	wantSession := sessionID(serverDER, clientPair.der, hello.ServerNonce, clientNonce, "tcp")
+	transport := cfg.DataTransport
+	if transport == "" {
+		transport = "tcp"
+	}
+	wantSession := sessionID(serverDER, clientPair.der, hello.ServerNonce, clientNonce, transport)
 	if ready.SessionID != wantSession {
 		return fail(protocol.NewError(protocol.CodeBootstrapProtocolError, "ready session id does not match the exchanged material"))
 	}
@@ -357,6 +379,31 @@ func Bootstrap(ctx context.Context, cfg BootstrapConfig) (*Client, error) {
 
 	c.hello, c.ready = *hello, *ready
 	c.dialAddr, c.httpTLS, c.sftpTLS, c.execTLS = dialAddr, httpTLS, sftpTLS, execTLS
+	c.transport = cfg.DataTransport
+	if c.transport == "" {
+		c.transport = "tcp"
+	}
+	if c.transport != "tcp" && c.transport != "quic" {
+		return fail(protocol.NewError(protocol.CodeInvalidArgument, "unknown data transport %q", c.transport))
+	}
+	if c.transport == "quic" {
+		qTLS := clientTLSConfig(clientPair, serverCert, []string{protocol.ALPNQUIC})
+		c.quicTLS = qTLS
+		dialCtx, cancel := context.WithTimeout(ctx, cfg.HandshakeTimeout)
+		qc, derr := quic.DialAddr(dialCtx, dialAddr, qTLS, quicClientConfig(cfg))
+		cancel()
+		if derr != nil {
+			return fail(derr)
+		}
+		c.quicConn = qc
+		c.ctx, c.cancel = context.WithCancel(ctx)
+		// Prove the authenticated control stream works before planning.
+		if _, err := c.Stat(ctx, "/"); err != nil {
+			return fail(fmt.Errorf("daemon: QUIC control precheck: %w", err))
+		}
+		c.startBackground(cfg)
+		return c, nil
+	}
 	c.http = &http.Client{Transport: &http.Transport{
 		DisableKeepAlives: true,
 		DialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
@@ -492,6 +539,9 @@ func (c *Client) cleanup() {
 			}
 			c.http.CloseIdleConnections()
 		}
+		if c.quicConn != nil {
+			_ = c.quicConn.CloseWithError(0, "client closing")
+		}
 		if c.sess != nil {
 			waitCtx, cancel := context.WithTimeout(context.Background(), defaultCloseTimeout)
 			defer cancel()
@@ -569,6 +619,9 @@ func wrapBootstrapError(err error, sess ControlSession) error {
 
 // post performs one JSON RPC call.
 func (c *Client) post(ctx context.Context, path string, req, out any) error {
+	if c.transport == "quic" {
+		return c.quicPost(ctx, path, req, out)
+	}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return protocol.NewError(protocol.CodeInternal, "encode request: %v", err)
@@ -608,6 +661,14 @@ func (c *Client) post(ctx context.Context, path string, req, out any) error {
 // streamNDJSON posts a request and consumes typed NDJSON records. It returns
 // only after a valid end record; a missing end is an integrity failure.
 func (c *Client) streamNDJSON(ctx context.Context, path string, req any, onRecord func(kind string, line []byte) error) (int, error) {
+	if c.transport == "quic" {
+		st, err := c.quicStreamRequest(ctx, path, req)
+		if err != nil {
+			return 0, err
+		}
+		defer st.Close()
+		return consumeNDJSON(c, newQuicStreamBody(st), path, onRecord)
+	}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return 0, protocol.NewError(protocol.CodeInternal, "encode request: %v", err)
@@ -631,7 +692,13 @@ func (c *Client) streamNDJSON(ctx context.Context, path string, req any, onRecor
 		}
 		return 0, protocol.NewError(protocol.CodeInternal, "rpc %s: HTTP %d", path, resp.StatusCode)
 	}
-	br := bufio.NewReaderSize(resp.Body, 4096)
+	return consumeNDJSON(c, resp.Body, path, onRecord)
+}
+
+// consumeNDJSON validates one NDJSON stream. It requires a final end record
+// and rejects truncation, records after end, and count mismatches.
+func consumeNDJSON(c *Client, body io.ReadCloser, path string, onRecord func(kind string, line []byte) error) (int, error) {
+	br := bufio.NewReaderSize(body, 4096)
 	count := -1
 	for {
 		line, readErr := readStreamLine(br)
@@ -836,6 +903,11 @@ func (c *Client) SameFile(ctx context.Context, a, b string) (bool, error) {
 }
 
 // DialSFTP opens one SFTP data connection with the negotiated sftp ALPN.
-func (c *Client) DialSFTP(ctx context.Context) (net.Conn, error) {
+// DialSFTP opens one independent SFTP data stream. TCP uses a fresh pinned
+// TLS connection; QUIC opens a stream on the single run connection.
+func (c *Client) DialSFTP(ctx context.Context) (io.ReadWriteCloser, error) {
+	if c.transport == "quic" {
+		return c.openQUICStream(ctx, protocol.StreamSFTP)
+	}
 	return dialTLS(ctx, c.dialAddr, c.sftpTLS, protocol.ALPNSFTP)
 }

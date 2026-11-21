@@ -377,6 +377,7 @@ type daemonTransportOptions struct {
 	Env              []string
 	Stderr           io.Writer
 	ForwardLocalPort int
+	DaemonTransport  string
 }
 
 // newDaemonControlTransport builds the production SSH bootstrap transport.
@@ -386,6 +387,7 @@ var newDaemonControlTransport = func(o daemonTransportOptions) daemon.ControlTra
 		Program: o.Program, User: o.User, Host: o.Host, Port: o.Port,
 		IPv6: o.IPv6, RemoteCatsyncd: o.RemoteCatsyncd, Listen: o.Listen,
 		Env: o.Env, Stderr: o.Stderr, ForwardLocalPort: o.ForwardLocalPort,
+		DaemonTransport: o.DaemonTransport,
 	}
 }
 
@@ -405,8 +407,10 @@ func (e *Executor) ensureRemote(ctx context.Context) (remoteOps, error) {
 	default:
 		return nil, fmt.Errorf("%w: unknown transport %q", ErrInvalidConfig, e.effectiveTransport())
 	}
-	if e.daemonTransport() != "tcp" {
-		return nil, fmt.Errorf("%w: daemon transport %q is not implemented yet (only tcp)", ErrInvalidConfig, e.daemonTransport())
+	switch e.daemonTransport() {
+	case "tcp", "quic":
+	default:
+		return nil, fmt.Errorf("%w: unknown daemon transport %q", ErrInvalidConfig, e.daemonTransport())
 	}
 	endpoint := e.remoteEndpoint()
 	listen, daemonAddr, forwardLocalPort, err := e.daemonBootstrapTargets()
@@ -420,13 +424,15 @@ func (e *Executor) ensureRemote(ctx context.Context) (remoteOps, error) {
 		Listen:         listen,
 		Env:            e.cfg.Env, Stderr: e.stderr,
 		ForwardLocalPort: forwardLocalPort,
+		DaemonTransport:  e.daemonTransport(),
 	}
 	client, err := daemon.Bootstrap(ctx, daemon.BootstrapConfig{
-		Transport:  newDaemonControlTransport(opts),
-		Version:    "catsync",
-		Host:       endpoint.Host,
-		DaemonAddr: daemonAddr,
-		Stderr:     e.stderr,
+		Transport:     newDaemonControlTransport(opts),
+		Version:       "catsync",
+		Host:          endpoint.Host,
+		DaemonAddr:    daemonAddr,
+		DataTransport: e.daemonTransport(),
+		Stderr:        e.stderr,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("executor: daemon bootstrap: %w", err)
@@ -530,14 +536,18 @@ func (e *Executor) precheckDaemon(out *PlanOutcome) error {
 		execPeak++
 	}
 	lim := client.Limits()
-	if err := e.checkCapacity("SFTP", sfwPeak, lim.MaxSFTPConns); err != nil {
+	sftpLimit, execLimit := lim.MaxSFTPConns, lim.MaxExecConns
+	if e.daemonTransport() == "quic" {
+		sftpLimit, execLimit = lim.MaxSFTPStreams, lim.MaxExecStreams
+	}
+	if err := e.checkCapacity("SFTP", sfwPeak, sftpLimit); err != nil {
 		return err
 	}
 	if sfwPeak > 0 && !client.Features().SFTP {
 		return fmt.Errorf("%w: the remote daemon has no sftp-server; install OpenSSH's sftp-server on the remote host", protocolError(protocol.CodeFeatureUnavailable))
 	}
 	if needExec {
-		if err := e.checkCapacity("exec", execPeak, lim.MaxExecConns); err != nil {
+		if err := e.checkCapacity("exec", execPeak, execLimit); err != nil {
 			return err
 		}
 		if !client.Features().Exec {
@@ -594,14 +604,18 @@ func (e *Executor) precheckDaemonRun(run *state.Run) error {
 		execPeak++
 	}
 	lim := client.Limits()
-	if err := e.checkCapacity("SFTP", sfwPeak, lim.MaxSFTPConns); err != nil {
+	sftpLimit, execLimit := lim.MaxSFTPConns, lim.MaxExecConns
+	if e.daemonTransport() == "quic" {
+		sftpLimit, execLimit = lim.MaxSFTPStreams, lim.MaxExecStreams
+	}
+	if err := e.checkCapacity("SFTP", sfwPeak, sftpLimit); err != nil {
 		return err
 	}
 	if sfwPeak > 0 && !client.Features().SFTP {
 		return fmt.Errorf("%w: the remote daemon has no sftp-server", protocolError(protocol.CodeFeatureUnavailable))
 	}
 	if needExec {
-		if err := e.checkCapacity("exec", execPeak, lim.MaxExecConns); err != nil {
+		if err := e.checkCapacity("exec", execPeak, execLimit); err != nil {
 			return err
 		}
 		if !client.Features().Exec {

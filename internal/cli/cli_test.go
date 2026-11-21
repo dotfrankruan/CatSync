@@ -413,7 +413,6 @@ func TestDaemonTransportFlagValidation(t *testing.T) {
 		want string
 	}{
 		{[]string{"--transport", "bogus"}, "--transport"},
-		{[]string{"--daemon-transport", "quic"}, "not implemented yet"},
 		{[]string{"--daemon-port", "70000"}, "--daemon-port"},
 	}
 	for _, tc := range cases {
@@ -434,6 +433,7 @@ func TestDaemonTransportFlagValidation(t *testing.T) {
 	for _, extra := range [][]string{
 		{"--transport", "daemon", "--daemon-port", "0", "--remote-catsyncd", "/opt/catsyncd"},
 		{"--transport", "daemon", "--daemon-bootstrap", "ssh-forward", "--daemon-port", "43411"},
+		{"--transport", "daemon", "--daemon-transport", "quic", "--daemon-port", "0"},
 	} {
 		args := append([]string{"plan"}, extra...)
 		args = append(args, "--state-dir", t.TempDir(), src, "host:/data")

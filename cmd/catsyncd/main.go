@@ -72,6 +72,7 @@ func runProbe(args []string) int {
 		fmt.Printf("  sftp: %v  exec: %v  manifest: %v  metadata: %v  hash: %v  stat: %v  samefile: %v\n",
 			report.Features.SFTP, report.Features.Exec, report.Features.Manifest,
 			report.Features.Metadata, report.Features.Hash, report.Features.Stat, report.Features.SameFile)
+		fmt.Printf("  transports: tcp, quic (experimental; UDP, no 0-RTT)\n")
 		fmt.Printf("  sftp-server: %q\n  rsync: %q\n  notes: %s\n", report.Details.SFTPServer, report.Details.Rsync, report.Details.Notes)
 		return 0
 	}
@@ -88,7 +89,10 @@ func runServe(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	once := fs.Bool("once", false, "serve exactly one bootstrap session and exit (required)")
-	listen := fs.String("listen", ":43411", "TCP listen address; port 0 selects an ephemeral port")
+	listen := fs.String("listen", ":43411", "listen address; port 0 selects an ephemeral port")
+	transport := fs.String("transport", "tcp", "data transport: tcp or quic (UDP)")
+	quicStreamWindow := fs.Uint64("quic-stream-window", 0, "QUIC max stream receive window in bytes (0 = tested default)")
+	quicConnWindow := fs.Uint64("quic-conn-window", 0, "QUIC max connection receive window in bytes (0 = tested default)")
 	sftpServer := fs.String("sftp-server", "", "path to the OpenSSH sftp-server executable")
 	rsyncPath := fs.String("rsync", "", "path to the rsync executable used by the exec channel")
 	maxSFTP := fs.Int("max-sftp-conns", 64, "maximum concurrent SFTP connections")
@@ -111,24 +115,33 @@ func runServe(args []string) int {
 		fmt.Fprintln(os.Stderr, "catsyncd: serve requires --once; catsyncd is not a persistent service")
 		return 2
 	}
+	switch *transport {
+	case "tcp", "quic":
+	default:
+		fmt.Fprintln(os.Stderr, "catsyncd: --transport must be tcp or quic")
+		return 2
+	}
 	requestedPort := portFromListen(*listen)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	code := daemon.Serve(ctx, daemon.ServerConfig{
-		Listen:           *listen,
-		RequestedPort:    requestedPort,
-		SFTPPath:         daemon.ResolveSFTPPath(*sftpServer),
-		RsyncPath:        daemon.ResolveRsyncPath(*rsyncPath),
-		Limits:           protocolLimits(*maxSFTP, *maxExec, *maxControl, *maxPending, *maxConns),
-		CertTTL:          *certTTL,
-		IdleTimeout:      *idle,
-		DrainTimeout:     *drain,
-		ControlTimeout:   *controlTimeout,
-		HandshakeTimeout: 10 * time.Second,
-		Version:          version,
-		Stdin:            os.Stdin,
-		Stdout:           os.Stdout,
-		Stderr:           os.Stderr,
+		Listen:              *listen,
+		RequestedPort:       requestedPort,
+		SFTPPath:            daemon.ResolveSFTPPath(*sftpServer),
+		RsyncPath:           daemon.ResolveRsyncPath(*rsyncPath),
+		Transport:           *transport,
+		QUICMaxStreamWindow: *quicStreamWindow,
+		QUICMaxConnWindow:   *quicConnWindow,
+		Limits:              protocolLimits(*maxSFTP, *maxExec, *maxControl, *maxPending, *maxConns),
+		CertTTL:             *certTTL,
+		IdleTimeout:         *idle,
+		DrainTimeout:        *drain,
+		ControlTimeout:      *controlTimeout,
+		HandshakeTimeout:    10 * time.Second,
+		Version:             version,
+		Stdin:               os.Stdin,
+		Stdout:              os.Stdout,
+		Stderr:              os.Stderr,
 	})
 	return code
 }

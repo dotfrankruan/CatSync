@@ -23,7 +23,7 @@ daemon on the remote side.
 
 | | |
 | --- | --- |
-| Local | Go 1.23+ to build. At runtime `ssh`, plus `rsync` for updated files and mirror sync; a copy that only adds files works with `ssh` alone. |
+| Local | Go 1.26+ to build. At runtime `ssh`, plus `rsync` for updated files and mirror sync; a copy that only adds files works with `ssh` alone. |
 | Remote | `rsync`, `sshd` with `sftp-server`, and GNU findutils. Native uploads additionally need OpenSSH ≥ 9.0 (fsync and `hardlink@openssh.com`) and GNU coreutils; native downloads need only SFTP and GNU findutils. |
 | Not required | No remote daemon and no extra tooling beyond the two programs above. |
 
@@ -58,7 +58,7 @@ tar -xzf catsync_v0.1.0_darwin_arm64.tar.gz
 install -m 0755 catsync_v0.1.0_darwin_arm64/catsync ~/.local/bin/catsync
 ```
 
-From source: `make install` (Go 1.23+; installs `catsync` and `catsyncd`),
+From source: `make install` (Go 1.26+; installs `catsync` and `catsyncd`),
 `go install github.com/dotfrankruan/CatSync/cmd/catsync@latest`, and separately
 `go install github.com/dotfrankruan/CatSync/cmd/catsyncd@latest` if you want the
 opt-in daemon transport.
@@ -75,6 +75,8 @@ catsync copy --transport daemon ~/src user@host:/data
 The run starts exactly one ssh bootstrap session. Over that authenticated
 channel the two sides exchange fresh in-memory ECDSA certificates, then use
 pinned mutual TLS 1.3 for the data plane (SFTP streams, rsync exec, RPC).
+An experimental QUIC data transport multiplexes all streams over one UDP
+connection (`--daemon-transport quic`, ALPN `catsync-quic/1`, no 0-RTT).
 The certificates and session nonces exist only for that run and are never
 written to disk or state. `catsyncd` must already be installed by you on the
 remote host and should be an absolute path or on the remote `PATH`; CatSync

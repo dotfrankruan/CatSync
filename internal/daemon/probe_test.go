@@ -13,6 +13,9 @@ func TestProbeFeaturesAreHonest(t *testing.T) {
 	if (r.Features.SFTP) != (r.Details.SFTPServer != "") {
 		t.Errorf("sftp feature %v does not match resolved path %q", r.Features.SFTP, r.Details.SFTPServer)
 	}
+	if len(r.Transports) != 2 || r.Transports[0] != "tcp" || r.Transports[1] != "quic" {
+		t.Errorf("transports = %v", r.Transports)
+	}
 	if r.Protocol != 1 || r.DefaultPort != DefaultPort {
 		t.Errorf("report = %+v", r)
 	}

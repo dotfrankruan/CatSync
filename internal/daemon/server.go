@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/quic-go/quic-go"
+
 	"github.com/dotfrankruan/CatSync/internal/daemon/protocol"
 )
 
@@ -30,8 +32,14 @@ type ServerConfig struct {
 	// RsyncPath is the resolved absolute rsync executable; empty disables
 	// the exec capability (the server never runs an unvalidated program).
 	RsyncPath string
+	// Transport selects the data plane: "" or "tcp" (default), or "quic".
+	Transport string
 	// Limits bounds concurrent work. Zero fields default.
 	Limits protocol.Limits
+	// QUIC flow-control windows. Zero selects tested defaults.
+	QUICInitialStreamWindow uint64
+	QUICMaxStreamWindow     uint64
+	QUICMaxConnWindow       uint64
 	// Manifest bounds traversal memory and stream size; zero fields default.
 	Manifest manifestConfig
 	// CertTTL is the ephemeral certificate lifetime.
@@ -89,6 +97,30 @@ func (c *ServerConfig) applyDefaults() {
 	if c.Limits.MaxConns <= 0 {
 		c.Limits.MaxConns = 256
 	}
+	if c.Transport == "" {
+		c.Transport = "tcp"
+	}
+	if c.Limits.MaxSFTPStreams <= 0 {
+		c.Limits.MaxSFTPStreams = 64
+	}
+	if c.Limits.MaxExecStreams <= 0 {
+		c.Limits.MaxExecStreams = 64
+	}
+	if c.Limits.MaxControlStreams <= 0 {
+		c.Limits.MaxControlStreams = 16
+	}
+	if c.Limits.MaxQUICStreams <= 0 {
+		c.Limits.MaxQUICStreams = c.Limits.MaxSFTPStreams + c.Limits.MaxExecStreams + c.Limits.MaxControlStreams
+	}
+	if c.QUICInitialStreamWindow == 0 {
+		c.QUICInitialStreamWindow = 4 << 20
+	}
+	if c.QUICMaxStreamWindow == 0 {
+		c.QUICMaxStreamWindow = 16 << 20
+	}
+	if c.QUICMaxConnWindow == 0 {
+		c.QUICMaxConnWindow = 64 << 20
+	}
 }
 
 // features reports only capabilities this build actually provides.
@@ -136,6 +168,16 @@ type server struct {
 	done         chan struct{}
 	final        countsSnapshot
 	drained      bool
+
+	// QUIC data plane (M5): one connection per run, independent stream
+	// budgets, and explicit stream-credit release.
+	transport   string
+	quicLn      *quic.Listener
+	quicConnMu  sync.Mutex
+	quicConn    *quic.Conn
+	quicSFTPSem chan struct{}
+	quicExecSem chan struct{}
+	quicCtrlSem chan struct{}
 }
 
 // Serve runs the one-shot bootstrap and, on success, serves until bye, a
@@ -197,17 +239,38 @@ func Serve(ctx context.Context, cfg ServerConfig) int {
 	}
 
 	// Only after the client identity is verified and pinned does the
-	// listener exist.
-	listener, err := net.Listen("tcp", cfg.Listen)
-	if err != nil {
-		return bootstrapFailure(writer, logf, protocol.NewError(protocol.CodePortInUse, "listen %s: %v", cfg.Listen, err))
-	}
-	defer listener.Close()
+	// listener exist. QUIC binds UDP at the same point and advertises its
+	// actual port in ready.
+	var (
+		listener   net.Listener
+		quicLn     *quic.Listener
+		quicProtos []string
+	)
 	actualPort := 0
-	if addr, ok := listener.Addr().(*net.TCPAddr); ok {
-		actualPort = addr.Port
+	switch cfg.Transport {
+	case "tcp":
+		listener, err = net.Listen("tcp", cfg.Listen)
+		if err != nil {
+			return bootstrapFailure(writer, logf, protocol.NewError(protocol.CodePortInUse, "listen %s: %v", cfg.Listen, err))
+		}
+		defer listener.Close()
+		if addr, ok := listener.Addr().(*net.TCPAddr); ok {
+			actualPort = addr.Port
+		}
+	case "quic":
+		quicProtos = []string{protocol.ALPNQUIC}
+		quicLn, err = quic.ListenAddr(cfg.Listen, serverTLSConfig(serverPair, clientCert, quicProtos), quicServerConfig(&cfg))
+		if err != nil {
+			return bootstrapFailure(writer, logf, protocol.NewError(protocol.CodePortInUse, "listen quic %s: %v", cfg.Listen, err))
+		}
+		defer quicLn.Close()
+		if addr, ok := quicLn.Addr().(*net.UDPAddr); ok {
+			actualPort = addr.Port
+		}
+	default:
+		return bootstrapFailure(writer, logf, protocol.NewError(protocol.CodeInvalidArgument, "unknown server transport %q", cfg.Transport))
 	}
-	session := sessionID(serverPair.der, clientDER, serverNonce, clientHello.ClientNonce, "tcp")
+	session := sessionID(serverPair.der, clientDER, serverNonce, clientHello.ClientNonce, cfg.Transport)
 	protos := enabledALPN(cfg.features())
 	ready := &readyMsg{
 		Type: msgReady, Protocol: protocol.Version, Port: actualPort,
@@ -238,27 +301,36 @@ func Serve(ctx context.Context, cfg ServerConfig) int {
 	defer cancel()
 	srv := &server{
 		cfg: cfg, ctx: serverCtx, cancel: cancel,
-		tlsConfig:  serverTLSConfig(serverPair, clientCert, protos),
-		listener:   listener,
-		pendingSem: make(chan struct{}, cfg.Limits.MaxPendingHandshake),
-		conns:      make(map[*trackedConn]struct{}),
-		pending:    make(map[net.Conn]struct{}),
-		children:   make(map[*childProcess]struct{}),
-		done:       make(chan struct{}),
+		tlsConfig:   serverTLSConfig(serverPair, clientCert, protos),
+		listener:    listener,
+		transport:   cfg.Transport,
+		quicLn:      quicLn,
+		pendingSem:  make(chan struct{}, cfg.Limits.MaxPendingHandshake),
+		conns:       make(map[*trackedConn]struct{}),
+		pending:     make(map[net.Conn]struct{}),
+		children:    make(map[*childProcess]struct{}),
+		done:        make(chan struct{}),
+		quicSFTPSem: make(chan struct{}, cfg.Limits.MaxSFTPStreams),
+		quicExecSem: make(chan struct{}, cfg.Limits.MaxExecStreams),
+		quicCtrlSem: make(chan struct{}, cfg.Limits.MaxControlStreams),
 	}
-	srv.httpLn = newChanListener(listener.Addr())
-	srv.http = &http.Server{
-		Handler:           srv.httpHandler(),
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}
-	go func() {
-		if err := srv.http.Serve(srv.httpLn); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
-			logf("http server: %v", err)
+	if cfg.Transport == "quic" {
+		go srv.quicAcceptLoop(logf)
+	} else {
+		srv.httpLn = newChanListener(listener.Addr())
+		srv.http = &http.Server{
+			Handler:           srv.httpHandler(),
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       60 * time.Second,
 		}
-	}()
-	go srv.acceptLoop(logf)
-	go srv.idleMonitor()
+		go func() {
+			if err := srv.http.Serve(srv.httpLn); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+				logf("http server: %v", err)
+			}
+		}()
+		go srv.acceptLoop(logf)
+		go srv.idleMonitor()
+	}
 
 	lastControl := &atomic.Int64{}
 	lastControl.Store(time.Now().UnixNano())
@@ -466,7 +538,12 @@ func (s *server) atCapacity() bool {
 func (s *server) shutdown(writer *controlWriter, logf func(string, ...any), graceful bool) {
 	s.shutdownOnce.Do(func() {
 		s.closedOnce.Do(func() {
-			_ = s.listener.Close()
+			if s.quicLn != nil {
+				_ = s.quicLn.Close()
+			}
+			if s.listener != nil {
+				_ = s.listener.Close()
+			}
 			s.cancel()
 		})
 		logf("draining: rpc=%d sftp=%d exec=%d children=%d", s.counters.rpcActive.Load(), s.counters.sftpConns.Load(), s.counters.execActive.Load(), s.counters.children.Load())
@@ -489,9 +566,18 @@ func (s *server) shutdown(writer *controlWriter, logf func(string, ...any), grac
 		for s.counters.rpcActive.Load() > 0 && time.Now().Before(rpcDeadline) {
 			time.Sleep(20 * time.Millisecond)
 		}
-		// 3. Close the HTTP server and every remaining data connection; this
-		// unblocks sftp-server children before they are reaped.
-		_ = s.http.Close()
+		// 3. Close the HTTP server / QUIC connection and every remaining data
+		// connection; this unblocks sftp-server children before they are
+		// reaped.
+		if s.http != nil {
+			_ = s.http.Close()
+		}
+		s.quicConnMu.Lock()
+		qc := s.quicConn
+		s.quicConnMu.Unlock()
+		if qc != nil {
+			_ = qc.CloseWithError(0, "server draining")
+		}
 		s.mu.Lock()
 		conns := make([]*trackedConn, 0, len(s.conns))
 		for c := range s.conns {

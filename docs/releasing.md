@@ -28,7 +28,8 @@ gh release view v0.1.0
 ## 1b. Verify the archives
 
 `make release` writes one archive per platform; each must contain both
-`catsync` and `catsyncd` at the archive root. CI and the release workflow
+`catsync` and `catsyncd` at the archive root. CI builds with the Go version
+declared in `go.mod` (1.26 or newer). CI and the release workflow
 check this automatically. If the Homebrew formula is updated, it must install
 both binaries and test both `catsync version` and `catsyncd version`.
 

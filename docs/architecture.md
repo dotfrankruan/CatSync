@@ -245,6 +245,22 @@ children, verifies zero counters, then sends `bye_ack`. A precheck failure
 or a resource-budget violation happens before any run state or remote data
 write.
 
+QUIC data plane (experimental): the same bootstrap runs `catsyncd serve
+--once --transport quic`, which binds UDP only after the client identity is
+verified and advertises the actual UDP port in `ready`. Both sides dial one
+QUIC connection (TLS 1.3 mutual auth, pinned leaf, ALPN `catsync-quic/1`,
+0-RTT disabled). The first byte of every client-opened stream selects
+CONTROL, SFTP, or EXEC; each type has its own budget semaphore and the
+connection advertises the sum so control streams always have reserved
+capacity. Stream credit release is explicit (`RequireStreamCreditRelease`)
+and every accepted stream calls `ReleaseStreamCredit`, including rejected
+types and budget failures. CONTROL uses length-prefixed JSON requests and
+status-prefixed responses (NDJSON for streaming RPCs); SFTP and EXEC reuse
+the exact TCP data-plane adapters. The QUIC connection is single-per-run;
+a second connection is refused, and losing the connection without `bye`
+terminates the server non-zero. Flow-control windows are configurable and
+tested with small windows as well as large transfers.
+
 The local rsh agent bridges rsync's `-e "<catsync> rsh"` to the exec channel:
 a private 0700 directory, a 0600 Unix socket, same-uid peer credentials,
 and a random per-run token passed only through the environment. This is what

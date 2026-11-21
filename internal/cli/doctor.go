@@ -131,6 +131,7 @@ func runDoctor(stdout, stderr io.Writer, opts Options, timeout time.Duration) in
 		fmt.Fprintln(stdout, "daemon transport: install catsyncd yourself on each remote host (CatSync never does);")
 		fmt.Fprintln(stdout, "                  remote native transfers need OpenSSH sftp-server, small batches and mirror need rsync")
 		fmt.Fprintln(stdout, "                  check a remote host with: catsync daemon probe USER@HOST")
+		fmt.Fprintln(stdout, "                  experimental QUIC data transport: --daemon-transport quic (UDP, direct bootstrap only)")
 	}
 	return ExitOK
 }

@@ -44,7 +44,7 @@ brew install catsync
 
 Prebuilt archives for linux/amd64, linux/arm64, darwin/amd64, and darwin/arm64
 are on the [releases page](https://github.com/dotfrankruan/CatSync/releases),
-each tag with a `SHA256SUMS` file. From source (Go 1.23+):
+each tag with a `SHA256SUMS` file. From source (Go 1.26+):
 
 ```sh
 make install        # -> ~/.local/bin/catsync
@@ -243,7 +243,7 @@ Options (also accepted by `resume` to override only the recorded values):
 | --- | --- |
 | `--transport=ssh|daemon` | Data transport. Default `ssh` on new runs; resume inherits the recorded value. |
 | `--daemon-port N` | Daemon TCP/UDP port. `0` requests an ephemeral port and is distinct from unset. Default 43411. |
-| `--daemon-transport tcp|quic` | `tcp` is implemented. `quic` is experimental and not available in this build; it is rejected explicitly. |
+| `--daemon-transport tcp|quic` | `tcp` (default) uses one pinned mTLS connection per data stream. `quic` (experimental) uses one UDP QUIC connection per run with multiplexed streams; ALPN is fixed to `catsync-quic/1`, 0-RTT is disabled, and stream budgets are enforced separately. |
 | `--daemon-bootstrap direct|ssh-forward` | `direct` dials the mTLS port directly. `ssh-forward` uses the same ssh bootstrap process with `-L 127.0.0.1:<local>:127.0.0.1:<daemon-port>`; the inner connections are still mTLS. Requires a fixed non-zero port and a loopback listen address. |
 | `--remote-catsyncd PATH` | Name or absolute path of the remote `catsyncd`. CatSync never installs or uploads it. |
 | `--daemon-listen ADDR` | Value passed to `catsyncd serve --listen`. With ssh-forward it must be loopback. |
@@ -266,8 +266,13 @@ Security and failure behavior:
   passthrough. See docs/architecture.md.
 - The ssh-forward mode keeps using ssh for transport, so data does travel
   through the ssh process; the inner mTLS layer and pinning still apply.
-- QUIC is not implemented in this build. The flags and probe report it as
-  unavailable; do not plan around it yet.
+- QUIC is experimental. It uses UDP on the same daemon port, requires a
+  direct bootstrap (not `ssh-forward`), and builds one QUIC connection with
+  independent CONTROL/SFTP/EXEC stream budgets (`catsyncd serve` exposes
+  `--quic-stream-window` and `--quic-conn-window`, plus per-type stream
+  limits). It keeps the same ephemeral certificate identities, pinning,
+  ALPN, and JSONL lifecycle as TCP; 0-RTT is never used. The probe reports
+  `transports: ["tcp", "quic"]`.
 
 Non-UTF-8 file names are not representable in the daemon protocol: planning
 fails with `UNSUPPORTED_PATH_ENCODING` before any remote write. Use the

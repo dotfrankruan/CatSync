@@ -76,31 +76,39 @@ func readExecFrame(r *bufio.Reader) (byte, []byte, error) {
 // stdin/stdout/stderr over the framed exec protocol.
 func (s *server) handleExecConn(conn net.Conn) {
 	tc := newTrackedConn(conn, s)
-	defer tc.Close()
-	if s.cfg.RsyncPath == "" {
-		s.writeExecError(tc, protocol.NewError(protocol.CodeFeatureUnavailable, "rsync exec is not available on this server"))
-		return
-	}
 	s.counters.execActive.Add(1)
 	defer s.counters.execActive.Add(-1)
+	s.serveExec(tc, func() { _ = tc.Close() })
+}
 
-	br := bufio.NewReaderSize(tc, 16*1024)
+// serveExec runs one validated rsync server child and bridges its
+// stdin/stdout/stderr over the framed exec protocol. It is shared by TCP
+// TLS connections and QUIC EXEC streams; closeFn releases the underlying
+// transport after the exit frame is written.
+func (s *server) serveExec(rw io.ReadWriter, closeFn func()) {
+	defer closeFn()
+	if s.cfg.RsyncPath == "" {
+		s.writeExecError(rw, protocol.NewError(protocol.CodeFeatureUnavailable, "rsync exec is not available on this server"))
+		return
+	}
+
+	br := bufio.NewReaderSize(rw, 16*1024)
 	line, err := readExecStartLine(br)
 	if err != nil {
-		s.writeExecError(tc, err)
+		s.writeExecError(rw, err)
 		return
 	}
 	var start protocol.ExecStart
 	if err := strictjson.Decode(line, &start, strictjson.Limits{MaxBytes: protocol.MaxExecStartBytes, MaxDepth: 8}); err != nil {
-		s.writeExecError(tc, protocol.NewError(protocol.CodeJSONTypeMismatch, "exec start: %v", err))
+		s.writeExecError(rw, protocol.NewError(protocol.CodeJSONTypeMismatch, "exec start: %v", err))
 		return
 	}
 	if start.Type != "start" {
-		s.writeExecError(tc, protocol.NewError(protocol.CodeExecRejected, "exec start type is %q", start.Type))
+		s.writeExecError(rw, protocol.NewError(protocol.CodeExecRejected, "exec start type is %q", start.Type))
 		return
 	}
 	if err := protocol.ValidateExecStart(start.Program, start.Args); err != nil {
-		s.writeExecError(tc, err)
+		s.writeExecError(rw, err)
 		return
 	}
 
@@ -109,21 +117,21 @@ func (s *server) handleExecConn(conn net.Conn) {
 	configureChild(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		s.writeExecError(tc, protocol.NewError(protocol.CodeInternal, "exec stdin: %v", err))
+		s.writeExecError(rw, protocol.NewError(protocol.CodeInternal, "exec stdin: %v", err))
 		return
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		s.writeExecError(tc, protocol.NewError(protocol.CodeInternal, "exec stdout: %v", err))
+		s.writeExecError(rw, protocol.NewError(protocol.CodeInternal, "exec stdout: %v", err))
 		return
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		s.writeExecError(tc, protocol.NewError(protocol.CodeInternal, "exec stderr: %v", err))
+		s.writeExecError(rw, protocol.NewError(protocol.CodeInternal, "exec stderr: %v", err))
 		return
 	}
 	if err := cmd.Start(); err != nil {
-		s.writeExecError(tc, protocol.NewError(protocol.CodeRemoteProcessFailed, "start rsync: %v", err))
+		s.writeExecError(rw, protocol.NewError(protocol.CodeRemoteProcessFailed, "start rsync: %v", err))
 		return
 	}
 	child := &childProcess{cmd: cmd, done: make(chan struct{})}
@@ -140,7 +148,7 @@ func (s *server) handleExecConn(conn net.Conn) {
 		s.mu.Unlock()
 	}()
 
-	fw := &execFrameWriter{w: tc}
+	fw := &execFrameWriter{w: rw}
 	var copies sync.WaitGroup
 	copyFrames := func(r io.Reader, typ byte) {
 		defer copies.Done()
@@ -203,7 +211,6 @@ func (s *server) handleExecConn(conn net.Conn) {
 	code := childExitCode(cmd)
 	_ = fw.write(protocol.ExecFrameExit, protocol.ExecExitPayload(code))
 	fw.fail()
-	tc.Close()
 	<-clientGone
 }
 

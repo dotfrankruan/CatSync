@@ -19,6 +19,7 @@ type ProbeReport struct {
 	DefaultPort int               `json:"default_port"`
 	Features    protocol.Features `json:"features"`
 	Details     ProbeDetails      `json:"details"`
+	Transports  []string          `json:"transports"`
 }
 
 // ProbeDetails explains feature decisions.
@@ -100,6 +101,7 @@ func Probe(version string) ProbeReport {
 			Stat:     true,
 			SameFile: true,
 		},
-		Details: ProbeDetails{SFTPServer: sftp, Rsync: rsync, Notes: notes},
+		Details:    ProbeDetails{SFTPServer: sftp, Rsync: rsync, Notes: notes},
+		Transports: []string{"tcp", "quic"},
 	}
 }

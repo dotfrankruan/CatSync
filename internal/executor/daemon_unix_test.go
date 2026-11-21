@@ -3,6 +3,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -13,9 +14,11 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/dotfrankruan/CatSync/internal/backend/multistream"
 	"github.com/dotfrankruan/CatSync/internal/daemon"
 	"github.com/dotfrankruan/CatSync/internal/daemon/protocol"
 	"github.com/dotfrankruan/CatSync/internal/state"
@@ -29,6 +32,7 @@ type inProcDaemonTransport struct {
 	t         *testing.T
 	sftpPath  string
 	rsyncPath string
+	transport string
 	limits    protocol.Limits
 	mu        sync.Mutex
 	sessions  []*inProcDaemonSession
@@ -44,6 +48,7 @@ func (tr *inProcDaemonTransport) Start(ctx context.Context) (daemon.ControlSessi
 		Version:          "test",
 		SFTPPath:         tr.sftpPath,
 		RsyncPath:        tr.rsyncPath,
+		Transport:        tr.transport,
 		Limits:           tr.limits,
 		IdleTimeout:      5 * time.Second,
 		DrainTimeout:     10 * time.Second,
@@ -602,4 +607,268 @@ func TestDaemonForwardTargets(t *testing.T) {
 	if err != nil || p != 0 || l != ":0" || a != "" {
 		t.Errorf("direct targets = %q %q %d %v", l, a, p, err)
 	}
+}
+
+// daemonTransportTestConfig is daemonTestConfig with an explicit data
+// transport.
+func daemonTransportTestConfig(t *testing.T, transport string, direction target.Direction, src, remote string, backend state.Backend) Config {
+	t.Helper()
+	cfg := daemonTestConfig(t, direction, src, remote, backend, 2, 2)
+	cfg.LargeThreshold = 1 << 10
+	cfg.DaemonTransport = transport
+	cfg.DaemonPort = 0
+	return cfg
+}
+
+func TestDaemonQUICMixedTreeMatchesTCP(t *testing.T) {
+	sftpPath := daemon.ResolveSFTPPath("")
+	rsyncPath := daemon.ResolveRsyncPath("")
+	if sftpPath == "" || rsyncPath == "" {
+		t.Skip("sftp-server or rsync is not installed")
+	}
+	exe := realCatsyncBinary(t)
+	oldExe := catsyncExecutable
+	catsyncExecutable = func() (string, error) { return exe, nil }
+	t.Cleanup(func() { catsyncExecutable = oldExe })
+
+	// The same local tree is uploaded once over TCP and once over QUIC; the
+	// destination trees must be byte-identical and keep metadata.
+	local := t.TempDir()
+	mtime := time.Unix(1_700_400_000, 222_333_444)
+	writeDaemonFile(t, filepath.Join(local, "big.bin"), 8<<10, mtime)
+	writeDaemonFile(t, filepath.Join(local, "small1.txt"), 100, mtime)
+	writeDaemonFile(t, filepath.Join(local, "sub", "nested.txt"), 300, mtime)
+	writeDaemonFile(t, filepath.Join(local, "unicode-文件.txt"), 50, mtime)
+	writeDaemonFile(t, filepath.Join(local, "with space.txt"), 60, mtime)
+
+	upload := func(transport string) string {
+		tr := &inProcDaemonTransport{t: t, sftpPath: sftpPath, rsyncPath: rsyncPath, transport: transport, limits: protocol.Limits{MaxSFTPConns: 8, MaxExecConns: 8, MaxControlConns: 8, MaxPendingHandshake: 8, MaxConns: 64}}
+		installDaemonTransport(t, tr)
+		dest := t.TempDir()
+		cfg := daemonTransportTestConfig(t, transport, target.LocalToRemote, local, dest, state.BackendAuto)
+		if transport == "quic" {
+			cfg.Verify = state.VerifySHA256
+		}
+		run, err := Sync(context.Background(), cfg)
+		if err != nil {
+			if run != nil {
+				for _, task := range run.Tasks {
+					t.Logf("[%s] task %s (%s): %s %s", transport, task.Path, task.Backend, task.Status, task.Error)
+				}
+			}
+			t.Fatalf("[%s] sync: %v", transport, err)
+		}
+		if run.Status != state.StatusCompleted {
+			t.Fatalf("[%s] run = %s (%q)", transport, run.Status, run.Error)
+		}
+		return dest
+	}
+	tcpDest := upload("tcp")
+	quicDest := upload("quic")
+	for _, name := range []string{"big.bin", "small1.txt", "sub/nested.txt", "unicode-文件.txt", "with space.txt"} {
+		rel := filepath.FromSlash(name)
+		requireFileEqual(t, filepath.Join(tcpDest, rel), filepath.Join(quicDest, rel))
+		requireFileEqual(t, filepath.Join(local, rel), filepath.Join(quicDest, rel))
+	}
+	// Download the QUIC destination tree back over QUIC.
+	tr := &inProcDaemonTransport{t: t, sftpPath: sftpPath, rsyncPath: rsyncPath, transport: "quic", limits: protocol.Limits{MaxSFTPConns: 8, MaxExecConns: 8, MaxControlConns: 8, MaxPendingHandshake: 8, MaxConns: 64}}
+	installDaemonTransport(t, tr)
+	down := t.TempDir()
+	if _, err := Sync(context.Background(), daemonTransportTestConfig(t, "quic", target.RemoteToLocal, down, quicDest, state.BackendAuto)); err != nil {
+		t.Fatalf("quic download: %v", err)
+	}
+	for _, name := range []string{"big.bin", "small1.txt", "sub/nested.txt", "unicode-文件.txt", "with space.txt"} {
+		rel := filepath.FromSlash(name)
+		requireFileEqual(t, filepath.Join(quicDest, rel), filepath.Join(down, rel))
+	}
+}
+
+func TestDaemonQUICMirrorAndResume(t *testing.T) {
+	sftpPath := daemon.ResolveSFTPPath("")
+	rsyncPath := daemon.ResolveRsyncPath("")
+	if sftpPath == "" || rsyncPath == "" {
+		t.Skip("sftp-server or rsync is not installed")
+	}
+	exe := realCatsyncBinary(t)
+	oldExe := catsyncExecutable
+	catsyncExecutable = func() (string, error) { return exe, nil }
+	t.Cleanup(func() { catsyncExecutable = oldExe })
+	tr := &inProcDaemonTransport{t: t, sftpPath: sftpPath, rsyncPath: rsyncPath, transport: "quic", limits: protocol.Limits{MaxSFTPConns: 8, MaxExecConns: 8, MaxControlConns: 8, MaxPendingHandshake: 8, MaxConns: 64}}
+	installDaemonTransport(t, tr)
+	local := t.TempDir()
+	remote := t.TempDir()
+	writeDaemonFile(t, filepath.Join(local, "big.bin"), 8<<10, time.Unix(1_700_500_000, 0))
+	writeDaemonFile(t, filepath.Join(local, "small.txt"), 100, time.Unix(1_700_500_000, 0))
+	cfg := daemonTransportTestConfig(t, "quic", target.LocalToRemote, local, remote, state.BackendAuto)
+	cfg.Mirror = true
+	if _, err := Sync(context.Background(), cfg); err != nil {
+		t.Fatalf("quic mirror: %v", err)
+	}
+	extra := filepath.Join(remote, "extra.txt")
+	if err := os.WriteFile(extra, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg2 := daemonTransportTestConfig(t, "quic", target.LocalToRemote, local, remote, state.BackendAuto)
+	cfg2.Mirror = true
+	if _, err := Sync(context.Background(), cfg2); err != nil {
+		t.Fatalf("quic mirror second run: %v", err)
+	}
+	if _, err := os.Stat(extra); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("quic mirror did not delete extraneous file: %v", err)
+	}
+}
+
+// backendSFTPConfig builds a multistream config whose data plane is the
+// daemon transport, for direct backend checkpoint-reuse tests.
+func backendSFTPConfig(t *testing.T, tr *inProcDaemonTransport, transport string) (*daemon.Client, func()) {
+	t.Helper()
+	sess, err := tr.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := daemon.Bootstrap(context.Background(), daemon.BootstrapConfig{
+		Transport: staticControlTransport{sess: sess}, Host: "127.0.0.1",
+		DataTransport: transport, HandshakeTimeout: 10 * time.Second,
+		ControlTimeout: 10 * time.Second, CloseTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	return client, func() { _ = client.Close() }
+}
+
+type staticControlTransport struct{ sess daemon.ControlSession }
+
+func (t staticControlTransport) Start(context.Context) (daemon.ControlSession, error) {
+	return t.sess, nil
+}
+
+func TestDaemonCheckpointChunkReuse(t *testing.T) {
+	sftpPath := daemon.ResolveSFTPPath("")
+	if sftpPath == "" {
+		t.Skip("sftp-server is not installed")
+	}
+	for _, transport := range []string{"tcp", "quic"} {
+		t.Run(transport, func(t *testing.T) {
+			tr := &inProcDaemonTransport{t: t, sftpPath: sftpPath, transport: transport,
+				limits: protocol.Limits{MaxSFTPConns: 8, MaxExecConns: 8, MaxControlConns: 8, MaxPendingHandshake: 8, MaxConns: 64}}
+			installDaemonTransport(t, tr)
+			client, closeClient := backendSFTPConfig(t, tr, transport)
+			defer closeClient()
+			local := t.TempDir()
+			remoteDir := t.TempDir()
+			if _, err := client.Mkdir(context.Background(), []string{remoteDir}); err != nil {
+				t.Fatal(err)
+			}
+			const size = 1 << 20
+			const chunk = 64 << 10
+			src := filepath.Join(local, "chunks.bin")
+			data := randomBytes(t, size)
+			if err := os.WriteFile(src, data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cfg := multistream.SFTPConfig{
+				Dest: target.Destination{User: "u", Host: "127.0.0.1", Path: remoteDir},
+				SetMtime: func(ctx context.Context, p string, tm time.Time) error {
+					return client.MetadataMtime(ctx, p, nil, tm.UnixNano())
+				},
+				Dial: func(ctx context.Context) (io.ReadWriteCloser, func(), error) {
+					c, err := client.DialSFTP(ctx)
+					if err != nil {
+						return nil, nil, err
+					}
+					return c, func() { _ = c.Close() }, nil
+				},
+			}
+			ckpt := filepath.Join(local, "file.ckpt")
+			remoteFinal := filepath.Join(remoteDir, "chunks.bin")
+			ctx, cancel := context.WithCancel(context.Background())
+			opts := multistream.TransferOptions{
+				SFTP: cfg, Streams: 2, ChunkSize: chunk, CheckpointPath: ckpt,
+				OnChunkComplete: func(done, total int) {
+					if done == 4 {
+						cancel()
+					}
+				},
+			}
+			_, err := multistream.Transfer(ctx, src, "chunks.bin", remoteFinal, opts)
+			cancel()
+			if err == nil {
+				t.Fatal("interrupted transfer unexpectedly succeeded")
+			}
+			ck, err := multistream.LoadCheckpoint(ckpt)
+			if err != nil {
+				t.Fatalf("load checkpoint: %v", err)
+			}
+			if len(ck.Completed) < 4 {
+				t.Fatalf("completed chunks = %v, want at least 4", ck.Completed)
+			}
+			completedBytes := uint64(0)
+			for _, idx := range ck.Completed {
+				start := uint64(idx) * chunk
+				end := start + chunk
+				if end > size {
+					end = size
+				}
+				completedBytes += end - start
+			}
+			if completedBytes >= size {
+				t.Fatalf("checkpoint already covers the whole file (%d bytes)", completedBytes)
+			}
+			var retransferred atomic.Uint64
+			resumeOpts := multistream.TransferOptions{
+				SFTP: cfg, Streams: 2, ChunkSize: chunk, CheckpointPath: ckpt,
+				OnProgress: func(n uint64) { retransferred.Add(n) },
+			}
+			res, err := multistream.Resume(context.Background(), src, "chunks.bin", ckpt, remoteFinal, resumeOpts)
+			if err != nil {
+				t.Fatalf("resume: %v", err)
+			}
+			if !res.Published {
+				t.Fatal("resume did not publish")
+			}
+			want := uint64(size) - completedBytes
+			if got := retransferred.Load(); got != want {
+				t.Fatalf("resume retransferred %d bytes, want exactly %d (checkpoint must cover %d)", got, want, completedBytes)
+			}
+			final, err := os.ReadFile(remoteFinal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(final, data) {
+				t.Fatal("resumed file content differs")
+			}
+		})
+	}
+}
+
+func TestDaemonQUICResumeAfterInterrupt(t *testing.T) {
+	sftpPath := daemon.ResolveSFTPPath("")
+	if sftpPath == "" {
+		t.Skip("sftp-server is not installed")
+	}
+	tr := &inProcDaemonTransport{t: t, sftpPath: sftpPath, transport: "quic",
+		limits: protocol.Limits{MaxSFTPConns: 8, MaxExecConns: 8, MaxControlConns: 8, MaxPendingHandshake: 8, MaxConns: 64}}
+	installDaemonTransport(t, tr)
+	local := t.TempDir()
+	remote := t.TempDir()
+	writeDaemonFile(t, filepath.Join(local, "big.bin"), 64<<20, time.Unix(1_700_700_000, 0))
+	cfg := daemonTransportTestConfig(t, "quic", target.LocalToRemote, local, remote, state.BackendMSCP)
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	run, err := Sync(ctx, cfg)
+	if err == nil {
+		t.Skip("transfer finished before the interrupt; nothing to resume")
+	}
+	if run == nil {
+		t.Skipf("interrupt landed before the run was created: %v", err)
+	}
+	resumed, err := Resume(context.Background(), Config{StateDir: cfg.StateDir}, run.ID)
+	if err != nil {
+		t.Fatalf("QUIC resume: %v", err)
+	}
+	if resumed.Status != state.StatusCompleted {
+		t.Fatalf("QUIC resume = %s (%q)", resumed.Status, resumed.Error)
+	}
+	requireFileEqual(t, filepath.Join(local, "big.bin"), filepath.Join(remote, "big.bin"))
 }

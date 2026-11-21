@@ -3,7 +3,7 @@
 package daemon
 
 import (
-	"net"
+	"io"
 
 	"github.com/pkg/sftp"
 )
@@ -20,7 +20,7 @@ func (t testSFTPClient) Create(path string) (*sftp.File, error) { return t.c.Cre
 func (t testSFTPClient) Close() error                           { return t.c.Close() }
 
 // newTestSFTPClient builds a pkg/sftp client over one pinned data stream.
-func newTestSFTPClient(conn net.Conn) (sftpClient, error) {
+func newTestSFTPClient(conn io.ReadWriteCloser) (sftpClient, error) {
 	c, err := sftp.NewClientPipe(conn, conn)
 	if err != nil {
 		return nil, err
