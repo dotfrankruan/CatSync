@@ -40,6 +40,10 @@ type ServerConfig struct {
 	QUICInitialStreamWindow uint64
 	QUICMaxStreamWindow     uint64
 	QUICMaxConnWindow       uint64
+	// QUICQLogPath, when set, writes a qlog trace for this QUIC connection
+	// to the given local file (created with mode 0600) and enables
+	// low-overhead application progress diagnostics.
+	QUICQLogPath string
 	// Manifest bounds traversal memory and stream size; zero fields default.
 	Manifest manifestConfig
 	// CertTTL is the ephemeral certificate lifetime.
@@ -178,6 +182,7 @@ type server struct {
 	quicSFTPSem chan struct{}
 	quicExecSem chan struct{}
 	quicCtrlSem chan struct{}
+	quicAct     *quicActivity
 }
 
 // Serve runs the one-shot bootstrap and, on success, serves until bye, a
@@ -259,7 +264,15 @@ func Serve(ctx context.Context, cfg ServerConfig) int {
 		}
 	case "quic":
 		quicProtos = []string{protocol.ALPNQUIC}
-		quicLn, err = quic.ListenAddr(cfg.Listen, serverTLSConfig(serverPair, clientCert, quicProtos), quicServerConfig(&cfg))
+		qcfg := quicServerConfig(&cfg)
+		if cfg.QUICQLogPath != "" {
+			tracer, terr := openQlogTracer(cfg.QUICQLogPath)
+			if terr != nil {
+				return bootstrapFailure(writer, logf, protocol.NewError(protocol.CodeInvalidArgument, "quic qlog: %v", terr))
+			}
+			qcfg.Tracer = tracer
+		}
+		quicLn, err = quic.ListenAddr(cfg.Listen, serverTLSConfig(serverPair, clientCert, quicProtos), qcfg)
 		if err != nil {
 			return bootstrapFailure(writer, logf, protocol.NewError(protocol.CodePortInUse, "listen quic %s: %v", cfg.Listen, err))
 		}
@@ -313,6 +326,7 @@ func Serve(ctx context.Context, cfg ServerConfig) int {
 		quicSFTPSem: make(chan struct{}, cfg.Limits.MaxSFTPStreams),
 		quicExecSem: make(chan struct{}, cfg.Limits.MaxExecStreams),
 		quicCtrlSem: make(chan struct{}, cfg.Limits.MaxControlStreams),
+		quicAct:     newQUICActivity(cfg.QUICQLogPath != ""),
 	}
 	if cfg.Transport == "quic" {
 		go srv.quicAcceptLoop(logf)

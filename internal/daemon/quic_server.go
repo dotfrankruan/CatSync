@@ -31,6 +31,27 @@ func quicServerConfig(cfg *ServerConfig) *quic.Config {
 	}
 }
 
+// activityStream wraps a QUIC stream and records application-level progress
+// for diagnostics. It embeds the stream so deadlines, resets, and credit
+// release keep working unchanged.
+type activityStream struct {
+	*quic.Stream
+	typ byte
+	act *quicActivity
+}
+
+func (a *activityStream) Read(p []byte) (int, error) {
+	n, err := a.Stream.Read(p)
+	a.act.touch(a.typ, n)
+	return n, err
+}
+
+func (a *activityStream) Write(p []byte) (int, error) {
+	n, err := a.Stream.Write(p)
+	a.act.touch(a.typ, n)
+	return n, err
+}
+
 // quicClientTLS is the server-side view used only to document parity; the
 // actual configuration is built by serverTLSConfig with the QUIC ALPN.
 
@@ -60,6 +81,7 @@ func (s *server) runQUICConn(conn *quic.Conn, logf func(string, ...any)) {
 		st, err := conn.AcceptStream(s.ctx)
 		if err != nil {
 			if s.ctx.Err() == nil {
+				logQUICDiagnostic(s.cfg.Stderr, "catsyncd", s.quicAct, err)
 				logf("QUIC connection closed: %v", err)
 				go s.shutdown(nil, logf, false)
 			}
@@ -125,7 +147,8 @@ func (s *server) handleQUICStream(st *quic.Stream) {
 		defer release(s.quicExecSem)
 		s.counters.execActive.Add(1)
 		defer s.counters.execActive.Add(-1)
-		s.serveExec(st, func() {
+		as := &activityStream{Stream: st, typ: protocol.StreamExec, act: s.quicAct}
+		s.serveExec(as, func() {
 			_ = st.Close()
 			st.CancelRead(0)
 		})
@@ -142,10 +165,11 @@ func (s *server) rejectQUICStream(st *quic.Stream) {
 // serveQUICControl runs one frozen RPC over a CONTROL stream. Request and
 // response framing is length-delimited JSON; stream responses use NDJSON.
 func (s *server) serveQUICControl(st *quic.Stream) {
+	rw := &activityStream{Stream: st, typ: protocol.StreamControl, act: s.quicAct}
 	ctx := st.Context()
 	_ = st.SetReadDeadline(time.Now().Add(s.cfg.ControlTimeout))
 	var hdr [4]byte
-	if _, err := io.ReadFull(st, hdr[:]); err != nil {
+	if _, err := io.ReadFull(rw, hdr[:]); err != nil {
 		s.rejectQUICStream(st)
 		return
 	}
@@ -155,19 +179,19 @@ func (s *server) serveQUICControl(st *quic.Stream) {
 		return
 	}
 	payload := make([]byte, n)
-	if _, err := io.ReadFull(st, payload); err != nil {
+	if _, err := io.ReadFull(rw, payload); err != nil {
 		s.rejectQUICStream(st)
 		return
 	}
 	var req protocol.QUICControlRequest
 	if err := strictjson.Decode(payload, &req, strictjson.Limits{MaxBytes: protocol.MaxQUICControlFrameBytes, MaxDepth: 8}); err != nil {
-		w := &quicRPCWriter{w: st}
+		w := &quicRPCWriter{w: rw}
 		w.Abort(protocol.NewError(protocol.CodeJSONTypeMismatch, "control frame: %v", err))
 		_ = st.Close()
 		return
 	}
 	if !protocol.IsControlPath(req.Path) {
-		w := &quicRPCWriter{w: st}
+		w := &quicRPCWriter{w: rw}
 		w.Abort(protocol.NewError(protocol.CodeInvalidArgument, "unknown control path %q", req.Path))
 		_ = st.Close()
 		return
@@ -175,7 +199,7 @@ func (s *server) serveQUICControl(st *quic.Stream) {
 	_ = st.SetReadDeadline(time.Time{})
 	s.counters.rpcActive.Add(1)
 	defer s.counters.rpcActive.Add(-1)
-	w := &quicRPCWriter{w: st}
+	w := &quicRPCWriter{w: rw}
 	s.dispatchControlRPC(ctx, req.Path, req.Body, w)
 	if !w.started && !w.failed {
 		w.Abort(protocol.NewError(protocol.CodeInternal, "control handler produced no response"))
@@ -193,9 +217,10 @@ func (s *server) serveQUICSFTP(st *quic.Stream) {
 	if s.cfg.SFTPPath == "" {
 		return
 	}
+	rw := &activityStream{Stream: st, typ: protocol.StreamSFTP, act: s.quicAct}
 	cmd := exec.Command(s.cfg.SFTPPath)
-	cmd.Stdin = st
-	cmd.Stdout = st
+	cmd.Stdin = rw
+	cmd.Stdout = rw
 	if s.cfg.Stderr != nil {
 		cmd.Stderr = s.cfg.Stderr
 	}

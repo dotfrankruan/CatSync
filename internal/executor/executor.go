@@ -146,6 +146,10 @@ type Config struct {
 	DaemonBootstrap string
 	// RemoteCatsyncd is the remote executable name or path.
 	RemoteCatsyncd string
+	// QUICQLogPath writes a local qlog trace for daemon QUIC diagnostics.
+	QUICQLogPath string
+	// RemoteQUICQLogPath asks the remote catsyncd to write its qlog there.
+	RemoteQUICQLogPath string
 	// DaemonListen is the remote --listen value; empty derives from the
 	// transport mode and port.
 	DaemonListen string

@@ -66,6 +66,10 @@ type Options struct {
 	DaemonListen string
 	// DaemonAddr overrides the data connection address.
 	DaemonAddr string
+	// QuicQLog writes local QUIC qlog diagnostics when daemon QUIC is used.
+	QuicQLog string
+	// RemoteQuicQLog asks the remote catsyncd to write its QUIC qlog there.
+	RemoteQuicQLog string
 	// Explicit records which flags the user actually set.
 	Explicit map[string]bool
 }
@@ -141,6 +145,10 @@ func (o *Options) bindDaemonFlags(fs *flag.FlagSet) {
 		"listen address passed to catsyncd (empty derives from the port and bootstrap mode)")
 	fs.StringVar(&o.DaemonAddr, "daemon-addr", o.DaemonAddr,
 		"override the daemon data address as host:port")
+	fs.StringVar(&o.QuicQLog, "quic-qlog", o.QuicQLog,
+		"write a local QUIC qlog trace to this file (QUIC diagnostics; owner-only permissions)")
+	fs.StringVar(&o.RemoteQuicQLog, "remote-quic-qlog", o.RemoteQuicQLog,
+		"ask catsyncd to write its QUIC qlog trace to this absolute remote path")
 }
 
 // recordExplicit records which flags the user set, so resume overrides only
@@ -180,6 +188,17 @@ func (o *Options) validateDaemonFlags() error {
 	}
 	if strings.TrimSpace(o.RemoteCatsyncd) == "" {
 		return errors.New("--remote-catsyncd must not be empty")
+	}
+	if o.QuicQLog != "" && o.DaemonTransport != "quic" {
+		return errors.New("--quic-qlog requires --daemon-transport quic")
+	}
+	if o.RemoteQuicQLog != "" {
+		if o.DaemonTransport != "quic" {
+			return errors.New("--remote-quic-qlog requires --daemon-transport quic")
+		}
+		if !filepath.IsAbs(o.RemoteQuicQLog) {
+			return errors.New("--remote-quic-qlog must be an absolute remote path")
+		}
 	}
 	return nil
 }

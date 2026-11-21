@@ -93,6 +93,7 @@ func runServe(args []string) int {
 	transport := fs.String("transport", "tcp", "data transport: tcp or quic (UDP)")
 	quicStreamWindow := fs.Uint64("quic-stream-window", 0, "QUIC max stream receive window in bytes (0 = tested default)")
 	quicConnWindow := fs.Uint64("quic-conn-window", 0, "QUIC max connection receive window in bytes (0 = tested default)")
+	quicQLog := fs.String("quic-qlog", "", "write a QUIC qlog trace to this file (owner-only permissions; diagnostics)")
 	sftpServer := fs.String("sftp-server", "", "path to the OpenSSH sftp-server executable")
 	rsyncPath := fs.String("rsync", "", "path to the rsync executable used by the exec channel")
 	maxSFTP := fs.Int("max-sftp-conns", 64, "maximum concurrent SFTP connections")
@@ -132,6 +133,7 @@ func runServe(args []string) int {
 		Transport:           *transport,
 		QUICMaxStreamWindow: *quicStreamWindow,
 		QUICMaxConnWindow:   *quicConnWindow,
+		QUICQLogPath:        *quicQLog,
 		Limits:              protocolLimits(*maxSFTP, *maxExec, *maxControl, *maxPending, *maxConns),
 		CertTTL:             *certTTL,
 		IdleTimeout:         *idle,

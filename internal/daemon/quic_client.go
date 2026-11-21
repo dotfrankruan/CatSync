@@ -45,11 +45,22 @@ func quicClientConfig(cfg BootstrapConfig) *quic.Config {
 // quicByteStream adapts a quic.Stream to io.ReadWriteCloser for
 // sftp.NewClientPipe and the exec framing. Close completes both halves.
 type quicByteStream struct {
-	st *quic.Stream
+	st  *quic.Stream
+	typ byte
+	act *quicActivity
 }
 
-func (q *quicByteStream) Read(p []byte) (int, error)  { return q.st.Read(p) }
-func (q *quicByteStream) Write(p []byte) (int, error) { return q.st.Write(p) }
+func (q *quicByteStream) Read(p []byte) (int, error) {
+	n, err := q.st.Read(p)
+	q.act.touch(q.typ, n)
+	return n, err
+}
+
+func (q *quicByteStream) Write(p []byte) (int, error) {
+	n, err := q.st.Write(p)
+	q.act.touch(q.typ, n)
+	return n, err
+}
 func (q *quicByteStream) Close() error {
 	q.st.CancelRead(0)
 	return q.st.Close()
@@ -69,7 +80,7 @@ func (c *Client) openQUICStream(ctx context.Context, typ byte) (*quicByteStream,
 		_ = st.Close()
 		return nil, protocol.NewError(protocol.CodeControlChannelLost, "write QUIC stream header: %v", err)
 	}
-	return &quicByteStream{st: st}, nil
+	return &quicByteStream{st: st, typ: typ, act: c.quicAct}, nil
 }
 
 // quicPost performs one non-streaming CONTROL RPC.

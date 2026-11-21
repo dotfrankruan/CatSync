@@ -57,6 +57,9 @@ type SSHTransport struct {
 	// DaemonTransport is "tcp" (default) or "quic"; quic makes the remote
 	// catsyncd bind UDP instead of TCP.
 	DaemonTransport string
+	// RemoteQUICQLog is an absolute remote path where catsyncd writes its
+	// QUIC qlog trace. Empty disables remote qlog diagnostics.
+	RemoteQUICQLog string
 }
 
 // command builds the ssh argv for this transport.
@@ -96,6 +99,12 @@ func (t SSHTransport) command() ([]string, error) {
 	remoteCmd := discovery.ShellQuote(remote) + " serve --once --listen " + discovery.ShellQuote(listen)
 	if t.DaemonTransport == "quic" {
 		remoteCmd += " --transport quic"
+	}
+	if t.RemoteQUICQLog != "" {
+		if t.DaemonTransport != "quic" {
+			return nil, protocol.NewError(protocol.CodeInvalidArgument, "remote QUIC qlog requires the quic daemon transport")
+		}
+		remoteCmd += " --quic-qlog " + discovery.ShellQuote(t.RemoteQUICQLog)
 	}
 	who := t.Host
 	if t.User != "" {
@@ -226,6 +235,10 @@ type BootstrapConfig struct {
 	QUICMaxConnWindow       uint64
 	// DaemonAddr optionally overrides the data address as host:port.
 	DaemonAddr string
+	// QUICQLogPath, when set, writes a qlog trace for this QUIC connection
+	// to the given local file (created with mode 0600) and enables
+	// low-overhead application progress diagnostics.
+	QUICQLogPath string
 
 	HandshakeTimeout  time.Duration
 	ControlTimeout    time.Duration
@@ -248,6 +261,7 @@ type Client struct {
 	execTLS   *tls.Config
 	quicTLS   *tls.Config
 	quicConn  *quic.Conn
+	quicAct   *quicActivity
 	http      *http.Client
 
 	ctx         context.Context
@@ -389,8 +403,17 @@ func Bootstrap(ctx context.Context, cfg BootstrapConfig) (*Client, error) {
 	if c.transport == "quic" {
 		qTLS := clientTLSConfig(clientPair, serverCert, []string{protocol.ALPNQUIC})
 		c.quicTLS = qTLS
+		c.quicAct = newQUICActivity(cfg.QUICQLogPath != "")
+		qcfg := quicClientConfig(cfg)
+		if cfg.QUICQLogPath != "" {
+			tracer, terr := openQlogTracer(cfg.QUICQLogPath)
+			if terr != nil {
+				return fail(terr)
+			}
+			qcfg.Tracer = tracer
+		}
 		dialCtx, cancel := context.WithTimeout(ctx, cfg.HandshakeTimeout)
-		qc, derr := quic.DialAddr(dialCtx, dialAddr, qTLS, quicClientConfig(cfg))
+		qc, derr := quic.DialAddr(dialCtx, dialAddr, qTLS, qcfg)
 		cancel()
 		if derr != nil {
 			return fail(derr)
@@ -540,6 +563,7 @@ func (c *Client) cleanup() {
 			c.http.CloseIdleConnections()
 		}
 		if c.quicConn != nil {
+			logQUICDiagnostic(c.stderr, "catsync", c.quicAct, c.control)
 			_ = c.quicConn.CloseWithError(0, "client closing")
 		}
 		if c.sess != nil {

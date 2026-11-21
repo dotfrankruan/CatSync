@@ -70,6 +70,9 @@ ssh data channel per SFTP stream or rsync batch:
 
 ```bash
 catsync copy --transport daemon ~/src user@host:/data
+# Optional QUIC diagnostics (qlog; owner-only files):
+# catsync copy --transport daemon --daemon-transport quic \
+#   --quic-qlog local.sqlog --remote-quic-qlog /tmp/remote.sqlog ...
 ```
 
 The run starts exactly one ssh bootstrap session. Over that authenticated

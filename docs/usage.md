@@ -263,6 +263,8 @@ Options (also accepted by `resume` to override only the recorded values):
 | `--daemon-bootstrap direct|ssh-forward` | `direct` dials the mTLS port directly. `ssh-forward` uses the same ssh bootstrap process with `-L 127.0.0.1:<local>:127.0.0.1:<daemon-port>`; the inner connections are still mTLS. Requires a fixed non-zero port and a loopback listen address. |
 | `--remote-catsyncd PATH` | Name or absolute path of the remote `catsyncd`. CatSync never installs or uploads it. |
 | `--daemon-listen ADDR` | Value passed to `catsyncd serve --listen`. With ssh-forward it must be loopback. |
+| `--quic-qlog PATH` | Optional diagnostic: write the local QUIC qlog trace to `PATH` (created owner-only, mode 0600). Enables per-stream `last progress` diagnostics on stderr. QUIC only. |
+| `--remote-quic-qlog PATH` | Optional diagnostic: ask the remote `catsyncd` to write its QUIC qlog there (absolute remote path; owner-only). QUIC only. |
 | `--daemon-addr HOST:PORT` | Override the data connection address (advanced: proxies/NAT). |
 
 Prerequisites on the remote host: an executable `catsyncd`, a working
@@ -289,6 +291,15 @@ Security and failure behavior:
   limits). It keeps the same ephemeral certificate identities, pinning,
   ALPN, and JSONL lifecycle as TCP; 0-RTT is never used. The probe reports
   `transports: ["tcp", "quic"]`.
+
+QUIC diagnostics are opt-in and add no work to normal runs. `--quic-qlog`
+writes a standard qlog trace (packet loss, PTO/loss timer, RTT, cwnd, bytes in
+flight, flow control, connection close) for the local connection;
+`--remote-quic-qlog` does the same for the remote `catsyncd`. Both files are
+created with mode 0600 (a pre-existing file is tightened to 0600), and the
+stream/control/EXEC progress summary is printed to stderr on connection close
+so a stalled data path can be distinguished from an application wait. The
+remote `catsyncd` also exposes `--quic-qlog PATH` directly for manual runs.
 
 Non-UTF-8 file names are not representable in the daemon protocol: planning
 fails with `UNSUPPORTED_PATH_ENCODING` before any remote write. Use the

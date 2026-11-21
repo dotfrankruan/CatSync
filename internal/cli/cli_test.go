@@ -414,6 +414,8 @@ func TestDaemonTransportFlagValidation(t *testing.T) {
 	}{
 		{[]string{"--transport", "bogus"}, "--transport"},
 		{[]string{"--daemon-port", "70000"}, "--daemon-port"},
+		{[]string{"--daemon-transport", "tcp", "--quic-qlog", filepath.Join(t.TempDir(), "q.sqlog")}, "--quic-qlog requires"},
+		{[]string{"--daemon-transport", "quic", "--remote-quic-qlog", "relative.sqlog"}, "absolute remote path"},
 	}
 	for _, tc := range cases {
 		args := append([]string{"plan"}, tc.args...)
@@ -434,6 +436,9 @@ func TestDaemonTransportFlagValidation(t *testing.T) {
 		{"--transport", "daemon", "--daemon-port", "0", "--remote-catsyncd", "/opt/catsyncd"},
 		{"--transport", "daemon", "--daemon-bootstrap", "ssh-forward", "--daemon-port", "43411"},
 		{"--transport", "daemon", "--daemon-transport", "quic", "--daemon-port", "0"},
+		{"--transport", "daemon", "--daemon-transport", "quic", "--daemon-port", "0",
+			"--quic-qlog", filepath.Join(t.TempDir(), "local.sqlog"),
+			"--remote-quic-qlog", "/tmp/remote.sqlog"},
 	} {
 		args := append([]string{"plan"}, extra...)
 		args = append(args, "--state-dir", t.TempDir(), src, "host:/data")

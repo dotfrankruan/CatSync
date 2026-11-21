@@ -116,6 +116,17 @@ func (e *Executor) daemonAddr() string {
 	return e.cfg.DaemonAddr
 }
 
+func (e *Executor) quicQLogPath() string {
+	if e.cfg.QUICQLogPath != "" {
+		return e.cfg.QUICQLogPath
+	}
+	return ""
+}
+
+func (e *Executor) remoteQUICQLogPath() string {
+	return e.cfg.RemoteQUICQLogPath
+}
+
 // manifestDestTarget is the destination endpoint for a manifest call in both
 // planning and execution.
 func (e *Executor) manifestDestTarget() (target.Destination, bool) {
@@ -423,17 +434,19 @@ func (e *Executor) sshSFTPConfig() multistream.SFTPConfig {
 // daemonTransportOptions carries the SSH bootstrap command inputs. It is a
 // struct so tests can replace the transport factory.
 type daemonTransportOptions struct {
-	Program          string
-	User             string
-	Host             string
-	Port             int
-	IPv6             bool
-	RemoteCatsyncd   string
-	Listen           string
-	Env              []string
-	Stderr           io.Writer
-	ForwardLocalPort int
-	DaemonTransport  string
+	Program            string
+	User               string
+	Host               string
+	Port               int
+	IPv6               bool
+	RemoteCatsyncd     string
+	Listen             string
+	Env                []string
+	Stderr             io.Writer
+	ForwardLocalPort   int
+	DaemonTransport    string
+	QUICQLogPath       string
+	RemoteQUICQLogPath string
 }
 
 // newDaemonControlTransport builds the production SSH bootstrap transport.
@@ -444,6 +457,7 @@ var newDaemonControlTransport = func(o daemonTransportOptions) daemon.ControlTra
 		IPv6: o.IPv6, RemoteCatsyncd: o.RemoteCatsyncd, Listen: o.Listen,
 		Env: o.Env, Stderr: o.Stderr, ForwardLocalPort: o.ForwardLocalPort,
 		DaemonTransport: o.DaemonTransport,
+		RemoteQUICQLog:  o.RemoteQUICQLogPath,
 	}
 }
 
@@ -479,8 +493,10 @@ func (e *Executor) ensureRemote(ctx context.Context) (remoteOps, error) {
 		RemoteCatsyncd: e.remoteCatsyncdName(),
 		Listen:         listen,
 		Env:            e.cfg.Env, Stderr: e.stderr,
-		ForwardLocalPort: forwardLocalPort,
-		DaemonTransport:  e.daemonTransport(),
+		ForwardLocalPort:   forwardLocalPort,
+		DaemonTransport:    e.daemonTransport(),
+		QUICQLogPath:       e.quicQLogPath(),
+		RemoteQUICQLogPath: e.remoteQUICQLogPath(),
 	}
 	client, err := daemon.Bootstrap(ctx, daemon.BootstrapConfig{
 		Transport:     newDaemonControlTransport(opts),
@@ -489,6 +505,7 @@ func (e *Executor) ensureRemote(ctx context.Context) (remoteOps, error) {
 		DaemonAddr:    daemonAddr,
 		DataTransport: e.daemonTransport(),
 		Stderr:        e.stderr,
+		QUICQLogPath:  e.quicQLogPath(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("executor: daemon bootstrap: %w", err)

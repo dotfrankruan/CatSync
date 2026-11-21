@@ -73,6 +73,25 @@ func TestManifestRejectsMissingEndAndRecordsAfterEnd(t *testing.T) {
 	}
 }
 
+func TestSSHTransportQUICQLogCommand(t *testing.T) {
+	tr := SSHTransport{Host: "h", User: "u", DaemonTransport: "quic", RemoteQUICQLog: "/home/u/q log.sqlog"}
+	argv, err := tr.command()
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := argv[len(argv)-1]
+	for _, want := range []string{"--transport quic", "--quic-qlog '/home/u/q log.sqlog'"} {
+		if !strings.Contains(last, want) {
+			t.Errorf("remote command %q lacks %q", last, want)
+		}
+	}
+	// TCP runs must reject the QUIC-only remote diagnostic explicitly.
+	tcp := SSHTransport{Host: "h", RemoteQUICQLog: "/tmp/q.sqlog"}
+	if _, err := tcp.command(); err == nil {
+		t.Error("TCP remote command accepted a QUIC qlog flag")
+	}
+}
+
 func TestSSHTransportForwardCommand(t *testing.T) {
 	tr := SSHTransport{Host: "h", User: "u", Listen: "127.0.0.1:43411", ForwardLocalPort: 49001}
 	argv, err := tr.command()
