@@ -872,3 +872,112 @@ func TestDaemonQUICResumeAfterInterrupt(t *testing.T) {
 	}
 	requireFileEqual(t, filepath.Join(local, "big.bin"), filepath.Join(remote, "big.bin"))
 }
+
+func TestDaemonPublishNoClobberCrashWindows(t *testing.T) {
+	sftpPath := daemon.ResolveSFTPPath("")
+	if sftpPath == "" {
+		t.Skip("sftp-server is not installed")
+	}
+	for _, transport := range []string{"tcp", "quic"} {
+		t.Run(transport, func(t *testing.T) {
+			tr := &inProcDaemonTransport{t: t, sftpPath: sftpPath, transport: transport,
+				limits: protocol.Limits{MaxSFTPConns: 8, MaxExecConns: 8, MaxControlConns: 8, MaxPendingHandshake: 8, MaxConns: 64}}
+			installDaemonTransport(t, tr)
+			client, closeClient := backendSFTPConfig(t, tr, transport)
+			defer closeClient()
+			local := t.TempDir()
+			remoteDir := t.TempDir()
+			if _, err := client.Mkdir(context.Background(), []string{remoteDir}); err != nil {
+				t.Fatal(err)
+			}
+			cfg := multistream.SFTPConfig{
+				Dest: target.Destination{User: "u", Host: "127.0.0.1", Path: remoteDir},
+				SetMtime: func(ctx context.Context, p string, tm time.Time) error {
+					return client.MetadataMtime(ctx, p, nil, tm.UnixNano())
+				},
+				SameFile: func(ctx context.Context, a, b string) (bool, error) {
+					return client.SameFile(ctx, a, b)
+				},
+				Dial: func(ctx context.Context) (io.ReadWriteCloser, func(), error) {
+					c, err := client.DialSFTP(ctx)
+					if err != nil {
+						return nil, nil, err
+					}
+					return c, func() { _ = c.Close() }, nil
+				},
+			}
+			const size = 256 << 10
+			const chunk = 32 << 10
+			data := randomBytes(t, size)
+			opts := func(ckpt string) multistream.TransferOptions {
+				return multistream.TransferOptions{SFTP: cfg, Streams: 2, ChunkSize: chunk, CheckpointPath: ckpt}
+			}
+
+			// A pre-existing final must never be overwritten.
+			src := filepath.Join(local, "a.bin")
+			if err := os.WriteFile(src, data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			finalA := filepath.Join(remoteDir, "a.bin")
+			if err := os.WriteFile(finalA, []byte("foreign"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := multistream.Transfer(context.Background(), src, "a.bin", finalA, opts(filepath.Join(local, "a.ckpt")))
+			if err == nil || !strings.Contains(err.Error(), "already exists") {
+				t.Fatalf("transfer onto existing final = %v, want an already-exists refusal", err)
+			}
+			if got, _ := os.ReadFile(finalA); string(got) != "foreign" {
+				t.Fatalf("existing final was clobbered: %q", got)
+			}
+
+			// Normal publish, then simulate a crash after the hardlink publish
+			// but before the run state was saved: Resume must recover without
+			// copying and must verify the existing final.
+			src = filepath.Join(local, "b.bin")
+			if err := os.WriteFile(src, data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			finalB := filepath.Join(remoteDir, "b.bin")
+			ckpt := filepath.Join(local, "b.ckpt")
+			first, err := multistream.Transfer(context.Background(), src, "b.bin", finalB, opts(ckpt))
+			if err != nil {
+				t.Fatalf("Transfer: %v", err)
+			}
+			copies := 0
+			recovery := opts(ckpt)
+			recovery.OnChunkComplete = func(done, total int) { copies++ }
+			res, err := multistream.Resume(context.Background(), src, "b.bin", ckpt, finalB, recovery)
+			if err != nil {
+				t.Fatalf("Resume recovery: %v", err)
+			}
+			if !res.Recovered || res.TempPath != first.TempPath {
+				t.Fatalf("recovery = %+v (recovered=%v), want published recovery of %q", res, res.Recovered, first.TempPath)
+			}
+			if copies != 0 {
+				t.Fatalf("recovered publish re-copied %d chunks", copies)
+			}
+			if got, _ := os.ReadFile(finalB); !bytes.Equal(got, data) {
+				t.Fatal("recovered final content differs")
+			}
+			fi, err := os.Lstat(finalB)
+			if err != nil || fi.Mode().Perm() != 0o644 {
+				t.Fatalf("recovered final mode = %v, %v", fi.Mode(), err)
+			}
+
+			// Hardlink exists but a different object now occupies the final
+			// path: resume must refuse instead of overwriting it.
+			if err := os.Remove(finalB); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(finalB, []byte("foreign-final"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := multistream.Resume(context.Background(), src, "b.bin", ckpt, finalB, opts(ckpt)); err == nil || !errors.Is(err, multistream.ErrPublishConflict) {
+				t.Fatalf("resume onto a foreign final = %v, want ErrPublishConflict", err)
+			}
+			if got, _ := os.ReadFile(finalB); string(got) != "foreign-final" {
+				t.Fatalf("foreign final was overwritten: %q", got)
+			}
+		})
+	}
+}
