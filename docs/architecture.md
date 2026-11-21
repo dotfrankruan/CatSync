@@ -45,6 +45,14 @@ uploads, through batched remote manifests and exact per-file native probes
 for downloads). A changed
 source is a failed task, not a successful transfer. State is written by
 temporary-file plus rename and a destination lock prevents overlapping runs.
+The lock is an OS advisory lock (flock) on a stable lock-file inode, not the
+existence of a lock file: if a process crashes (including SIGKILL and power
+loss) the kernel releases the lock, so the next run proceeds without manual
+lock-file cleanup. Lock files are intentionally never unlinked while they may
+be opened, and released files remain on disk, unlocked and empty. Advisory
+locks are only trustworthy on filesystems that implement them; on network
+filesystems or other hosts sharing a state directory without reliable flock
+support, `catsync` fails closed instead of claiming cross-host exclusion.
 
 ## Execution stages
 

@@ -118,7 +118,10 @@ Prints the version.
 ## Sources and destinations
 
 Exactly one operand must be remote: `LOCAL [user@]host:/absolute/path` uploads
-and `[user@]host:/absolute/path LOCAL` downloads. Remote paths must be absolute;
+and `[user@]host:/absolute/path LOCAL` downloads. Every remote path in every
+example is absolute; relative paths and `~` are rejected with a usage error so
+the same destination cannot silently resolve differently on the client and
+server.
 bracketed IPv6 literals are accepted. Remote-to-remote and local-to-local
 transfers are rejected.
 
@@ -152,6 +155,15 @@ There are two ways to continue, and normally you need neither in mind:
   instead of re-planning it. The output names the run it continues.
 - **Explicit.** `catsync resume` continues the latest resumable run, or the one
   you name.
+
+A destination lock prevents two runs from writing the same destination
+concurrently. It is an advisory kernel lock held through the whole run, so a
+client killed with `kill -9` (or a power loss) releases it automatically: just
+rerun the command. Lock files may remain in the state directory; their
+existence does not mean a run is active, and they must not be deleted to
+"clear" a lock. The state directory must live on a filesystem with reliable
+advisory-lock support (local APFS/ext4/xfs are fine); network filesystems that
+do not implement flock are rejected rather than treated as a global mutex.
 
 ```sh
 catsync copy user@host:/data/dataset ./data         # interrupted

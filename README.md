@@ -109,6 +109,7 @@ tag and bumping the Homebrew formula.
 make install            # builds and installs catsync and catsyncd to ~/.local/bin
 catsync doctor          # check ssh and rsync
 
+# Remote paths are always absolute (CATSync rejects relative paths and ~).
 catsync plan ./data user@host:/srv/data       # what would be transferred
 catsync copy ./data user@host:/srv/data       # add new/changed files, never delete
 catsync sync ./data user@host:/srv/data       # exact mirror (deletes extras)
