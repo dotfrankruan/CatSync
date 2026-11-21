@@ -49,7 +49,10 @@ The lock is an OS advisory lock (flock) on a stable lock-file inode, not the
 existence of a lock file: if a process crashes (including SIGKILL and power
 loss) the kernel releases the lock, so the next run proceeds without manual
 lock-file cleanup. Lock files are intentionally never unlinked while they may
-be opened, and released files remain on disk, unlocked and empty. Advisory
+be opened, and released files remain on disk, unlocked and empty. New
+releases ignore old-format lock files as ownership, but binaries from before
+this change still use existence-only locking, so all clients sharing a state
+directory must be upgraded together. Advisory
 locks are only trustworthy between processes on the same host using the same
 state directory on a filesystem that implements them. Sharing a state
 directory across hosts, or putting it on a network filesystem without reliable

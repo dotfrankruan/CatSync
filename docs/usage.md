@@ -161,7 +161,9 @@ concurrently. It is an advisory kernel lock held through the whole run, so a
 client killed with `kill -9` (or a power loss) releases it automatically: just
 rerun the command. Lock files may remain in the state directory; their
 existence does not mean a run is active, and they must not be deleted to
-"clear" a lock. The state directory must live on a local filesystem with reliable
+"clear" a lock. Lock files from older releases are ignored as ownership, but
+older catsync binaries still treat file existence as a lock: upgrade every
+client that shares a state directory before running the new release. The state directory must live on a local filesystem with reliable
 advisory-lock support (local APFS/ext4/xfs are fine). Sharing a state directory
 between different hosts is not supported, and a network filesystem that
 silently provides only local lock semantics cannot be detected; such a setup
