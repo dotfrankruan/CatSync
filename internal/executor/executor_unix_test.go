@@ -129,6 +129,13 @@ func sftpSessionInvocations(invs []mockexec.Invocation) []mockexec.Invocation {
 // writeScript installs a tool's script-style config.
 func (h *harness) writeScript(tool, config string) {
 	h.t.Helper()
+	// Directory-source runs validate/create the destination root with one
+	// ssh invocation before any transfer. Every mock ssh accepts that
+	// precondition by default; tests that exercise its failure use a more
+	// specific script.
+	if tool == "ssh" {
+		config = "match=[ -L \nexit=0\n---\n" + config
+	}
 	dir := filepath.Join(h.scriptDir, tool)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		h.t.Fatal(err)
@@ -969,9 +976,10 @@ func TestSyncSubprocessFailurePropagates(t *testing.T) {
 	if task.Status != state.StatusFailed || !strings.Contains(task.Error, "status 23") {
 		t.Errorf("task = %s (%q), want failed with exit 23", task.Status, task.Error)
 	}
-	// A failed task is never verified, so no second ssh call happens.
-	if got := len(toolInvocations(h.invocations(), "ssh")); got != 1 {
-		t.Errorf("ssh invocations = %d, want 1", got)
+	// Plan manifest plus the directory-root precondition; a failed task is
+	// never verified, so no further ssh call happens.
+	if got := len(toolInvocations(h.invocations(), "ssh")); got != 2 {
+		t.Errorf("ssh invocations = %d, want 2", got)
 	}
 }
 
@@ -2297,8 +2305,8 @@ func TestNativeStageVerifyNone(t *testing.T) {
 	if run.Tasks[0].Status != state.StatusCompleted {
 		t.Errorf("task = %s (%q), want completed", run.Tasks[0].Status, run.Tasks[0].Error)
 	}
-	if got := len(toolInvocations(h.invocations(), "ssh")); got != 1 {
-		t.Errorf("ssh invocations = %d, want 1 (plan manifest only)", got)
+	if got := len(toolInvocations(h.invocations(), "ssh")); got != 2 {
+		t.Errorf("ssh invocations = %d, want 2 (plan manifest + root precondition)", got)
 	}
 }
 
@@ -2474,7 +2482,8 @@ func TestNativeStageBatchedParentMkdir(t *testing.T) {
 	invs := h.invocations()
 	var mkdirs []int
 	for i, inv := range invs {
-		if inv.Tool == "ssh" && strings.Contains(strings.Join(inv.Args, "\x00"), "mkdir -p") {
+		joined := strings.Join(inv.Args, "\x00")
+		if inv.Tool == "ssh" && strings.Contains(joined, "mkdir -p") && !strings.Contains(joined, "[ -L ") {
 			mkdirs = append(mkdirs, i)
 		}
 	}
@@ -2939,6 +2948,8 @@ func TestNativeStageCancellationRevertSaveFailure(t *testing.T) {
 // resume path must fail closed.
 func TestNativeLegacyCheckpointDeterministic(t *testing.T) {
 	h := newHarness(t)
+	// The directory-root precondition runs before the native stage.
+	h.writeScript("ssh", "exit=0")
 	h.writeSrc("big.bin", 2048)
 
 	// Craft an interrupted run whose large task points at a legacy
@@ -3183,6 +3194,8 @@ func craftNativeRun(t *testing.T, h *harness, ckpt string) *state.Run {
 // lacks hardlink support — rsync would bypass the no-clobber publish.
 func TestNativeResumeWithCheckpointFailsClosedWithoutHardlink(t *testing.T) {
 	h := newHarness(t)
+	// The directory-root precondition runs before the native stage.
+	h.writeScript("ssh", "exit=0")
 	h.writeSrc("big.bin", 2048)
 	remoteFinal := filepath.Join(h.remoteDir, "big.bin")
 	tempPath := filepath.Join(h.remoteDir, ".catsync-tmp-big.bin")
@@ -3312,6 +3325,8 @@ func TestNativeResumePublishedCrashWindowProbeFailure(t *testing.T) {
 // falls back.
 func TestNativeResumeLegacyCheckpointWithoutHardlink(t *testing.T) {
 	h := newHarness(t)
+	// The directory-root precondition runs before the native stage.
+	h.writeScript("ssh", "exit=0")
 	h.writeSrc("big.bin", 2048)
 	legacy := filepath.Join(h.stateDir, "checkpoints", "crafted", "legacy.mscpckpt")
 	if err := os.MkdirAll(filepath.Dir(legacy), 0o700); err != nil {

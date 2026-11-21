@@ -20,6 +20,7 @@ import (
 	"github.com/dotfrankruan/CatSync/internal/discovery"
 	"github.com/dotfrankruan/CatSync/internal/partition"
 	"github.com/dotfrankruan/CatSync/internal/planner"
+	"github.com/dotfrankruan/CatSync/internal/process"
 	"github.com/dotfrankruan/CatSync/internal/rsh"
 	"github.com/dotfrankruan/CatSync/internal/state"
 	"github.com/dotfrankruan/CatSync/internal/target"
@@ -38,6 +39,10 @@ type remoteOps interface {
 	DestManifest(ctx context.Context) (map[string]discovery.RemoteEntry, bool, error)
 	SourceManifest(ctx context.Context) (root, file string, entries []discovery.Entry, err error)
 	MkdirParents(ctx context.Context, dirs []string) error
+	// EnsureDestRoot makes the directory-source destination root exist as a
+	// real directory before the first transfer write. Single-file runs never
+	// call it.
+	EnsureDestRoot(ctx context.Context) error
 	HashCapability(ctx context.Context) (remoteHashCapability, error)
 	Hashes(ctx context.Context, tool remoteHashTool, tasks []*state.Task) (map[string]string, error)
 	SFTPConfig() multistream.SFTPConfig
@@ -159,6 +164,31 @@ func (r sshRemote) MkdirParents(ctx context.Context, dirs []string) error {
 	return r.e.mkdirRemoteParents(ctx, dest, ipv6, dirs)
 }
 
+// EnsureDestRoot validates/creates the remote destination root as a real
+// directory in one ssh invocation. A symlink or regular file at that path is
+// rejected before any transfer write, so rsync cannot treat it as a file.
+func (r sshRemote) EnsureDestRoot(ctx context.Context) error {
+	if r.e.run == nil {
+		return errors.New("executor: destination root is only ensured during execution")
+	}
+	dest, ipv6 := r.e.manifestDestTarget()
+	argv, err := discovery.EnsureDirCommandProgPort(r.e.progs.ssh(), dest, ipv6, r.e.sshPort(), dest.Path)
+	if err != nil {
+		return err
+	}
+	var stderr strings.Builder
+	if err := r.e.withConnection(func() error {
+		return process.Run(ctx, process.Spec{Name: argv[0], Args: argv[1:], Env: r.e.cfg.Env, Stderr: &stderr})
+	}); err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if detail != "" {
+			return fmt.Errorf("executor: destination root %q: %s", dest.Path, firstLine(detail))
+		}
+		return fmt.Errorf("executor: destination root %q: %w", dest.Path, err)
+	}
+	return nil
+}
+
 func (r sshRemote) HashCapability(ctx context.Context) (remoteHashCapability, error) {
 	tool, err := r.e.detectRemoteHashTool(ctx)
 	if err != nil {
@@ -260,6 +290,32 @@ func entryFromProtocol(en protocol.ManifestEntryRecord) discovery.Entry {
 func (r daemonRemote) MkdirParents(ctx context.Context, dirs []string) error {
 	_, err := r.client.Mkdir(ctx, dirs)
 	return err
+}
+
+// EnsureDestRoot validates/creates the remote destination root over RPC. A
+// symlink, regular file, or other non-directory is rejected before writes.
+func (r daemonRemote) EnsureDestRoot(ctx context.Context) error {
+	dest, _ := r.e.manifestDestTarget()
+	if err := protocol.ValidateAbsPath(dest.Path); err != nil {
+		return err
+	}
+	st, err := r.client.Stat(ctx, dest.Path)
+	if err != nil {
+		if !isProtocolCode(err, protocol.CodeNotFound) {
+			return fmt.Errorf("executor: destination root %q: %w", dest.Path, err)
+		}
+		if _, merr := r.client.Mkdir(ctx, []string{dest.Path}); merr != nil {
+			return fmt.Errorf("executor: destination root %q: %w", dest.Path, merr)
+		}
+		st, err = r.client.Stat(ctx, dest.Path)
+		if err != nil {
+			return fmt.Errorf("executor: destination root %q: %w", dest.Path, err)
+		}
+	}
+	if st.Type != protocol.StatDir {
+		return fmt.Errorf("%w: destination root %q exists but is not a directory (type %s)", ErrInvalidConfig, dest.Path, st.Type)
+	}
+	return nil
 }
 
 func (r daemonRemote) HashCapability(ctx context.Context) (remoteHashCapability, error) {

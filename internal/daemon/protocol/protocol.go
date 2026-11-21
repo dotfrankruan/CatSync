@@ -302,6 +302,7 @@ type StatResponse struct {
 const (
 	StatFile    = "file"
 	StatSymlink = "symlink"
+	StatDir     = "dir"
 	StatOther   = "other"
 )
 

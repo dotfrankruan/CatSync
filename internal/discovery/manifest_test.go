@@ -478,3 +478,23 @@ func TestMkdirCommandProgValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestEnsureDirCommand(t *testing.T) {
+	dest := target.Destination{User: "u", Host: "h", Path: "/data"}
+	argv, err := EnsureDirCommandProgPort("ssh", dest, false, 2222, "/data/it's here")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(argv) < 3 || argv[len(argv)-2] != "u@h" {
+		t.Fatalf("argv = %v", argv)
+	}
+	script := argv[len(argv)-1]
+	for _, want := range []string{"[ -L ", "[ -d ", "[ -e ", "mkdir -p -- ", "/data/it"} {
+		if !strings.Contains(script, want) {
+			t.Errorf("script lacks %q: %s", want, script)
+		}
+	}
+	if _, err := EnsureDirCommandProgPort("ssh", dest, false, 0, "relative/path"); err == nil {
+		t.Error("relative ensure-dir path accepted")
+	}
+}

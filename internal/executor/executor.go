@@ -1462,6 +1462,9 @@ func (e *Executor) execute(ctx context.Context) (retErr error) {
 			return err
 		}
 	}
+	if err := e.ensureDestinationRoot(ctx); err != nil {
+		return e.finalize([]string{fmt.Sprintf("destination root: %v", err)})
+	}
 	defer func() {
 		if e.progress != nil {
 			e.progress.Finish(retErr == nil)
@@ -1901,4 +1904,37 @@ func (e *Executor) removeRunCheckpointDir() {
 	if err := os.RemoveAll(dir); err != nil {
 		e.warnf("remove checkpoint directory %s: %v", dir, err)
 	}
+}
+
+// ensureDestinationRoot makes the directory-source destination root exist and
+// be a directory before any transfer write. Single-file runs keep their
+// point-to-point destination semantics, and dry runs never touch the
+// destination.
+func (e *Executor) ensureDestinationRoot(ctx context.Context) error {
+	if e.run == nil || e.run.Config.DryRun || e.run.Source.File != "" {
+		return nil
+	}
+	if e.run.Config.Direction.Effective() == state.DirectionRemoteToLocal {
+		root := e.run.Destination.Path
+		fi, err := os.Lstat(root)
+		switch {
+		case err == nil:
+			if !fi.IsDir() {
+				return fmt.Errorf("%w: local destination root %q exists but is not a directory", ErrInvalidConfig, root)
+			}
+			return nil
+		case errors.Is(err, os.ErrNotExist):
+			if err := os.MkdirAll(root, 0o755); err != nil {
+				return fmt.Errorf("create local destination root %q: %w", root, err)
+			}
+			fi, err = os.Lstat(root)
+			if err != nil || !fi.IsDir() {
+				return fmt.Errorf("local destination root %q is not a directory after creation", root)
+			}
+			return nil
+		default:
+			return fmt.Errorf("inspect local destination root %q: %w", root, err)
+		}
+	}
+	return e.remote.EnsureDestRoot(ctx)
 }

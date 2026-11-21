@@ -347,6 +347,8 @@ func (s *server) statRPC(req *protocol.StatRequest, w rpcWriter) {
 		kind = protocol.StatFile
 	case info.Mode()&os.ModeSymlink != 0:
 		kind = protocol.StatSymlink
+	case info.IsDir():
+		kind = protocol.StatDir
 	}
 	w.BeginJSON()
 	_ = w.JSON(protocol.StatResponse{

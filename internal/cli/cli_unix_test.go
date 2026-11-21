@@ -90,6 +90,11 @@ func (h *cliHarness) resetScriptCounters(tool string) {
 
 func (h *cliHarness) writeScript(tool, config string) {
 	h.t.Helper()
+	// Directory-source runs validate/create the destination root with one
+	// ssh invocation before any transfer. Mock ssh accepts it by default.
+	if tool == "ssh" {
+		config = "match=[ -L \nexit=0\n---\n" + config
+	}
 	dir := filepath.Join(h.scriptDir, tool)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		h.t.Fatal(err)

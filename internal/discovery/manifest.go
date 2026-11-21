@@ -431,6 +431,27 @@ func MkdirCommandProgPort(prog string, dest target.Destination, ipv6 bool, port 
 	return append(argv, b.String()), nil
 }
 
+// EnsureDirCommandProgPort builds one ssh invocation that makes dir exist as
+// a real directory or fails without changing anything: an existing non-
+// directory (including a symlink) is rejected; a missing path is created
+// with mkdir -p. It is used for directory-source destination roots before the
+// first transfer write so rsync never has to guess the target type.
+func EnsureDirCommandProgPort(prog string, dest target.Destination, ipv6 bool, port int, dir string) ([]string, error) {
+	if !strings.HasPrefix(dir, "/") || strings.ContainsRune(dir, 0) {
+		return nil, fmt.Errorf("discovery: ensure-dir path %q is not a clean absolute path", dir)
+	}
+	argv, err := sshArgv(prog, dest, ipv6, port)
+	if err != nil {
+		return nil, err
+	}
+	q := shellQuote(dir)
+	script := "if [ -L " + q + " ]; then echo 'destination root is a symlink, not a directory' >&2; exit 41; " +
+		"elif [ -d " + q + " ]; then :; " +
+		"elif [ -e " + q + " ]; then echo 'destination root exists but is not a directory' >&2; exit 41; " +
+		"else mkdir -p -- " + q + " || exit 1; fi"
+	return append(argv, script), nil
+}
+
 // sshArgv builds the leading tokens of an ssh invocation: program,
 // optional -6, and the [user@]host target.
 func sshArgv(prog string, dest target.Destination, ipv6 bool, port int) ([]string, error) {
