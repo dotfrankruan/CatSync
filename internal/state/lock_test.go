@@ -63,13 +63,13 @@ func TestLockContentionAndRelease(t *testing.T) {
 	if err := rel.Unlock(); err != nil {
 		t.Fatalf("second Unlock: %v", err)
 	}
-	// All lock files are gone; nothing lingers.
-	entries, err := os.ReadDir(filepath.Join(s.Dir(), "locks"))
+	// Lock files are kept (stable inode) but must not block a future run.
+	again, err := s.LockDestination(destA())
 	if err != nil {
-		t.Fatalf("ReadDir locks: %v", err)
+		t.Fatalf("relock with retained lock file: %v", err)
 	}
-	if len(entries) != 0 {
-		t.Errorf("%d lock files left behind", len(entries))
+	if err := again.Unlock(); err != nil {
+		t.Fatalf("Unlock again: %v", err)
 	}
 }
 
@@ -89,17 +89,29 @@ func TestLockErrorNamesHolder(t *testing.T) {
 	}
 }
 
-func TestLockStaleNotReclaimed(t *testing.T) {
-	// A lock left behind by a process that never unlocked (crash) blocks new
-	// runs instead of being silently reclaimed: overlapping writes to one
-	// destination are worse than a manual cleanup step.
+func TestLockFileExistenceDoesNotBlock(t *testing.T) {
+	// A lock file left behind by an older release (or a crashed process whose
+	// flock the kernel already released) must not block a new run. The file
+	// and its recorded PID are diagnostic only.
 	s := newStore(t)
-	if _, err := s.LockDestination(destA()); err != nil {
+	if err := os.MkdirAll(filepath.Join(s.Dir(), "locks"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := s.LockDestination(destA())
+	if err != nil {
 		t.Fatalf("LockDestination: %v", err)
 	}
-	// No Unlock: simulate the holder disappearing.
-	if _, err := s.LockDestination(destA()); !errors.Is(err, state.ErrLocked) {
-		t.Fatalf("stale lock = %v, want ErrLocked", err)
+	if err := lock.Unlock(); err != nil {
+		t.Fatalf("Unlock: %v", err)
+	}
+	// The file remains; acquisition must still succeed using the advisory
+	// lock rather than treating existence as ownership.
+	again, err := s.LockDestination(destA())
+	if err != nil {
+		t.Fatalf("LockDestination with retained lock file: %v", err)
+	}
+	if err := again.Unlock(); err != nil {
+		t.Fatalf("Unlock: %v", err)
 	}
 }
 
@@ -130,39 +142,23 @@ func TestLockLocalDestination(t *testing.T) {
 	}
 }
 
-func TestUnlockRefusesForeignLock(t *testing.T) {
+func TestUnlockAfterExternalFileRemoval(t *testing.T) {
 	s := newStore(t)
 	lock, err := s.LockDestination(destA())
 	if err != nil {
 		t.Fatalf("LockDestination: %v", err)
 	}
-	// Another holder replaces the file: simulate by removing ours and
-	// acquiring a fresh lock through the store.
 	entries, err := os.ReadDir(filepath.Join(s.Dir(), "locks"))
-	if err != nil {
-		t.Fatalf("ReadDir locks: %v", err)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("locks = %v, %v", entries, err)
 	}
-	if len(entries) != 1 {
-		t.Fatalf("want 1 lock file, got %d", len(entries))
+	// External tampering (manual removal) must not make Unlock panic or
+	// corrupt other state; the advisory lock is released by the handle.
+	if err := os.Remove(filepath.Join(s.Dir(), "locks", entries[0].Name())); err != nil {
+		t.Fatal(err)
 	}
-	path := filepath.Join(s.Dir(), "locks", entries[0].Name())
-	if err := os.Remove(path); err != nil {
-		t.Fatalf("Remove lock file: %v", err)
-	}
-	foreign, err := s.LockDestination(destA())
-	if err != nil {
-		t.Fatalf("foreign LockDestination: %v", err)
-	}
-	// The stale handle must refuse to delete the new holder's file.
-	if err := lock.Unlock(); err == nil {
-		t.Error("Unlock of stale handle succeeded, want refusal")
-	}
-	if _, err := os.Stat(path); err != nil {
-		t.Errorf("foreign lock file was removed: %v", err)
-	}
-	// The real holder can still release it.
-	if err := foreign.Unlock(); err != nil {
-		t.Errorf("foreign Unlock: %v", err)
+	if err := lock.Unlock(); err != nil {
+		t.Errorf("Unlock after external removal: %v", err)
 	}
 }
 

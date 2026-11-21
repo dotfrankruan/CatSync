@@ -18,11 +18,18 @@ import (
 // files, keeping them out of List's way.
 const locksDirName = "locks"
 
-// Lock is an exclusive, destination-scoped advisory lock held by the
-// existence of one lock file. Locks are nonblocking: a second holder fails
-// immediately with ErrLocked instead of waiting. A lock only ever creates
-// and removes its own file; run state and user data are never touched.
+// Lock is an exclusive, destination-scoped advisory lock. Ownership is held
+// by an OS advisory lock (flock) on a stable lock-file inode, not by the mere
+// existence of the file: a lock file left behind by a crashed process never
+// blocks a new run, because the kernel releases the advisory lock when the
+// holder's file descriptor closes.
+//
+// The file is deliberately never unlinked while a process may still open it:
+// removing it would allow a second inode to be created and locked
+// concurrently. Released files remain in the locks directory, unlocked and
+// empty; they are harmless and are reused by the next run.
 type Lock struct {
+	file  *os.File
 	path  string
 	dest  string
 	token string
@@ -31,8 +38,9 @@ type Lock struct {
 	released bool
 }
 
-// lockInfo is the JSON body of a lock file, recorded so a human can identify
-// the holder of a stale lock.
+// lockInfo is the JSON body of a held lock file, recorded so a human can
+// identify the holder. It is diagnostic only: no recovery decision may be
+// based on the PID or timestamp in it.
 type lockInfo struct {
 	Destination string    `json:"destination"`
 	PID         int       `json:"pid"`
@@ -43,6 +51,14 @@ type lockInfo struct {
 // Destination returns the canonical destination string this lock covers.
 func (l *Lock) Destination() string { return l.dest }
 
+// processLocks prevents two lock attempts in one process from both reaching
+// the OS lock. It is cleanup state only; the advisory lock remains the
+// cross-process authority.
+var processLocks = struct {
+	sync.Mutex
+	held map[string]bool
+}{held: make(map[string]bool)}
+
 // lockPath derives the lock file name for a destination key. The SHA-256
 // digest keeps the name short and free of characters that are unsafe in
 // file names, whatever the destination looks like; the human-readable
@@ -52,12 +68,18 @@ func lockPath(locksDir, key string) string {
 	return filepath.Join(locksDir, hex.EncodeToString(sum[:])+".lock")
 }
 
-// LockDestination acquires the exclusive nonblocking lock for dest. Two runs
-// writing the same remote tree can corrupt each other's data, so a second
-// caller fails immediately with an error wrapping ErrLocked that names the
-// recorded holder. The lock is deliberately not reclaimed when a process
-// dies holding it: a stale lock file is reported, and a human can remove it
-// once the holder is confirmed gone.
+// LockDestination acquires the exclusive nonblocking advisory lock for dest.
+// Two runs writing the same remote tree can corrupt each other's data, so a
+// second caller fails immediately with an error wrapping ErrLocked. The lock
+// is released automatically by the kernel if the process dies, including
+// SIGKILL; no manual stale-file cleanup is needed.
+//
+// The lock is only as reliable as the filesystem hosting the state
+// directory. Local filesystems (APFS, ext4, xfs) provide correct flock
+// semantics. Network filesystems or other environments that do not implement
+// advisory locks reliably cannot provide cross-host exclusion; LockDestination
+// fails closed (returns an error) when the OS reports advisory locking as
+// unsupported, rather than pretending to be a global lock.
 func (s *Store) LockDestination(dest Destination) (*Lock, error) {
 	if dest.Path == "" {
 		return nil, errors.New("state: cannot lock an incomplete destination")
@@ -83,82 +105,110 @@ func (s *Store) LockDestination(dest Destination) (*Lock, error) {
 		Token:       hex.EncodeToString(rnd[:]),
 		AcquiredAt:  time.Now().UTC(),
 	}
-	body, err := json.Marshal(info)
-	if err != nil {
-		return nil, fmt.Errorf("state: encode lock info: %w", err)
-	}
 	path := lockPath(locksDir, key)
-	// O_EXCL makes acquisition atomic and nonblocking.
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, fileMode)
+	releaseProcessSlot := func() {
+		processLocks.Lock()
+		delete(processLocks.held, path)
+		processLocks.Unlock()
+	}
+	processLocks.Lock()
+	if processLocks.held[path] {
+		processLocks.Unlock()
+		return nil, lockedError(path, key)
+	}
+	processLocks.held[path] = true
+	processLocks.Unlock()
+	fail := func(err error) (*Lock, error) {
+		releaseProcessSlot()
+		return nil, err
+	}
+
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, fileMode)
 	if err != nil {
-		if errors.Is(err, fs.ErrExist) {
-			return nil, lockedError(path, key)
-		}
-		return nil, fmt.Errorf("state: create lock file: %w", err)
+		return fail(fmt.Errorf("state: open lock file: %w", err))
 	}
-	// On any failure below the file is one this call just created, so
-	// removing it cannot delete another holder's lock.
-	if _, err := f.Write(body); err != nil {
-		f.Close()
-		os.Remove(path)
-		return nil, fmt.Errorf("state: write lock file: %w", err)
+	locked, lerr := tryLockFile(f)
+	if lerr != nil {
+		_ = f.Close()
+		return fail(fmt.Errorf("state: acquisition for %s failed: %w", key, lerr))
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(path)
-		return nil, fmt.Errorf("state: sync lock file: %w", err)
+	if !locked {
+		_ = f.Close()
+		return fail(lockedError(path, key))
 	}
-	if err := f.Close(); err != nil {
-		os.Remove(path)
-		return nil, fmt.Errorf("state: close lock file: %w", err)
+	if err := writeLockInfo(f, info); err != nil {
+		_ = releaseLockFile(f)
+		_ = f.Close()
+		return fail(fmt.Errorf("state: write lock file: %w", err))
 	}
-	_ = syncDir(locksDir) // best effort, see Save
-	return &Lock{path: path, dest: key, token: info.Token}, nil
+	return &Lock{file: f, path: path, dest: key, token: info.Token}, nil
 }
 
-// lockedError builds an ErrLocked error, naming the recorded holder when the
-// existing lock file is readable.
+// writeLockInfo replaces the diagnostic contents of the already-locked file.
+func writeLockInfo(f *os.File, info lockInfo) error {
+	body, err := json.Marshal(info)
+	if err != nil {
+		return err
+	}
+	if err := f.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		return err
+	}
+	if _, err := f.Write(body); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+// lockedError builds an ErrLocked error naming the holder when the lock file
+// can be read. It never advises removing the file: the file is not the lock.
 func lockedError(path, key string) error {
 	data, err := os.ReadFile(path)
 	if err == nil {
 		var info lockInfo
-		if err := json.Unmarshal(data, &info); err == nil {
-			return fmt.Errorf("%w: %s (held by pid %d since %s; remove %s once that process is gone)",
-				ErrLocked, key, info.PID, info.AcquiredAt.Format(time.RFC3339), path)
+		if err := json.Unmarshal(data, &info); err == nil && info.Destination != "" {
+			return fmt.Errorf("%w: %s (held by pid %d since %s; advisory lock still held by a running catsync process)",
+				ErrLocked, key, info.PID, info.AcquiredAt.Format(time.RFC3339))
 		}
 	}
-	return fmt.Errorf("%w: %s", ErrLocked, key)
+	return fmt.Errorf("%w: %s (advisory lock held by another catsync process)", ErrLocked, key)
 }
 
-// Unlock releases the lock. It is idempotent and removes the lock file only
-// after verifying the recorded token matches, so releasing can never delete
-// another holder's lock or any user data. A lock file that is already gone
-// is treated as released; one whose ownership cannot be verified is left in
-// place and reported.
+// Unlock releases the lock. It is idempotent. The lock file is kept (empty,
+// unlocked) to keep its inode stable; it is never unlinked by a holder.
 func (l *Lock) Unlock() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.released {
 		return nil
 	}
-	data, err := os.ReadFile(l.path)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			l.released = true
-			return nil
+	var firstErr error
+	if l.file != nil {
+		// Clear diagnostic contents while the advisory lock is still held.
+		if err := l.file.Truncate(0); err != nil && !errors.Is(err, fs.ErrClosed) {
+			firstErr = fmt.Errorf("state: clear lock file: %w", err)
 		}
-		return fmt.Errorf("state: read lock file: %w", err)
+		_ = l.file.Sync()
+		if err := releaseLockFile(l.file); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("state: release lock: %w", err)
+		}
+		if err := l.file.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("state: close lock file: %w", err)
+		}
+		l.file = nil
 	}
-	var info lockInfo
-	if err := json.Unmarshal(data, &info); err != nil {
-		return fmt.Errorf("state: cannot verify ownership of %s; not removing it", l.path)
-	}
-	if info.Token != l.token {
-		return fmt.Errorf("state: lock for %s is held by another owner; not removing it", l.dest)
-	}
-	if err := os.Remove(l.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("state: remove lock file: %w", err)
-	}
+	processLocks.Lock()
+	delete(processLocks.held, l.path)
+	processLocks.Unlock()
 	l.released = true
-	return nil
+	return firstErr
+}
+
+// releaseLockFile releases the advisory lock explicitly before close. Closing
+// the descriptor alone would also release it; this makes the ordering
+// explicit and surfaces errors.
+func releaseLockFile(f *os.File) error {
+	return unlockFile(f)
 }
