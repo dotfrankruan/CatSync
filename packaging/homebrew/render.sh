@@ -22,9 +22,9 @@ for v in "$darm" "$damd" "$larm" "$lamd"; do
 done
 sed \
   -e "s/__VERSION__/${version}/g" \
+  -e "s/__TAG__/${tag}/g" \
   -e "s/__SHA_DARWIN_ARM64__/${darm}/g" \
   -e "s/__SHA_DARWIN_AMD64__/${damd}/g" \
   -e "s/__SHA_LINUX_ARM64__/${larm}/g" \
   -e "s/__SHA_LINUX_AMD64__/${lamd}/g" \
-  -e "s/__TAG__/${tag}/g" \
   "$template"

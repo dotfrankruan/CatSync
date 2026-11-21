@@ -1,43 +1,51 @@
 # Formula source for the dotfrankruan/homebrew-catsync tap.
 #
-# This file is not published automatically: render it with
+# Render it from the published SHA256SUMS file:
 #   packaging/homebrew/render.sh VERSION dist/release/SHA256SUMS > catsync.rb
-# and commit the result to the tap. CatSync never publishes to the tap itself.
+# then copy the result into the tap's Formula/catsync.rb. CatSync never
+# publishes to the tap itself.
+#
+# Releases from the one-shot daemon milestone on ship both binaries in the
+# same archive. v0.1.0 contained only catsync; the tap's checked-in formula
+# keeps a conditional install so that historical release stays installable.
 class Catsync < Formula
-  desc "Crash-safe parallel file sync over ssh"
+  desc "Parallel, resumable file tree copier over SSH"
   homepage "https://github.com/dotfrankruan/CatSync"
   license "AGPL-3.0-only"
-  version "__VERSION__"
 
   on_macos do
-    if Hardware::CPU.arm?
+    on_arm do
       url "https://github.com/dotfrankruan/CatSync/releases/download/__TAG__/catsync_v__VERSION___darwin_arm64.tar.gz"
       sha256 "__SHA_DARWIN_ARM64__"
-    else
+    end
+    on_intel do
       url "https://github.com/dotfrankruan/CatSync/releases/download/__TAG__/catsync_v__VERSION___darwin_amd64.tar.gz"
       sha256 "__SHA_DARWIN_AMD64__"
     end
   end
 
   on_linux do
-    if Hardware::CPU.arm?
+    on_arm do
       url "https://github.com/dotfrankruan/CatSync/releases/download/__TAG__/catsync_v__VERSION___linux_arm64.tar.gz"
       sha256 "__SHA_LINUX_ARM64__"
-    else
+    end
+    on_intel do
       url "https://github.com/dotfrankruan/CatSync/releases/download/__TAG__/catsync_v__VERSION___linux_amd64.tar.gz"
       sha256 "__SHA_LINUX_AMD64__"
     end
   end
 
   def install
-    # Both binaries ship in every archive; catsyncd is the opt-in one-shot
-    # daemon agent and is never installed on remote hosts by catsync itself.
+    # Both binaries ship in every archive from the daemon milestone on. catsyncd is the
+    # opt-in one-shot daemon agent; installing it locally never installs or
+    # copies anything on remote hosts.
     bin.install "catsync", "catsyncd"
   end
 
   test do
-    assert_match version.to_s, shell_output("#{bin}/catsync version")
-    assert_match version.to_s, shell_output("#{bin}/catsyncd version")
-    assert_match "exec", shell_output("#{bin}/catsyncd probe --json")
+    assert_match "catsync v#{version}", shell_output("#{bin}/catsync version")
+    assert_match "Usage: catsync", shell_output("#{bin}/catsync help")
+    assert_match "catsyncd v#{version}", shell_output("#{bin}/catsyncd version")
+    assert_match "\"transports\"", shell_output("#{bin}/catsyncd probe --json")
   end
 end

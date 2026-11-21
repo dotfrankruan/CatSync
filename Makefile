@@ -8,7 +8,7 @@ GO ?= go
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 
-.PHONY: build test check cross release platforms clean install uninstall
+.PHONY: build test check cross release platforms clean install uninstall brew-formula
 
 build:
 	$(GO) build -ldflags "$(LDFLAGS)" -o bin/catsync ./cmd/catsync
@@ -65,6 +65,11 @@ clean:
 # install builds and copies the binary into BINDIR (default
 # $(PREFIX)/bin = ~/.local/bin). The directory is created if needed and the
 # file is replaced atomically by install(1).
+brew-formula:
+	@test -n "$(VERSION)" || { echo "usage: make brew-formula VERSION=vX.Y.Z (requires dist/release/SHA256SUMS)" >&2; exit 2; }
+	@test -f dist/release/SHA256SUMS || { echo "dist/release/SHA256SUMS missing; run make release first" >&2; exit 2; }
+	@packaging/homebrew/render.sh "$(VERSION)" dist/release/SHA256SUMS
+
 install: build
 	@mkdir -p "$(DESTDIR)$(BINDIR)"
 	install -m 0755 bin/catsync "$(DESTDIR)$(BINDIR)/catsync"

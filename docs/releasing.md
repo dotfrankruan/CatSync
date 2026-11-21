@@ -38,7 +38,38 @@ with hash placeholders and `packaging/homebrew/render.sh` to fill them from
 `dist/release/SHA256SUMS`. Publishing to the tap is a separate, manual step
 and is not performed by CatSync.
 
-## 2. Bump the Homebrew formula
+## 2. Update the Homebrew tap (manual)
+
+The tap lives in a separate repository (`dotfrankruan/homebrew-catsync`) and
+is never updated automatically. After the release workflow has published the
+archives:
+
+```bash
+make release VERSION=v0.2.0
+make brew-formula VERSION=v0.2.0 > /tmp/catsync.rb
+```
+
+Then, in a clone of the tap:
+
+```bash
+cp /tmp/catsync.rb Formula/catsync.rb
+brew style Formula/catsync.rb
+# Register the local clone once if needed:
+#   brew tap dotfrankruan/catsync /path/to/homebrew-catsync
+brew audit --strict dotfrankruan/catsync/catsync
+brew test dotfrankruan/catsync/catsync
+git commit -am "catsync v0.2.0"
+git push   # only when you explicitly intend to publish the tap
+```
+
+Releases from the one-shot daemon milestone on contain both `catsync` and
+`catsyncd` in every archive, so the rendered formula installs and tests both.
+The currently checked-in tap formula still carries a conditional install for
+the historical v0.1.0 archive, which shipped only `catsync`; after the first
+release containing `catsyncd`, that conditional can be removed and the
+formula replaced with the rendered one verbatim.
+
+## 3. Bump the Homebrew formula (legacy notes)
 
 The formula pins the release URLs and their SHA-256 values, so it must be
 updated for every tag. The checksums are the `SHA256SUMS` asset of the release:
