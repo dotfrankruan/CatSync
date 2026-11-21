@@ -50,9 +50,12 @@ existence of a lock file: if a process crashes (including SIGKILL and power
 loss) the kernel releases the lock, so the next run proceeds without manual
 lock-file cleanup. Lock files are intentionally never unlinked while they may
 be opened, and released files remain on disk, unlocked and empty. Advisory
-locks are only trustworthy on filesystems that implement them; on network
-filesystems or other hosts sharing a state directory without reliable flock
-support, `catsync` fails closed instead of claiming cross-host exclusion.
+locks are only trustworthy between processes on the same host using the same
+state directory on a filesystem that implements them. Sharing a state
+directory across hosts, or putting it on a network filesystem without reliable
+flock semantics, is not supported: `catsync` fails closed when the OS reports
+advisory locking as unavailable, but it cannot detect a network filesystem
+that accepts flock with only local semantics.
 
 ## Execution stages
 
