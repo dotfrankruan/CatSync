@@ -447,6 +447,7 @@ type daemonTransportOptions struct {
 	DaemonTransport    string
 	QUICQLogPath       string
 	RemoteQUICQLogPath string
+	Detach             bool
 }
 
 // newDaemonControlTransport builds the production SSH bootstrap transport.
@@ -458,6 +459,7 @@ var newDaemonControlTransport = func(o daemonTransportOptions) daemon.ControlTra
 		Env: o.Env, Stderr: o.Stderr, ForwardLocalPort: o.ForwardLocalPort,
 		DaemonTransport: o.DaemonTransport,
 		RemoteQUICQLog:  o.RemoteQUICQLogPath,
+		Detach:          o.Detach,
 	}
 }
 
@@ -497,15 +499,17 @@ func (e *Executor) ensureRemote(ctx context.Context) (remoteOps, error) {
 		DaemonTransport:    e.daemonTransport(),
 		QUICQLogPath:       e.quicQLogPath(),
 		RemoteQUICQLogPath: e.remoteQUICQLogPath(),
+		Detach:             e.daemonBootstrap() == "direct",
 	}
 	client, err := daemon.Bootstrap(ctx, daemon.BootstrapConfig{
-		Transport:     newDaemonControlTransport(opts),
-		Version:       "catsync",
-		Host:          endpoint.Host,
-		DaemonAddr:    daemonAddr,
-		DataTransport: e.daemonTransport(),
-		Stderr:        e.stderr,
-		QUICQLogPath:  e.quicQLogPath(),
+		Transport:      newDaemonControlTransport(opts),
+		Version:        "catsync",
+		Host:           endpoint.Host,
+		DaemonAddr:     daemonAddr,
+		DataTransport:  e.daemonTransport(),
+		Stderr:         e.stderr,
+		QUICQLogPath:   e.quicQLogPath(),
+		RequestHandoff: e.daemonBootstrap() == "direct",
 	})
 	if err != nil {
 		return nil, fmt.Errorf("executor: daemon bootstrap: %w", err)

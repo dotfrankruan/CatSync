@@ -195,6 +195,14 @@ A task is completed only after subprocess success, unchanged-source checks,
 and requested verification. On startup, `running` becomes `pending` with an
 interruption error so `resume` can revalidate it.
 
+Run-state compatibility is one-way: the current binary reads older additive
+run documents, but an older binary may reject fields added by a newer one.
+All clients sharing a state directory must be upgraded together. A strict
+decode failure such as `unknown field "transport"` therefore usually means
+an older `catsync` binary (for example one earlier in `PATH`) is reading a
+newer run; run `catsync version` and the explicit path of the intended binary
+before assuming the state file is corrupt.
+
 Persistence failures are correctness failures, not warnings. A task's
 `running` state is saved before its subprocess starts, and a failed save
 prevents the launch and propagates to the command. For the parallel
@@ -279,6 +287,39 @@ The local rsh agent bridges rsync's `-e "<catsync> rsh"` to the exec channel:
 a private 0700 directory, a 0600 Unix socket, same-uid peer credentials,
 and a random per-run token passed only through the environment. This is what
 keeps direct daemon mode at exactly one ssh session.
+
+### SSH bootstrap lifecycle handoff (direct TCP / QUIC)
+
+The SSH bootstrap is a trust-establishment channel, not the owner of the
+running session. In direct mode `catsyncd` is started under a `setsid -w`
+wrapper, which puts the one-shot worker in its own session while the wrapper
+keeps the SSH channel open for the bootstrap exchange. Once the client has
+verified the server certificate, the server has verified and pinned the
+client certificate, and the authenticated data control channel has passed its
+control precheck, the client sends a handoff request over that data channel.
+The request carries the bootstrap session id; the server accepts it only when
+the id matches and only when it was launched with the detach capability.
+
+The server writes the `detached` response on the authenticated channel first,
+then closes its SSH stdin/stdout/stderr descriptors and stops treating SSH
+EOF or SSH `bye` as shutdown authority. The client kills only its local
+bootstrap ssh process after that response. The remote worker is already in a
+new OS session, so the established data plane survives the SSH process
+disappearing. The direct data CONTROL channel now carries heartbeats and the
+graceful data-plane `bye`; a client crash is detected by a bounded heartbeat
+timeout, and normal completion makes the one-shot worker drain and exit.
+There is no permanent listener or service.
+
+If any of those steps fails before the server commits the handoff, the SSH
+bootstrap remains authoritative and the run fails/cleans up rather than
+leaving an untrusted worker. If the data connection itself is lost later, the
+run fails safely and is resumable; this feature does not implement passwordless
+re-authentication of a *new* direct session without SSH.
+
+SSH forwarding is deliberately excluded: its data connections live inside the
+SSH channel, so the SSH tunnel must stay alive. Legacy SSH is unchanged.
+The complete sequence is illustrated in
+[ssh-handoff.svg](assets/ssh-handoff.svg).
 
 ## Compatibility and limitations
 

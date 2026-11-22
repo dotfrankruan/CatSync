@@ -27,7 +27,8 @@ type QUICControlRequest struct {
 // IsControlPath reports whether path is one of the six frozen RPC paths.
 func IsControlPath(path string) bool {
 	switch path {
-	case "/v1/manifest", "/v1/mkdir", "/v1/metadata", "/v1/hash", "/v1/stat", "/v1/samefile":
+	case "/v1/manifest", "/v1/mkdir", "/v1/metadata", "/v1/hash", "/v1/stat", "/v1/samefile",
+		"/v1/handoff", "/v1/heartbeat", "/v1/bye":
 		return true
 	}
 	return false

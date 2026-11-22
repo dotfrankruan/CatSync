@@ -44,6 +44,10 @@ type ServerConfig struct {
 	// to the given local file (created with mode 0600) and enables
 	// low-overhead application progress diagnostics.
 	QUICQLogPath string
+	// DetachOnHandoff allows a direct bootstrap to hand session ownership to
+	// an authenticated data control channel. It is set only when the remote
+	// process was started under a detaching wrapper.
+	DetachOnHandoff bool
 	// Manifest bounds traversal memory and stream size; zero fields default.
 	Manifest manifestConfig
 	// CertTTL is the ephemeral certificate lifetime.
@@ -183,6 +187,13 @@ type server struct {
 	quicExecSem chan struct{}
 	quicCtrlSem chan struct{}
 	quicAct     *quicActivity
+
+	// Detached lifecycle: after handoff the SSH bootstrap is no longer the
+	// liveness authority; authenticated data-control heartbeats are.
+	sessionID   string
+	detached    atomic.Bool
+	lastDirect  atomic.Int64
+	shutdownReq chan bool
 }
 
 // Serve runs the one-shot bootstrap and, on success, serves until bye, a
@@ -327,7 +338,10 @@ func Serve(ctx context.Context, cfg ServerConfig) int {
 		quicExecSem: make(chan struct{}, cfg.Limits.MaxExecStreams),
 		quicCtrlSem: make(chan struct{}, cfg.Limits.MaxControlStreams),
 		quicAct:     newQUICActivity(cfg.QUICQLogPath != ""),
+		sessionID:   session,
+		shutdownReq: make(chan bool, 1),
 	}
+	srv.lastDirect.Store(time.Now().UnixNano())
 	if cfg.Transport == "quic" {
 		go srv.quicAcceptLoop(logf)
 	} else {
@@ -359,6 +373,9 @@ func Serve(ctx context.Context, cfg ServerConfig) int {
 				case *pingMsg:
 					_ = writer.send(&pongMsg{Type: msgPong, Seq: msg.Seq})
 				case *byeMsg:
+					if srv.detached.Load() {
+						return
+					}
 					srv.shutdown(writer, logf, true)
 					return
 				case *errorMsg:
@@ -369,6 +386,9 @@ func Serve(ctx context.Context, cfg ServerConfig) int {
 					return
 				}
 			case err := <-reader.errs:
+				if srv.detached.Load() {
+					return
+				}
 				if !errors.Is(err, io.EOF) {
 					logf("control channel error: %v", err)
 				}
@@ -392,12 +412,28 @@ func Serve(ctx context.Context, cfg ServerConfig) int {
 			<-srv.done
 			return srv.exitCode()
 		case <-ticker.C:
-			if time.Since(time.Unix(0, lastControl.Load())) > cfg.ControlTimeout {
-				logf("control channel silent for %s; terminating", cfg.ControlTimeout)
+			last := lastControl.Load()
+			authority := "control channel"
+			if srv.detached.Load() {
+				last = srv.lastDirect.Load()
+				authority = "detached data control channel"
+			}
+			if time.Since(time.Unix(0, last)) > cfg.ControlTimeout {
+				logf("%s silent for %s; terminating", authority, cfg.ControlTimeout)
 				srv.shutdown(writer, logf, false)
 				<-srv.done
 				return srv.exitCode()
 			}
+		case graceful := <-srv.shutdownReq:
+			// The lifecycle RPC response must be written before DRAINING
+			// closes the data plane. Wait for the handler's counter to drain.
+			deadline := time.Now().Add(time.Second)
+			for srv.counters.rpcActive.Load() > 0 && time.Now().Before(deadline) {
+				time.Sleep(5 * time.Millisecond)
+			}
+			srv.shutdown(writer, logf, graceful)
+			<-srv.done
+			return srv.exitCode()
 		}
 	}
 }
@@ -638,7 +674,7 @@ func (s *server) shutdown(writer *controlWriter, logf func(string, ...any), grac
 				Children: snap.children, Drained: s.drained,
 			})
 		}
-		if graceful {
+		if graceful && !s.detached.Load() {
 			if snap != (countsSnapshot{}) {
 				_ = writer.send(&errorMsg{Type: msgError, Code: protocol.CodeShutdownTimeout,
 					Message: fmt.Sprintf("drain timed out: rpc=%d sftp=%d exec=%d children=%d", snap.rpc, snap.sftp, snap.exec, snap.children)})

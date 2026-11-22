@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 520" width="920" height="520" role="img" aria-label="CatSync SSH bootstrap lifecycle handoff">
+  <title>CatSync direct-mode SSH bootstrap lifecycle handoff</title>
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #1f2328; }
+    .box { fill: #f6f8fa; stroke: #57606a; stroke-width: 1.5; }
+    .client { fill: #dbeafe; stroke: #2563eb; }
+    .server { fill: #dcfce7; stroke: #16a34a; }
+    .data { fill: #fef3c7; stroke: #d97706; }
+    .arrow { stroke: #57606a; stroke-width: 2; fill: none; }
+    .dash { stroke-dasharray: 7 5; }
+    .label { font-size: 13px; }
+    .small { font-size: 11px; fill: #57606a; }
+    .title { font-size: 20px; font-weight: 700; }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #e6edf3; }
+      .box { fill: #21262d; stroke: #8b949e; }
+      .client { fill: #172554; stroke: #60a5fa; }
+      .server { fill: #052e16; stroke: #4ade80; }
+      .data { fill: #451a03; stroke: #fbbf24; }
+      .arrow { stroke: #8b949e; }
+      .small { fill: #8b949e; }
+    }
+  </style>
+  <text x="24" y="34" class="title">SSH establishes trust. The direct transport owns the session.</text>
+  <text x="24" y="56" class="small">Direct TCP / QUIC bootstrap; SSH forwarding and legacy SSH keep their existing SSH-bound lifecycle.</text>
+
+  <rect x="24" y="86" width="180" height="330" rx="10" class="client"/>
+  <text x="114" y="112" text-anchor="middle" class="label" font-weight="700">Mac client</text>
+  <rect x="42" y="130" width="144" height="52" rx="6" class="box"/>
+  <text x="114" y="151" text-anchor="middle" class="label">catsync CLI</text>
+  <text x="114" y="169" text-anchor="middle" class="small">planner + executor</text>
+  <rect x="42" y="202" width="144" height="52" rx="6" class="box"/>
+  <text x="114" y="223" text-anchor="middle" class="label">bootstrap client</text>
+  <text x="114" y="241" text-anchor="middle" class="small">ephemeral cert + nonce</text>
+  <rect x="42" y="278" width="144" height="60" rx="6" class="data"/>
+  <text x="114" y="300" text-anchor="middle" class="label">authenticated mTLS</text>
+  <text x="114" y="318" text-anchor="middle" class="small">CONTROL + SFTP + EXEC</text>
+  <rect x="42" y="360" width="144" height="38" rx="6" class="box"/>
+  <text x="114" y="383" text-anchor="middle" class="small">checkpoint / resume</text>
+
+  <rect x="694" y="86" width="202" height="330" rx="10" class="server"/>
+  <text x="795" y="112" text-anchor="middle" class="label" font-weight="700">Debian VPS</text>
+  <rect x="712" y="130" width="166" height="52" rx="6" class="box"/>
+  <text x="795" y="151" text-anchor="middle" class="label">sshd</text>
+  <text x="795" y="169" text-anchor="middle" class="small">one bootstrap session</text>
+  <rect x="712" y="202" width="166" height="52" rx="6" class="box"/>
+  <text x="795" y="223" text-anchor="middle" class="label">catsyncd bootstrap</text>
+  <text x="795" y="241" text-anchor="middle" class="small">cert verify + pin</text>
+  <rect x="712" y="278" width="166" height="60" rx="6" class="data"/>
+  <text x="795" y="300" text-anchor="middle" class="label">one-shot worker</text>
+  <text x="795" y="318" text-anchor="middle" class="small">setsid-detached session</text>
+  <rect x="712" y="360" width="166" height="38" rx="6" class="box"/>
+  <text x="795" y="383" text-anchor="middle" class="small">heartbeat timeout / bye</text>
+
+  <path d="M188 227 L694 227" class="arrow"/>
+  <text x="440" y="217" text-anchor="middle" class="small">SSH bootstrap: server_hello → client_hello → bind → ready → ready_ack → active_ack</text>
+  <path d="M188 305 L694 305" class="arrow"/>
+  <text x="440" y="295" text-anchor="middle" class="small">pinned mTLS 1.3 data control (TCP) or QUIC TLS 1.3 (no 0-RTT)</text>
+  <path d="M560 330 L560 358" class="arrow"/>
+  <text x="572" y="350" class="small">handoff</text>
+  <path d="M188 250 C 320 250, 380 450, 560 450 S 680 390, 712 390" class="arrow dash"/>
+  <text x="500" y="470" text-anchor="middle" class="small">after handoff: bootstrap ssh is closed; data heartbeats and bye own the lifecycle</text>
+  <text x="24" y="500" class="small">Server exits after authenticated bye, a bounded data-control heartbeat timeout, or shutdown. No permanent daemon, no persisted identity.</text>
+</svg>

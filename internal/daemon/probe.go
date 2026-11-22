@@ -87,6 +87,16 @@ func Probe(version string) ProbeReport {
 	if rsync == "" {
 		notes = "rsync not found; the exec channel is disabled (rsync batches fall back to ssh)"
 	}
+	// The direct lifecycle handoff is enabled by catsync's launch wrapper,
+	// which uses setsid on the remote host. Probe can only report whether the
+	// prerequisite exists; the authenticated handshake negotiates the actual
+	// behavior.
+	if _, err := exec.LookPath("setsid"); err == nil {
+		if notes != "" {
+			notes += "; "
+		}
+		notes += "direct TCP/QUIC handoff prerequisite setsid is available"
+	}
 	return ProbeReport{
 		Version:     version,
 		Protocol:    protocol.Version,

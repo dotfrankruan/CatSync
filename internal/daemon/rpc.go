@@ -77,6 +77,9 @@ func (s *server) httpHandler() http.Handler {
 	mux.HandleFunc("/v1/hash", s.handleHashHTTP)
 	mux.HandleFunc("/v1/stat", s.handleStatHTTP)
 	mux.HandleFunc("/v1/samefile", s.handleSameFileHTTP)
+	mux.HandleFunc("/v1/handoff", s.handleHandoffHTTP)
+	mux.HandleFunc("/v1/heartbeat", s.handleHeartbeatHTTP)
+	mux.HandleFunc("/v1/bye", s.handleByeHTTP)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.counters.rpcActive.Add(1)
 		defer s.counters.rpcActive.Add(-1)
@@ -204,6 +207,71 @@ func (s *server) handleSameFileHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.sameFileRPC(&req, &httpRPCWriter{w: w})
+}
+
+func (s *server) handleHandoffHTTP(w http.ResponseWriter, r *http.Request) {
+	var req protocol.HandoffRequest
+	if err := decodeRequest(w, r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	var out protocol.LifecycleResponse
+	rw := &lifecycleJSONWriter{w: w, out: &out}
+	s.handoffRPC(&req, rw)
+	if !rw.failed {
+		writeJSON(w, http.StatusOK, out)
+	}
+}
+
+func (s *server) handleHeartbeatHTTP(w http.ResponseWriter, r *http.Request) {
+	var req protocol.HeartbeatRequest
+	if err := decodeRequest(w, r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	var out protocol.LifecycleResponse
+	rw := &lifecycleJSONWriter{w: w, out: &out}
+	s.heartbeatRPC(&req, rw)
+	if !rw.failed {
+		writeJSON(w, http.StatusOK, out)
+	}
+}
+
+func (s *server) handleByeHTTP(w http.ResponseWriter, r *http.Request) {
+	var req protocol.ByeRequest
+	if err := decodeRequest(w, r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	var out protocol.LifecycleResponse
+	rw := &lifecycleJSONWriter{w: w, out: &out}
+	s.byeRPC(&req, rw)
+	if !rw.failed {
+		writeJSON(w, http.StatusOK, out)
+	}
+}
+
+// lifecycleJSONWriter adapts a lifecycle response to the shared rpcWriter
+// interface. The HTTP adapter needs to add the status code/header exactly
+// once after the handler has completed.
+type lifecycleJSONWriter struct {
+	w      http.ResponseWriter
+	out    *protocol.LifecycleResponse
+	failed bool
+}
+
+func (l *lifecycleJSONWriter) BeginJSON() {}
+func (l *lifecycleJSONWriter) JSON(v any) error {
+	if r, ok := v.(protocol.LifecycleResponse); ok {
+		*l.out = r
+	}
+	return nil
+}
+func (l *lifecycleJSONWriter) BeginStream() *json.Encoder { return json.NewEncoder(l.w) }
+func (l *lifecycleJSONWriter) Flush()                     {}
+func (l *lifecycleJSONWriter) Abort(err error) {
+	l.failed = true
+	writeError(l.w, err)
 }
 
 // Business operations ------------------------------------------------------
@@ -489,6 +557,27 @@ func (s *server) dispatchControlRPC(ctx context.Context, path string, body []byt
 			return
 		}
 		s.sameFileRPC(&req, w)
+	case "/v1/handoff":
+		var req protocol.HandoffRequest
+		if err := decodeBody(body, &req); err != nil {
+			w.Abort(err)
+			return
+		}
+		s.handoffRPC(&req, w)
+	case "/v1/heartbeat":
+		var req protocol.HeartbeatRequest
+		if err := decodeBody(body, &req); err != nil {
+			w.Abort(err)
+			return
+		}
+		s.heartbeatRPC(&req, w)
+	case "/v1/bye":
+		var req protocol.ByeRequest
+		if err := decodeBody(body, &req); err != nil {
+			w.Abort(err)
+			return
+		}
+		s.byeRPC(&req, w)
 	default:
 		w.Abort(protocol.NewError(protocol.CodeInvalidArgument, "unknown control path %q", path))
 	}

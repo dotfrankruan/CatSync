@@ -247,11 +247,28 @@ How it works:
    unchanged; the daemon server enforces its own connection budgets and
    fails with `CONNECTION_LIMIT` before any write if the plan would exceed
    them.
-4. When the run ends the client sends `bye`; the server drains, closes data
-   connections before terminating children, reports final counters, and
-   exits. Interrupted runs leave checkpoints and resume exactly as before;
-   resume creates new ephemeral identities and bootstraps a new one-shot
-   server.
+4. For direct TCP/QUIC, after both pinned identities are verified and the
+   authenticated data control channel has passed its control precheck, the
+   client hands lifecycle ownership to that channel. The server confirms
+   `detached` on the authenticated channel, closes the SSH bootstrap stdio,
+   and keeps the one-shot worker alive in its own OS session. The client then
+   terminates only its local bootstrap ssh process. From that point data
+   heartbeats and the final data-plane `bye` own the session; SSH is not
+   needed again for this run.
+5. When the run ends the client sends an authenticated data-plane `bye`; the
+   server drains, closes data connections before terminating children, reports
+   final counters, and exits. If the client dies, the server exits after the
+   bounded data-control heartbeat timeout. Interrupted runs leave checkpoints
+   and resume exactly as before; resume creates new ephemeral identities and
+   bootstraps a new one-shot server using SSH again.
+
+**Direct-mode lifecycle:** SSH is used once to establish trust. Direct TCP and
+direct QUIC can continue after the SSH bootstrap exits. `ssh-forward` data
+connections genuinely live inside the SSH tunnel, so that mode still requires
+SSH for its whole lifetime. Legacy `--transport ssh` is unchanged. A direct
+run whose data connection is lost fails safely and can be resumed, but CatSync
+does not claim to re-establish a new direct session without SSH authentication;
+resume always performs a fresh trusted bootstrap.
 
 Options (also accepted by `resume` to override only the recorded values):
 
@@ -260,7 +277,7 @@ Options (also accepted by `resume` to override only the recorded values):
 | `--transport=ssh|daemon` | Data transport. Default `ssh` on new runs; resume inherits the recorded value. |
 | `--daemon-port N` | Daemon TCP/UDP port. `0` requests an ephemeral port and is distinct from unset. Default 43411. |
 | `--daemon-transport tcp|quic` | `tcp` (default) uses one pinned mTLS connection per data stream. `quic` (experimental) uses one UDP QUIC connection per run with multiplexed streams; ALPN is fixed to `catsync-quic/1`, 0-RTT is disabled, and stream budgets are enforced separately. |
-| `--daemon-bootstrap direct|ssh-forward` | `direct` dials the mTLS port directly. `ssh-forward` uses the same ssh bootstrap process with `-L 127.0.0.1:<local>:127.0.0.1:<daemon-port>`; the inner connections are still mTLS. Requires a fixed non-zero port and a loopback listen address. |
+| `--daemon-bootstrap direct|ssh-forward` | `direct` dials the mTLS port directly and, once authenticated, detaches the session from SSH so the transfer can outlive the bootstrap. `ssh-forward` uses the same ssh bootstrap process with `-L 127.0.0.1:<local>:127.0.0.1:<daemon-port>`; its data path remains dependent on SSH. Requires a fixed non-zero port and a loopback listen address. |
 | `--remote-catsyncd PATH` | Name or absolute path of the remote `catsyncd`. CatSync never installs or uploads it. |
 | `--daemon-listen ADDR` | Value passed to `catsyncd serve --listen`. With ssh-forward it must be loopback. |
 | `--quic-qlog PATH` | Optional diagnostic: write the local QUIC qlog trace to `PATH` (created owner-only, mode 0600). Enables per-stream `last progress` diagnostics on stderr. QUIC only. |
@@ -269,7 +286,10 @@ Options (also accepted by `resume` to override only the recorded values):
 
 Prerequisites on the remote host: an executable `catsyncd`, a working
 OpenSSH `sftp-server` for native transfers, and (only if the plan contains
-small batches or mirror stages) `rsync`. `catsync daemon probe USER@HOST`
+small batches or mirror stages) `rsync`. Direct TCP/QUIC detachment also
+needs a `setsid` utility on the remote host; when it is unavailable the
+client prints a warning and keeps the SSH-bound lifecycle for that run rather
+than claiming a safe handoff. `catsync daemon probe USER@HOST`
 runs the read-only capability probe over one ssh session and prints what the
 remote host can do; missing software is reported, never installed.
 
@@ -279,6 +299,11 @@ Security and failure behavior:
   pinned. TLS requires 1.3, mutual authentication, the pinned leaf, and a
   known ALPN. Unauthenticated or wrong-pin connections cannot execute an RPC
   or start a child process.
+- Direct handoff is accepted only over the pinned mTLS/QUIC data control
+  channel and only with the bootstrap session id. Unauthenticated or
+  wrong-session requests cannot detach a worker; a failed handoff leaves the
+  SSH bootstrap as the authority and fails cleanly instead of orphaning a
+  daemon.
 - `exec` only runs a fixed absolute `rsync` with a strictly validated
   `--server` argument vector; no shell, arbitrary program, or environment
   passthrough. See docs/architecture.md.
@@ -575,6 +600,14 @@ itself. They never change tool behavior, and their values are never printed.
 never runs or probes those tools.
 
 ## Troubleshooting
+
+If `catsync status` or `resume` reports `corrupt run state ... unknown field
+"transport"`, an older `catsync` binary is reading a run written by a newer
+release. Check `command -v catsync` / `catsync version`; a user-local install
+can shadow a newer Homebrew or release binary. Upgrade the binary in `PATH`
+rather than editing the state file. State formats are not forward
+compatible: all clients sharing a state directory must be upgraded together.
+
 
 **A run stopped; what now?** Run the same `copy`/`sync` command again (it resumes
 the same job automatically) or `catsync resume`. Nothing already durable is

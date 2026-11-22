@@ -321,3 +321,25 @@ type SameFileResponse struct {
 type ErrorResponse struct {
 	Error *Error `json:"error"`
 }
+
+// HandoffRequest is sent over an already authenticated data control channel.
+// SessionID binds the request to the run's bootstrap exchange; a missing or
+// mismatched id is rejected.
+type HandoffRequest struct {
+	SessionID string `json:"session_id"`
+}
+
+// LifecycleResponse reports the state of a lifecycle control request.
+type LifecycleResponse struct {
+	State string `json:"state"`
+}
+
+// HeartbeatRequest keeps the detached data control channel live.
+type HeartbeatRequest struct {
+	SessionID string `json:"session_id"`
+}
+
+// ByeRequest gracefully ends a detached session.
+type ByeRequest struct {
+	SessionID string `json:"session_id"`
+}

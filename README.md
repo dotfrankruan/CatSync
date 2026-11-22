@@ -78,6 +78,10 @@ catsync copy --transport daemon ~/src user@host:/data
 The run starts exactly one ssh bootstrap session. Over that authenticated
 channel the two sides exchange fresh in-memory ECDSA certificates, then use
 pinned mutual TLS 1.3 for the data plane (SFTP streams, rsync exec, RPC).
+For direct TCP and direct QUIC, the authenticated data control channel then
+takes ownership: the SSH bootstrap exits and the transfer continues without
+it; the remote one-shot worker exits on the final authenticated bye or a
+bounded heartbeat timeout. `ssh-forward` still depends on its SSH tunnel.
 An experimental QUIC data transport multiplexes all streams over one UDP
 connection (`--daemon-transport quic`, ALPN `catsync-quic/1`, no 0-RTT).
 The certificates and session nonces exist only for that run and are never
@@ -87,7 +91,8 @@ never downloads, copies, or installs it. Default behavior without
 `--transport daemon` is unchanged: plain ssh, exactly as before.
 
 See [docs/usage.md](docs/usage.md#daemon-transport-one-shot-catsyncd) for
-options, security model, resume behavior, and limitations.
+options, security model, resume behavior, and limitations. The lifecycle
+handoff is illustrated in [docs/assets/ssh-handoff.svg](docs/assets/ssh-handoff.svg).
 
 ## Releases
 
@@ -150,6 +155,8 @@ CatSync.
 - [docs/usage.md](docs/usage.md) — commands, options, backend selection,
   verification, authentication, troubleshooting, limitations.
 - [docs/architecture.md](docs/architecture.md) — how the transfer stages,
-  checkpoints, resume, and state model work.
+  checkpoints, resume, state model, and SSH lifecycle handoff work.
+- [docs/benchmark.md](docs/benchmark.md) — measured transport performance,
+  real SSH handoff acceptance, and known limitations.
 - [third_party/](third_party/) — licenses of the linked Go modules (the main
   license is [AGPL-3.0-only](LICENSE)).

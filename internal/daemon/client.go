@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -60,6 +61,10 @@ type SSHTransport struct {
 	// RemoteQUICQLog is an absolute remote path where catsyncd writes its
 	// QUIC qlog trace. Empty disables remote qlog diagnostics.
 	RemoteQUICQLog string
+	// Detach asks the remote launch wrapper to detach catsyncd from the SSH
+	// session after a successful authenticated handoff. Only direct
+	// bootstrap uses this; SSH forwarding must stay bound to its tunnel.
+	Detach bool
 }
 
 // command builds the ssh argv for this transport.
@@ -105,6 +110,17 @@ func (t SSHTransport) command() ([]string, error) {
 			return nil, protocol.NewError(protocol.CodeInvalidArgument, "remote QUIC qlog requires the quic daemon transport")
 		}
 		remoteCmd += " --quic-qlog " + discovery.ShellQuote(t.RemoteQUICQLog)
+	}
+	if t.Detach {
+		// setsid -w creates a new session for catsyncd while the wrapper keeps
+		// the SSH channel open for the bootstrap. The env marker enables the
+		// detached handoff only when catsyncd really is launched in that
+		// wrapper; without setsid we deliberately stay on the SSH-bound
+		// lifecycle instead of pretending a handoff would be safe.
+		quoted := remoteCmd
+		remoteCmd = "if command -v setsid >/dev/null 2>&1; then " +
+			"CATSYNC_DETACH_ON_HANDOFF=1 setsid -w " + quoted +
+			"; else " + quoted + "; fi"
 	}
 	who := t.Host
 	if t.User != "" {
@@ -188,6 +204,16 @@ func (s *sshControlSession) Wait(ctx context.Context) error {
 	return s.h.Wait()
 }
 
+// Kill terminates the local bootstrap ssh process. After a successful
+// handoff the remote worker is in its own session, so killing the client-side
+// ssh cannot tear down the established data plane. Closing only the pipes is
+// not enough: the remote setsid wrapper waits for its child and would keep the
+// channel (and this process) alive for the whole transfer.
+func (s *sshControlSession) Kill() error {
+	s.cancel()
+	return nil
+}
+
 // StderrTail returns captured ssh diagnostics for error classification.
 func (s *sshControlSession) StderrTail() string { return s.tail.String() }
 
@@ -239,6 +265,10 @@ type BootstrapConfig struct {
 	// to the given local file (created with mode 0600) and enables
 	// low-overhead application progress diagnostics.
 	QUICQLogPath string
+	// RequestHandoff asks the server to detach the lifecycle from SSH after
+	// the pinned data control connection is authenticated. It is used only
+	// for direct TCP/QUIC bootstrap.
+	RequestHandoff bool
 
 	HandshakeTimeout  time.Duration
 	ControlTimeout    time.Duration
@@ -276,6 +306,11 @@ type Client struct {
 	control error
 
 	stderr io.Writer
+
+	detached    atomic.Bool
+	sshDetachCh chan struct{}
+	heartbeat   time.Duration
+	timing      *timingRecorder
 }
 
 // Bootstrap performs the full handshake and returns a ready client.
@@ -295,11 +330,14 @@ func Bootstrap(ctx context.Context, cfg BootstrapConfig) (*Client, error) {
 	if cfg.CloseTimeout <= 0 {
 		cfg.CloseTimeout = defaultCloseTimeout
 	}
+	timing := newTimingRecorder()
+	timing.event("bootstrap_start")
 	sess, err := cfg.Transport.Start(ctx)
 	if err != nil {
 		return nil, wrapBootstrapError(err, nil)
 	}
-	c := &Client{sess: sess, reader: newControlReader(sess), writer: newControlWriter(sess), stderr: cfg.Stderr}
+	c := &Client{sess: sess, reader: newControlReader(sess), writer: newControlWriter(sess), stderr: cfg.Stderr,
+		sshDetachCh: make(chan struct{}), heartbeat: cfg.HeartbeatInterval, timing: timing}
 	fail := func(err error) (*Client, error) {
 		c.cleanup()
 		return nil, wrapBootstrapError(err, sess)
@@ -424,7 +462,11 @@ func Bootstrap(ctx context.Context, cfg BootstrapConfig) (*Client, error) {
 		if _, err := c.Stat(ctx, "/"); err != nil {
 			return fail(fmt.Errorf("daemon: QUIC control precheck: %w", err))
 		}
+		timing.event("data_control_ready")
 		c.startBackground(cfg)
+		if err := c.maybeHandoff(ctx, cfg); err != nil {
+			return fail(err)
+		}
 		return c, nil
 	}
 	c.http = &http.Client{Transport: &http.Transport{
@@ -459,9 +501,138 @@ func Bootstrap(ctx context.Context, cfg BootstrapConfig) (*Client, error) {
 		return fail(derr)
 	}
 	_ = conn.Close()
+	timing.event("data_control_ready")
 	c.ctx, c.cancel = context.WithCancel(ctx)
 	c.startBackground(cfg)
+	if err := c.maybeHandoff(ctx, cfg); err != nil {
+		return fail(err)
+	}
 	return c, nil
+}
+
+// maybeHandoff performs the authenticated lifecycle handoff when the caller
+// asked for it. Support is negotiated by the authenticated handoff request
+// itself: an older server returns an unknown-path error and a server launched
+// without detach support returns FEATURE_UNAVAILABLE. Both are explicit;
+// the client continues with the legacy SSH-bound lifecycle and reports why
+// detaching did not happen.
+func (c *Client) maybeHandoff(ctx context.Context, cfg BootstrapConfig) error {
+	if !cfg.RequestHandoff {
+		return nil
+	}
+	c.timing.event("handoff_start")
+	var out protocol.LifecycleResponse
+	for attempt := 0; attempt < 3; attempt++ {
+		reqCtx, cancel := context.WithTimeout(ctx, cfg.ControlTimeout)
+		err := c.post(reqCtx, "/v1/handoff", protocol.HandoffRequest{SessionID: c.SessionID()}, &out)
+		cancel()
+		if err == nil {
+			break
+		}
+		if isHandoffUnsupported(err) {
+			if c.stderr != nil {
+				fmt.Fprintln(c.stderr, "catsync: warning: remote catsyncd does not support detached SSH handoff; keeping the SSH bootstrap alive for this session")
+			}
+			return nil
+		}
+		if attempt == 2 {
+			return fmt.Errorf("daemon: lifecycle handoff: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if out.State != "detached" {
+		return protocol.NewError(protocol.CodeInternal, "handoff returned state %q", out.State)
+	}
+	c.detached.Store(true)
+	close(c.sshDetachCh)
+	c.timing.event("handoff_ack")
+	c.startDirectHeartbeat()
+	// Test-only window: keep SSH alive briefly after a successful handoff so
+	// fault-injection tests can kill it while the direct data plane runs.
+	if v := os.Getenv("CATSYNC_TEST_HANDOFF_HOLD_SSH_MS"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+		}
+	}
+	return c.closeBootstrapSSH()
+}
+
+// isHandoffUnsupported distinguishes an older/limited server from a genuine
+// handoff failure. Older catsyncd versions do not know the authenticated
+// handoff path; a server that knows it but was not launched detached returns
+// FEATURE_UNAVAILABLE. In both cases the SSH bootstrap stays authoritative
+// and the client continues in the pre-handoff lifecycle, with an explicit
+// warning rather than a timeout or a silent downgrade.
+func isHandoffUnsupported(err error) bool {
+	var pe *protocol.Error
+	if !errors.As(err, &pe) {
+		return false
+	}
+	if pe.Code == protocol.CodeFeatureUnavailable {
+		return true
+	}
+	if pe.Code == protocol.CodeInvalidArgument && strings.Contains(pe.Message, "unknown control path") {
+		return true
+	}
+	// Older HTTP servers have no /v1/handoff route at all; the mux answers
+	// 404 and post() wraps it as INTERNAL. QUIC returns the coded unknown-path
+	// error above.
+	return pe.Code == protocol.CodeInternal && strings.Contains(pe.Message, "HTTP 404")
+}
+
+// closeBootstrapSSH closes the SSH bootstrap process after the server has
+// confirmed the authenticated handoff. The data connections stay untouched.
+func (c *Client) closeBootstrapSSH() error {
+	if c.sess == nil {
+		return nil
+	}
+	_ = c.sess.Close()
+	if k, ok := c.sess.(interface{ Kill() error }); ok {
+		_ = k.Kill()
+	}
+	waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	// The SSH process is expected to exit when its bootstrap pipes close.
+	// The process handle may report a cancellation-flavoured error for that
+	// intentional close; what matters is that it is reaped, not the wording.
+	_ = c.sess.Wait(waitCtx)
+	c.timing.event("ssh_closed")
+	return nil
+}
+
+// startDirectHeartbeat keeps the detached data control channel live. A
+// failure means the direct session can no longer be trusted, so the run is
+// cancelled and left resumable.
+func (c *Client) startDirectHeartbeat() {
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		interval := c.heartbeat
+		if interval <= 0 {
+			interval = 10 * time.Second
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-c.ctx.Done():
+				return
+			case <-ticker.C:
+				reqCtx, cancel := context.WithTimeout(c.ctx, interval)
+				var out protocol.LifecycleResponse
+				err := c.post(reqCtx, "/v1/heartbeat", protocol.HeartbeatRequest{SessionID: c.SessionID()}, &out)
+				cancel()
+				if err != nil {
+					c.cancel()
+					return
+				}
+			}
+		}
+	}()
 }
 
 // startBackground runs the heartbeat and the control reader.
@@ -476,10 +647,17 @@ func (c *Client) startBackground(cfg BootstrapConfig) {
 			select {
 			case <-c.ctx.Done():
 				return
+			case <-c.sshDetachCh:
+				return
 			case <-ticker.C:
+				if c.detached.Load() {
+					return
+				}
 				seq++
 				if err := c.writer.send(&pingMsg{Type: msgPing, Seq: seq}); err != nil {
-					c.cancel()
+					if !c.detached.Load() {
+						c.cancel()
+					}
 					return
 				}
 			}
@@ -505,6 +683,9 @@ func (c *Client) startBackground(cfg BootstrapConfig) {
 					c.mu.Unlock()
 				}
 			case err := <-c.reader.errs:
+				if c.detached.Load() {
+					return
+				}
 				c.mu.Lock()
 				if c.control == nil && !errors.Is(err, io.EOF) {
 					c.control = err
@@ -563,7 +744,10 @@ func (c *Client) cleanup() {
 			c.http.CloseIdleConnections()
 		}
 		if c.quicConn != nil {
-			logQUICDiagnostic(c.stderr, "catsync", c.quicAct, c.control)
+			c.mu.Lock()
+			ctrlErr := c.control
+			c.mu.Unlock()
+			logQUICDiagnostic(c.stderr, "catsync", c.quicAct, ctrlErr)
 			_ = c.quicConn.CloseWithError(0, "client closing")
 		}
 		if c.sess != nil {
@@ -578,6 +762,7 @@ func (c *Client) cleanup() {
 // return the same result. On the normal path it first sends bye and waits
 // (bounded) for the server's drained acknowledgement.
 func (c *Client) Close() error {
+	c.timing.event("client_close")
 	c.goodbyeOnce.Do(c.sendGoodbye)
 	c.cleanup()
 	done := make(chan struct{})
@@ -593,6 +778,13 @@ func (c *Client) Close() error {
 // control-channel EOF is also accepted: the server may have already exited.
 func (c *Client) sendGoodbye() {
 	if c.ctx == nil || c.ctx.Err() != nil {
+		return
+	}
+	if c.detached.Load() {
+		byeCtx, cancel := context.WithTimeout(context.Background(), defaultCloseTimeout)
+		defer cancel()
+		var out protocol.LifecycleResponse
+		_ = c.post(byeCtx, "/v1/bye", protocol.ByeRequest{SessionID: c.SessionID()}, &out)
 		return
 	}
 	if err := c.writer.send(&byeMsg{Type: msgBye}); err != nil {

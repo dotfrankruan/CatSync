@@ -28,7 +28,10 @@ Commands:
   version        print the catsyncd version
 
 catsyncd is normally started by catsync over ssh; it is not a persistent
-service. Install it yourself on the remote host; catsync never installs it.
+service. For direct TCP/QUIC, catsync launches it under a detaching wrapper
+and enables --detach-on-handoff so the authenticated data control channel can
+take over after the one-shot bootstrap. Install it yourself on the remote
+host; catsync never installs it.
 `
 
 func main() { os.Exit(run(os.Args[1:])) }
@@ -94,6 +97,7 @@ func runServe(args []string) int {
 	quicStreamWindow := fs.Uint64("quic-stream-window", 0, "QUIC max stream receive window in bytes (0 = tested default)")
 	quicConnWindow := fs.Uint64("quic-conn-window", 0, "QUIC max connection receive window in bytes (0 = tested default)")
 	quicQLog := fs.String("quic-qlog", "", "write a QUIC qlog trace to this file (owner-only permissions; diagnostics)")
+	detachOnHandoff := fs.Bool("detach-on-handoff", os.Getenv("CATSYNC_DETACH_ON_HANDOFF") == "1", "allow a direct data control channel to take over after authenticated handoff (launch under setsid)")
 	sftpServer := fs.String("sftp-server", "", "path to the OpenSSH sftp-server executable")
 	rsyncPath := fs.String("rsync", "", "path to the rsync executable used by the exec channel")
 	maxSFTP := fs.Int("max-sftp-conns", 64, "maximum concurrent SFTP connections")
@@ -134,6 +138,7 @@ func runServe(args []string) int {
 		QUICMaxStreamWindow: *quicStreamWindow,
 		QUICMaxConnWindow:   *quicConnWindow,
 		QUICQLogPath:        *quicQLog,
+		DetachOnHandoff:     *detachOnHandoff,
 		Limits:              protocolLimits(*maxSFTP, *maxExec, *maxControl, *maxPending, *maxConns),
 		CertTTL:             *certTTL,
 		IdleTimeout:         *idle,

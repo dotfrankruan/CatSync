@@ -138,7 +138,7 @@ func (o *Options) bindDaemonFlags(fs *flag.FlagSet) {
 	fs.StringVar(&o.DaemonTransport, "daemon-transport", o.DaemonTransport,
 		"daemon data transport: tcp (default) or quic (experimental)")
 	fs.StringVar(&o.DaemonBootstrap, "daemon-bootstrap", o.DaemonBootstrap,
-		"how catsync reaches the daemon: direct (default) or ssh-forward")
+		"how catsync reaches the daemon: direct (default; SSH handoff after authenticated data control) or ssh-forward (SSH-tunnel-bound)")
 	fs.StringVar(&o.RemoteCatsyncd, "remote-catsyncd", o.RemoteCatsyncd,
 		"catsyncd executable on the remote host (default catsyncd); catsync never installs it")
 	fs.StringVar(&o.DaemonListen, "daemon-listen", o.DaemonListen,
