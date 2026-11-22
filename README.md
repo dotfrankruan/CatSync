@@ -53,9 +53,9 @@ Upgrades arrive with `brew upgrade catsync`.
 From a release archive:
 
 ```sh
-curl -LO https://github.com/dotfrankruan/CatSync/releases/download/v0.1.0/catsync_v0.1.0_darwin_arm64.tar.gz
-tar -xzf catsync_v0.1.0_darwin_arm64.tar.gz
-install -m 0755 catsync_v0.1.0_darwin_arm64/catsync ~/.local/bin/catsync
+curl -LO https://github.com/dotfrankruan/CatSync/releases/download/v0.2.0/catsync_v0.2.0_darwin_arm64.tar.gz
+tar -xzf catsync_v0.2.0_darwin_arm64.tar.gz
+install -m 0755 catsync_v0.2.0_darwin_arm64/catsync ~/.local/bin/catsync
 ```
 
 From source: `make install` (Go 1.26+; installs `catsync` and `catsyncd`),
@@ -98,11 +98,11 @@ baked in, and publishes them with `SHA256SUMS` and
 generated notes on the GitHub releases page.
 
 ```sh
-git tag -a v0.1.0 -m "v0.1.0"
-git push origin v0.1.0
+git tag -a v0.2.0 -m "v0.2.0"
+git push origin v0.2.0
 ```
 
-`make release VERSION=v0.1.0` builds the same archives locally, and
+`make release VERSION=v0.2.0` builds the same archives locally, and
 [docs/releasing.md](docs/releasing.md) lists the remaining steps: publishing the
 tag and bumping the Homebrew formula.
 

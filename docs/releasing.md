@@ -8,8 +8,8 @@ Homebrew formula in [dotfrankruan/homebrew-catsync](https://github.com/dotfrankr
 `main` must be green in CI first. Then:
 
 ```sh
-git tag -a v0.1.0 -m "v0.1.0"
-git push origin v0.1.0
+git tag -a v0.2.0 -m "v0.2.0"
+git push origin v0.2.0
 ```
 
 `.github/workflows/release.yml` reacts to the tag: it re-runs `make check` on
@@ -22,7 +22,7 @@ Watch it with:
 
 ```sh
 gh run list --workflow=release.yml
-gh release view v0.1.0
+gh release view v0.2.0
 ```
 
 ## 1b. Verify the archives
@@ -75,13 +75,13 @@ The formula pins the release URLs and their SHA-256 values, so it must be
 updated for every tag. The checksums are the `SHA256SUMS` asset of the release:
 
 ```sh
-gh release download v0.1.0 --pattern SHA256SUMS --clobber
+gh release download v0.2.0 --pattern SHA256SUMS --clobber
 cat SHA256SUMS
 ```
 
 In a clone of `dotfrankruan/homebrew-catsync`, edit `Formula/catsync.rb`:
 
-- replace every `v0.1.0` with the new tag in the four `url` lines;
+- replace every `v0.2.0` with the new tag in the four `url` lines;
 - replace each `sha256` with the matching line from `SHA256SUMS`.
 
 Then validate and publish:
