@@ -7,3 +7,5 @@
 .DS_Store
 /.gomodcache/
 /.gotmp/
+__pycache__/
+*.pyc

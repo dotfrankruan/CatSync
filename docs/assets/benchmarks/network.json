@@ -1,0 +1,96 @@
+{
+  "schema": 1,
+  "note": "Remote NIC counters include the observation SSH connections.",
+  "runs": [
+    {
+      "mode": "legacy SSH",
+      "payload_bytes": 16777216,
+      "elapsed_s": 2.96,
+      "exit_code": 0,
+      "nic_deltas": {
+        "docker0": {
+          "rx_bytes": 0,
+          "tx_bytes": 0
+        },
+        "eth0": {
+          "rx_bytes": 17702775,
+          "tx_bytes": 127489
+        },
+        "tailscale0": {
+          "rx_bytes": 0,
+          "tx_bytes": 0
+        }
+      },
+      "stderr_tail": []
+    },
+    {
+      "mode": "daemon SSH-forward",
+      "payload_bytes": 16777216,
+      "elapsed_s": 1.446,
+      "exit_code": 0,
+      "nic_deltas": {
+        "docker0": {
+          "rx_bytes": 0,
+          "tx_bytes": 0
+        },
+        "eth0": {
+          "rx_bytes": 17866706,
+          "tx_bytes": 106170
+        },
+        "tailscale0": {
+          "rx_bytes": 0,
+          "tx_bytes": 0
+        }
+      },
+      "stderr_tail": [
+        "catsyncd: draining: rpc=0 sftp=0 exec=0 children=0",
+        "catsyncd: drain complete: rpc=0 sftp=0 exec=0 children=0"
+      ]
+    },
+    {
+      "mode": "daemon direct TCP",
+      "payload_bytes": 16777216,
+      "elapsed_s": 1.738,
+      "exit_code": 0,
+      "nic_deltas": {
+        "docker0": {
+          "rx_bytes": 0,
+          "tx_bytes": 0
+        },
+        "eth0": {
+          "rx_bytes": 17843698,
+          "tx_bytes": 121142
+        },
+        "tailscale0": {
+          "rx_bytes": 0,
+          "tx_bytes": 0
+        }
+      },
+      "stderr_tail": []
+    },
+    {
+      "mode": "daemon direct QUIC",
+      "payload_bytes": 16777216,
+      "elapsed_s": 2.386,
+      "exit_code": 0,
+      "nic_deltas": {
+        "docker0": {
+          "rx_bytes": 0,
+          "tx_bytes": 0
+        },
+        "eth0": {
+          "rx_bytes": 17837274,
+          "tx_bytes": 148561
+        },
+        "tailscale0": {
+          "rx_bytes": 0,
+          "tx_bytes": 0
+        }
+      },
+      "stderr_tail": [
+        "2026/11/22 15:27:44 failed to sufficiently increase receive buffer size (was: 208 kiB, wanted: 7168 kiB, got: 416 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.",
+        "catsyncd: handoff complete; detached data control owns the session"
+      ]
+    }
+  ]
+}

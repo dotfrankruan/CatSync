@@ -1,0 +1,142 @@
+{
+  "schema": 1,
+  "description": "Real OpenSSH lifecycle handoff acceptance; times relative to bootstrap start.",
+  "environment": {
+    "client": "macOS arm64",
+    "server": "Debian 13 x86_64 (sanitized)",
+    "transport": "tcp",
+    "transports": [
+      "tcp",
+      "quic"
+    ]
+  },
+  "cases": [
+    {
+      "label": "normal handoff",
+      "mode": "direct tcp",
+      "ssh_killed": false,
+      "exit_code": 0,
+      "elapsed_ms": 26619,
+      "worker_pid": "3856855",
+      "worker_after_handoff": "3856855",
+      "second_bootstrap_ssh": false,
+      "ssh_pid": 38964,
+      "kill_ms": null,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 431.45,
+        "handoff_start": 431.528,
+        "handoff_ack": 490.369,
+        "ssh_closed": 1504.701,
+        "client_close": 25846.258
+      },
+      "ssh_start_ms": 0,
+      "data_start_ms": 431,
+      "ssh_end_ms": 1505,
+      "data_end_ms": 25846,
+      "worker_exited": true,
+      "local_sha256": "af6becb3232226b6f4c8446ae3bcb6359c1e873bd63a3b7ec69721362185c524",
+      "remote_sha256": "af6becb3232226b6f4c8446ae3bcb6359c1e873bd63a3b7ec69721362185c524",
+      "sha256_match": true,
+      "stderr_tail": [
+        "catsyncd: handoff complete; detached data control owns the session"
+      ]
+    },
+    {
+      "label": "SSH SIGKILL after handoff",
+      "mode": "direct tcp",
+      "ssh_killed": true,
+      "exit_code": 0,
+      "elapsed_ms": 33612,
+      "worker_pid": "3857060",
+      "worker_after_handoff": "3857060",
+      "second_bootstrap_ssh": false,
+      "ssh_pid": 39076,
+      "kill_ms": 1945,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 373.397,
+        "handoff_start": 373.453,
+        "handoff_ack": 426.309,
+        "ssh_closed": 8428.536,
+        "client_close": 33406.457
+      },
+      "ssh_start_ms": 0,
+      "data_start_ms": 373,
+      "ssh_end_ms": 1945,
+      "data_end_ms": 33406,
+      "worker_exited": true,
+      "local_sha256": "af6becb3232226b6f4c8446ae3bcb6359c1e873bd63a3b7ec69721362185c524",
+      "remote_sha256": "af6becb3232226b6f4c8446ae3bcb6359c1e873bd63a3b7ec69721362185c524",
+      "sha256_match": true,
+      "stderr_tail": [
+        "catsyncd: handoff complete; detached data control owns the session"
+      ]
+    },
+    {
+      "label": "QUIC normal handoff",
+      "mode": "direct quic",
+      "ssh_killed": false,
+      "exit_code": 0,
+      "elapsed_ms": 3065,
+      "worker_pid": "3857300",
+      "worker_after_handoff": "3857300",
+      "second_bootstrap_ssh": false,
+      "ssh_pid": 39216,
+      "kill_ms": null,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 405.372,
+        "handoff_start": 405.473,
+        "handoff_ack": 421.146,
+        "ssh_closed": 1434.399,
+        "client_close": 2727.399
+      },
+      "ssh_start_ms": 0,
+      "data_start_ms": 405,
+      "ssh_end_ms": 1434,
+      "data_end_ms": 2727,
+      "worker_exited": true,
+      "local_sha256": "65c2d76e0a7689f310946867ed7dd439bfdef68f134a46022e9a3d20845205a1",
+      "remote_sha256": "65c2d76e0a7689f310946867ed7dd439bfdef68f134a46022e9a3d20845205a1",
+      "sha256_match": true,
+      "stderr_tail": [
+        "2026/11/22 15:42:28 failed to sufficiently increase receive buffer size (was: 208 kiB, wanted: 7168 kiB, got: 416 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.",
+        "catsyncd: handoff complete; detached data control owns the session"
+      ]
+    },
+    {
+      "label": "QUIC SSH SIGKILL after handoff",
+      "mode": "direct quic",
+      "ssh_killed": true,
+      "exit_code": 0,
+      "elapsed_ms": 9747,
+      "worker_pid": "3857404",
+      "worker_after_handoff": "3857404",
+      "second_bootstrap_ssh": false,
+      "ssh_pid": 39235,
+      "kill_ms": 1953,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 397.641,
+        "handoff_start": 397.708,
+        "handoff_ack": 411.759,
+        "ssh_closed": 8413.911,
+        "client_close": 9607.205
+      },
+      "ssh_start_ms": 0,
+      "data_start_ms": 398,
+      "ssh_end_ms": 1953,
+      "data_end_ms": 9607,
+      "worker_exited": true,
+      "local_sha256": "65c2d76e0a7689f310946867ed7dd439bfdef68f134a46022e9a3d20845205a1",
+      "remote_sha256": "65c2d76e0a7689f310946867ed7dd439bfdef68f134a46022e9a3d20845205a1",
+      "sha256_match": true,
+      "stderr_tail": [
+        "2026/11/22 15:42:32 failed to sufficiently increase receive buffer size (was: 208 kiB, wanted: 7168 kiB, got: 416 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.",
+        "catsyncd: handoff complete; detached data control owns the session"
+      ]
+    }
+  ],
+  "note": "TCP cases use the 128 MiB upload; QUIC cases use a 1 MiB upload because the known quic-go public-path low-bandwidth failure is a separate limitation."
+}

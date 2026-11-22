@@ -1,0 +1,1691 @@
+{
+  "schema": 1,
+  "generated_at": "2026-11-22T07:21:05.573535+00:00",
+  "client": {
+    "implementation": "workspace-detach-prototype",
+    "platform": "macOS arm64",
+    "vps": "Debian 13 x86_64 (sanitized host)"
+  },
+  "datasets": [
+    {
+      "id": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "direction": "upload",
+      "local_path": "/tmp/catsync-bench-data/large/large.bin"
+    },
+    {
+      "id": "small-16MiB",
+      "bytes": 16777216,
+      "files": 1,
+      "direction": "download",
+      "remote_path": "/home/catsync-test/catsync-bench/data/small/small.bin"
+    },
+    {
+      "id": "mixed-1001-files",
+      "bytes": 8388608,
+      "files": 1002,
+      "direction": "upload",
+      "local_path": "/tmp/catsync-bench-data/mixed"
+    }
+  ],
+  "specs": [
+    {
+      "id": "legacy",
+      "label": "legacy SSH",
+      "transport": "ssh"
+    },
+    {
+      "id": "forward",
+      "label": "daemon SSH-forward",
+      "transport": "daemon",
+      "bootstrap": "ssh-forward",
+      "data_transport": "tcp"
+    },
+    {
+      "id": "direct-tcp",
+      "label": "daemon direct TCP",
+      "transport": "daemon",
+      "bootstrap": "direct",
+      "data_transport": "tcp"
+    },
+    {
+      "id": "direct-quic",
+      "label": "daemon direct QUIC",
+      "transport": "daemon",
+      "bootstrap": "direct",
+      "data_transport": "quic"
+    },
+    {
+      "id": "old-direct-tcp",
+      "label": "pre-detach direct TCP (v0.2.0)",
+      "transport": "daemon",
+      "bootstrap": "direct",
+      "data_transport": "tcp",
+      "old": true
+    }
+  ],
+  "runs": [
+    {
+      "id": "legacy-large-128MiB-r1",
+      "mode": "legacy SSH",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 1,
+      "started_at": "2026-11-22T06:51:04.555970+00:00",
+      "elapsed_ms": 28341,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 1.117,
+      "cpu_sys_s": 1.227,
+      "maxrss_kb": 25456,
+      "effective_mbps": 37.886,
+      "timing_ms": {},
+      "stdout_tail": [
+        "run 20261122T065036Z-878a82b6fd946354: completed",
+        "run 20261122T065036Z-878a82b6fd946354: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "legacy-large-128MiB-r2",
+      "mode": "legacy SSH",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 2,
+      "started_at": "2026-11-22T06:51:31.832011+00:00",
+      "elapsed_ms": 26251,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 1.098,
+      "cpu_sys_s": 1.127,
+      "maxrss_kb": 25456,
+      "effective_mbps": 40.903,
+      "timing_ms": {},
+      "stdout_tail": [
+        "run 20261122T065105Z-968385a3bea28441: completed",
+        "run 20261122T065105Z-968385a3bea28441: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "legacy-large-128MiB-r3",
+      "mode": "legacy SSH",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 3,
+      "started_at": "2026-11-22T06:52:02.878568+00:00",
+      "elapsed_ms": 30014,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 1.103,
+      "cpu_sys_s": 1.149,
+      "maxrss_kb": 25456,
+      "effective_mbps": 35.774,
+      "timing_ms": {},
+      "stdout_tail": [
+        "run 20261122T065133Z-ea79bad0e9ab6713: completed",
+        "run 20261122T065133Z-ea79bad0e9ab6713: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "forward-large-128MiB-r1",
+      "mode": "daemon SSH-forward",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 1,
+      "started_at": "2026-11-22T06:52:26.713237+00:00",
+      "elapsed_ms": 22787,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 1.073,
+      "cpu_sys_s": 1.405,
+      "maxrss_kb": 25456,
+      "effective_mbps": 47.121,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 419.236,
+        "client_close": 22702.384
+      },
+      "stdout_tail": [
+        "run 20261122T065204Z-4fb4ac30a64bcec3: completed",
+        "run 20261122T065204Z-4fb4ac30a64bcec3: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: draining: rpc=0 sftp=0 exec=0 children=0",
+        "catsyncd: drain complete: rpc=0 sftp=0 exec=0 children=0"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "forward-large-128MiB-r2",
+      "mode": "daemon SSH-forward",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 2,
+      "started_at": "2026-11-22T06:52:50.057709+00:00",
+      "elapsed_ms": 22287,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 1.105,
+      "cpu_sys_s": 1.42,
+      "maxrss_kb": 25456,
+      "effective_mbps": 48.179,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 415.32,
+        "client_close": 22201.939
+      },
+      "stdout_tail": [
+        "run 20261122T065228Z-f25565721b33cbe5: completed",
+        "run 20261122T065228Z-f25565721b33cbe5: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: draining: rpc=0 sftp=0 exec=0 children=0",
+        "catsyncd: drain complete: rpc=0 sftp=0 exec=0 children=0"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "forward-large-128MiB-r3",
+      "mode": "daemon SSH-forward",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 3,
+      "started_at": "2026-11-22T06:53:16.593993+00:00",
+      "elapsed_ms": 25399,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 1.065,
+      "cpu_sys_s": 1.406,
+      "maxrss_kb": 25456,
+      "effective_mbps": 42.275,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 433.157,
+        "client_close": 25322.43
+      },
+      "stdout_tail": [
+        "run 20261122T065251Z-6d0f89788e9c15d1: completed",
+        "run 20261122T065251Z-6d0f89788e9c15d1: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: draining: rpc=0 sftp=0 exec=0 children=0",
+        "catsyncd: drain complete: rpc=0 sftp=0 exec=0 children=0"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "direct-tcp-large-128MiB-r1",
+      "mode": "daemon direct TCP",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 1,
+      "started_at": "2026-11-22T06:53:43.335656+00:00",
+      "elapsed_ms": 25599,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.426,
+      "cpu_sys_s": 0.877,
+      "maxrss_kb": 25456,
+      "effective_mbps": 41.945,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 378.355,
+        "handoff_start": 378.514,
+        "handoff_ack": 428.142,
+        "ssh_closed": 440.556,
+        "client_close": 25463.2
+      },
+      "stdout_tail": [
+        "run 20261122T065318Z-a05799c744178aeb: completed",
+        "run 20261122T065318Z-a05799c744178aeb: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "direct-tcp-large-128MiB-r2",
+      "mode": "daemon direct TCP",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 2,
+      "started_at": "2026-11-22T06:54:11.629959+00:00",
+      "elapsed_ms": 27284,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.428,
+      "cpu_sys_s": 0.889,
+      "maxrss_kb": 25456,
+      "effective_mbps": 39.354,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 387.977,
+        "handoff_start": 388.102,
+        "handoff_ack": 445.206,
+        "ssh_closed": 457.46,
+        "client_close": 27152.331
+      },
+      "stdout_tail": [
+        "run 20261122T065344Z-e9f362a050f1e17c: completed",
+        "run 20261122T065344Z-e9f362a050f1e17c: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "direct-tcp-large-128MiB-r3",
+      "mode": "daemon direct TCP",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 3,
+      "started_at": "2026-11-22T06:54:38.707596+00:00",
+      "elapsed_ms": 26062,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.338,
+      "cpu_sys_s": 0.654,
+      "maxrss_kb": 25456,
+      "effective_mbps": 41.2,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 348.344,
+        "handoff_start": 348.422,
+        "handoff_ack": 399.974,
+        "ssh_closed": 412.135,
+        "client_close": 25940.15
+      },
+      "stdout_tail": [
+        "run 20261122T065413Z-2ae3a4a17c9ad9f9: completed",
+        "run 20261122T065413Z-2ae3a4a17c9ad9f9: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: handoff complete; detached data control owns the session"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "direct-quic-large-128MiB-r1",
+      "mode": "daemon direct QUIC",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 1,
+      "started_at": "2026-11-22T06:55:07.610534+00:00",
+      "elapsed_ms": 27855,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 2.407,
+      "cpu_sys_s": 7.273,
+      "maxrss_kb": 25456,
+      "effective_mbps": 38.548,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 402.091,
+        "handoff_start": 402.212,
+        "handoff_ack": 421.304,
+        "ssh_closed": 433.426,
+        "client_close": 27759.568
+      },
+      "stdout_tail": [
+        "run 20261122T065440Z-5bf8106548d9ef80: completed",
+        "run 20261122T065440Z-5bf8106548d9ef80: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "2026/11/22 14:54:40 failed to sufficiently increase receive buffer size (was: 208 kiB, wanted: 7168 kiB, got: 416 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.",
+        "catsyncd: handoff complete; detached data control owns the session"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "direct-quic-large-128MiB-r2",
+      "mode": "daemon direct QUIC",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 2,
+      "started_at": "2026-11-22T06:55:41.256744+00:00",
+      "elapsed_ms": 32601,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 2.341,
+      "cpu_sys_s": 7.689,
+      "maxrss_kb": 25456,
+      "effective_mbps": 32.935,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 411.036,
+        "handoff_start": 411.153,
+        "handoff_ack": 431.912,
+        "ssh_closed": 443.813,
+        "client_close": 32523.436
+      },
+      "stdout_tail": [
+        "run 20261122T065509Z-148c63905cfa941a: completed",
+        "run 20261122T065509Z-148c63905cfa941a: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "2026/11/22 14:55:09 failed to sufficiently increase receive buffer size (was: 208 kiB, wanted: 7168 kiB, got: 416 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.",
+        "catsyncd: handoff complete; detached data control owns the session"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "direct-quic-large-128MiB-r3",
+      "mode": "daemon direct QUIC",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 3,
+      "started_at": "2026-11-22T06:56:05.668545+00:00",
+      "elapsed_ms": 23410,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 2.682,
+      "cpu_sys_s": 7.714,
+      "maxrss_kb": 25456,
+      "effective_mbps": 45.867,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 409.097,
+        "handoff_start": 409.189,
+        "handoff_ack": 424.973,
+        "ssh_closed": 437.23,
+        "client_close": 23333.293
+      },
+      "stdout_tail": [
+        "run 20261122T065542Z-b4d363c265d8785a: completed",
+        "run 20261122T065542Z-b4d363c265d8785a: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "2026/11/22 14:55:42 failed to sufficiently increase receive buffer size (was: 208 kiB, wanted: 7168 kiB, got: 416 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.",
+        "catsyncd: handoff complete; detached data control owns the session"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "old-direct-tcp-large-128MiB-r1",
+      "mode": "pre-detach direct TCP (v0.2.0)",
+      "implementation": "v0.2.0-pre-detach",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 1,
+      "started_at": "2026-11-22T06:56:32.828427+00:00",
+      "elapsed_ms": 26132,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.437,
+      "cpu_sys_s": 0.923,
+      "maxrss_kb": 25456,
+      "effective_mbps": 41.089,
+      "timing_ms": {},
+      "stdout_tail": [
+        "run 20261122T065607Z-dcd7ef9f4216336d: completed",
+        "run 20261122T065607Z-dcd7ef9f4216336d: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: draining: rpc=0 sftp=0 exec=0 children=0",
+        "catsyncd: drain complete: rpc=0 sftp=0 exec=0 children=0"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "old-direct-tcp-large-128MiB-r2",
+      "mode": "pre-detach direct TCP (v0.2.0)",
+      "implementation": "v0.2.0-pre-detach",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 2,
+      "started_at": "2026-11-22T06:56:58.924950+00:00",
+      "elapsed_ms": 25077,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.445,
+      "cpu_sys_s": 0.923,
+      "maxrss_kb": 25456,
+      "effective_mbps": 42.818,
+      "timing_ms": {},
+      "stdout_tail": [
+        "run 20261122T065634Z-c83edb10c0d79331: completed",
+        "run 20261122T065634Z-c83edb10c0d79331: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: draining: rpc=0 sftp=0 exec=0 children=0",
+        "catsyncd: drain complete: rpc=0 sftp=0 exec=0 children=0"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "old-direct-tcp-large-128MiB-r3",
+      "mode": "pre-detach direct TCP (v0.2.0)",
+      "implementation": "v0.2.0-pre-detach",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 3,
+      "started_at": "2026-11-22T06:57:32.096374+00:00",
+      "elapsed_ms": 28415,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.465,
+      "cpu_sys_s": 0.94,
+      "maxrss_kb": 25456,
+      "effective_mbps": 37.787,
+      "timing_ms": {},
+      "stdout_tail": [
+        "run 20261122T065705Z-e74dafdb7bcc0515: completed",
+        "run 20261122T065705Z-e74dafdb7bcc0515: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: draining: rpc=0 sftp=0 exec=0 children=0",
+        "catsyncd: drain complete: rpc=0 sftp=0 exec=0 children=0"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "legacy-small-16MiB-r1",
+      "mode": "legacy SSH",
+      "implementation": "workspace-detach-prototype",
+      "direction": "download",
+      "dataset": "small-16MiB",
+      "bytes": 16777216,
+      "files": 1,
+      "repeat": 1,
+      "started_at": "2026-11-22T06:58:31.215943+00:00",
+      "elapsed_ms": 58077,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.404,
+      "cpu_sys_s": 0.272,
+      "maxrss_kb": 25456,
+      "effective_mbps": 2.311,
+      "timing_ms": {},
+      "stdout_tail": [
+        "run 20261122T065733Z-fdd42f12c63d846c: completed",
+        "run 20261122T065733Z-fdd42f12c63d846c: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "legacy-small-16MiB-r2",
+      "mode": "legacy SSH",
+      "implementation": "workspace-detach-prototype",
+      "direction": "download",
+      "dataset": "small-16MiB",
+      "bytes": 16777216,
+      "files": 1,
+      "repeat": 2,
+      "started_at": "2026-11-22T06:59:29.373066+00:00",
+      "elapsed_ms": 57169,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.361,
+      "cpu_sys_s": 0.244,
+      "maxrss_kb": 25456,
+      "effective_mbps": 2.348,
+      "timing_ms": {},
+      "stdout_tail": [
+        "run 20261122T065832Z-e72b004b239d85fb: completed",
+        "run 20261122T065832Z-e72b004b239d85fb: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "legacy-small-16MiB-r3",
+      "mode": "legacy SSH",
+      "implementation": "workspace-detach-prototype",
+      "direction": "download",
+      "dataset": "small-16MiB",
+      "bytes": 16777216,
+      "files": 1,
+      "repeat": 3,
+      "started_at": "2026-11-22T07:00:27.466779+00:00",
+      "elapsed_ms": 57058,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.341,
+      "cpu_sys_s": 0.25,
+      "maxrss_kb": 25456,
+      "effective_mbps": 2.352,
+      "timing_ms": {},
+      "stdout_tail": [
+        "run 20261122T065930Z-4bceca30ef837015: completed",
+        "run 20261122T065930Z-4bceca30ef837015: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "forward-small-16MiB-r1",
+      "mode": "daemon SSH-forward",
+      "implementation": "workspace-detach-prototype",
+      "direction": "download",
+      "dataset": "small-16MiB",
+      "bytes": 16777216,
+      "files": 1,
+      "repeat": 1,
+      "started_at": "2026-11-22T07:01:04.903940+00:00",
+      "elapsed_ms": 36412,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.277,
+      "cpu_sys_s": 0.309,
+      "maxrss_kb": 25456,
+      "effective_mbps": 3.686,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 370.833,
+        "client_close": 36310.689
+      },
+      "stdout_tail": [
+        "run 20261122T070029Z-d4e614c642e1b3d3: completed",
+        "run 20261122T070029Z-d4e614c642e1b3d3: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: draining: rpc=0 sftp=0 exec=0 children=0",
+        "catsyncd: drain complete: rpc=0 sftp=0 exec=0 children=0"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "forward-small-16MiB-r2",
+      "mode": "daemon SSH-forward",
+      "implementation": "workspace-detach-prototype",
+      "direction": "download",
+      "dataset": "small-16MiB",
+      "bytes": 16777216,
+      "files": 1,
+      "repeat": 2,
+      "started_at": "2026-11-22T07:01:42.096169+00:00",
+      "elapsed_ms": 36179,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.269,
+      "cpu_sys_s": 0.297,
+      "maxrss_kb": 25456,
+      "effective_mbps": 3.71,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 425.535,
+        "client_close": 36078.927
+      },
+      "stdout_tail": [
+        "run 20261122T070106Z-912590d504b964aa: completed",
+        "run 20261122T070106Z-912590d504b964aa: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: draining: rpc=0 sftp=0 exec=0 children=0",
+        "catsyncd: drain complete: rpc=0 sftp=0 exec=0 children=0"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "forward-small-16MiB-r3",
+      "mode": "daemon SSH-forward",
+      "implementation": "workspace-detach-prototype",
+      "direction": "download",
+      "dataset": "small-16MiB",
+      "bytes": 16777216,
+      "files": 1,
+      "repeat": 3,
+      "started_at": "2026-11-22T07:02:19.597628+00:00",
+      "elapsed_ms": 36509,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.284,
+      "cpu_sys_s": 0.305,
+      "maxrss_kb": 25456,
+      "effective_mbps": 3.676,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 391.974,
+        "client_close": 36421.577
+      },
+      "stdout_tail": [
+        "run 20261122T070143Z-773450c1a1def3d8: completed",
+        "run 20261122T070143Z-773450c1a1def3d8: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: draining: rpc=0 sftp=0 exec=0 children=0",
+        "catsyncd: drain complete: rpc=0 sftp=0 exec=0 children=0"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "direct-tcp-small-16MiB-r1",
+      "mode": "daemon direct TCP",
+      "implementation": "workspace-detach-prototype",
+      "direction": "download",
+      "dataset": "small-16MiB",
+      "bytes": 16777216,
+      "files": 1,
+      "repeat": 1,
+      "started_at": "2026-11-22T07:03:24.402081+00:00",
+      "elapsed_ms": 63763,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.244,
+      "cpu_sys_s": 0.266,
+      "maxrss_kb": 25456,
+      "effective_mbps": 2.105,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 398.946,
+        "handoff_start": 399.085,
+        "handoff_ack": 453.723,
+        "ssh_closed": 465.204,
+        "client_close": 63640.096
+      },
+      "stdout_tail": [
+        "run 20261122T070221Z-ff62a0ce62f80a72: completed",
+        "run 20261122T070221Z-ff62a0ce62f80a72: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: handoff complete; detached data control owns the session"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "direct-tcp-small-16MiB-r2",
+      "mode": "daemon direct TCP",
+      "implementation": "workspace-detach-prototype",
+      "direction": "download",
+      "dataset": "small-16MiB",
+      "bytes": 16777216,
+      "files": 1,
+      "repeat": 2,
+      "started_at": "2026-11-22T07:04:28.415649+00:00",
+      "elapsed_ms": 62998,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.242,
+      "cpu_sys_s": 0.258,
+      "maxrss_kb": 25456,
+      "effective_mbps": 2.131,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 408.301,
+        "handoff_start": 408.426,
+        "handoff_ack": 464.646,
+        "ssh_closed": 476.152,
+        "client_close": 62878.383
+      },
+      "stdout_tail": [
+        "run 20261122T070326Z-06eaaf07794f2d71: completed",
+        "run 20261122T070326Z-06eaaf07794f2d71: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "direct-tcp-small-16MiB-r3",
+      "mode": "daemon direct TCP",
+      "implementation": "workspace-detach-prototype",
+      "direction": "download",
+      "dataset": "small-16MiB",
+      "bytes": 16777216,
+      "files": 1,
+      "repeat": 3,
+      "started_at": "2026-11-22T07:05:29.813575+00:00",
+      "elapsed_ms": 60384,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.217,
+      "cpu_sys_s": 0.209,
+      "maxrss_kb": 25456,
+      "effective_mbps": 2.223,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 371.185,
+        "handoff_start": 371.331,
+        "handoff_ack": 421.568,
+        "ssh_closed": 434.288,
+        "client_close": 60261.948
+      },
+      "stdout_tail": [
+        "run 20261122T070430Z-eaf890888c798c3d: completed",
+        "run 20261122T070430Z-eaf890888c798c3d: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: handoff complete; detached data control owns the session"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "direct-quic-small-16MiB-r1",
+      "mode": "daemon direct QUIC",
+      "implementation": "workspace-detach-prototype",
+      "direction": "download",
+      "dataset": "small-16MiB",
+      "bytes": 16777216,
+      "files": 1,
+      "repeat": 1,
+      "started_at": "2026-11-22T07:06:08.967330+00:00",
+      "elapsed_ms": 38208,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.528,
+      "cpu_sys_s": 1.093,
+      "maxrss_kb": 25456,
+      "effective_mbps": 3.513,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 359.877,
+        "handoff_start": 360.001,
+        "handoff_ack": 378.387,
+        "ssh_closed": 389.398,
+        "client_close": 38110.738
+      },
+      "stdout_tail": [
+        "run 20261122T070531Z-83df48b6eb86cdf4: completed",
+        "run 20261122T070531Z-83df48b6eb86cdf4: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "2026/11/22 15:05:31 failed to sufficiently increase receive buffer size (was: 208 kiB, wanted: 7168 kiB, got: 416 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.",
+        "catsyncd: handoff complete; detached data control owns the session"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "direct-quic-small-16MiB-r2",
+      "mode": "daemon direct QUIC",
+      "implementation": "workspace-detach-prototype",
+      "direction": "download",
+      "dataset": "small-16MiB",
+      "bytes": 16777216,
+      "files": 1,
+      "repeat": 2,
+      "started_at": "2026-11-22T07:07:00.410758+00:00",
+      "elapsed_ms": 50458,
+      "success": false,
+      "exit_code": 1,
+      "failure": "catsync: copy: run 20261122T070610Z-7a019bd0687091ef is recorded; inspect with 'catsync status 20261122T070610Z-7a019bd0687091ef'",
+      "cpu_user_s": 0.242,
+      "cpu_sys_s": 0.438,
+      "maxrss_kb": 25456,
+      "effective_mbps": 2.66,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 401.891,
+        "handoff_start": 402.005,
+        "handoff_ack": 420.071,
+        "ssh_closed": 432.343,
+        "client_close": 50392.886
+      },
+      "stdout_tail": [
+        "run 20261122T070610Z-7a019bd0687091ef: planned 1 task(s)",
+        "stage native-large download: 1 large file(s), up to 4 job(s) × 4 SFTP session(s)",
+        "run 20261122T070610Z-7a019bd0687091ef: failed: 1 task(s) failed"
+      ],
+      "stderr_tail": [
+        "catsync: QUIC data transport failed; no automatic fallback was performed.",
+        "catsync: to retry over pinned-mTLS TCP on port 43411: re-run with --transport daemon --daemon-transport tcp --daemon-port 43411",
+        "catsync: to use the historical SSH data path instead: re-run with --transport ssh",
+        "catsync: to keep diagnosing QUIC: add --quic-qlog PATH (and --remote-quic-qlog ABS_REMOTE_PATH)",
+        "catsync: the failed run is resumable; copy saves no data to the destination without an explicit retry.",
+        "catsync: copy: run 20261122T070610Z-7a019bd0687091ef is recorded; inspect with 'catsync status 20261122T070610Z-7a019bd0687091ef'"
+      ]
+    },
+    {
+      "id": "direct-quic-small-16MiB-r3",
+      "mode": "daemon direct QUIC",
+      "implementation": "workspace-detach-prototype",
+      "direction": "download",
+      "dataset": "small-16MiB",
+      "bytes": 16777216,
+      "files": 1,
+      "repeat": 3,
+      "started_at": "2026-11-22T07:08:21.864107+00:00",
+      "elapsed_ms": 80459,
+      "success": false,
+      "exit_code": 1,
+      "failure": "catsync: copy: run 20261122T070701Z-c9da4539284f5e09 is recorded; inspect with 'catsync status 20261122T070701Z-c9da4539284f5e09'",
+      "cpu_user_s": 0.556,
+      "cpu_sys_s": 1.149,
+      "maxrss_kb": 25456,
+      "effective_mbps": 1.668,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 406.09,
+        "handoff_start": 406.229,
+        "handoff_ack": 420.483,
+        "ssh_closed": 431.474,
+        "client_close": 80396.675
+      },
+      "stdout_tail": [
+        "run 20261122T070701Z-c9da4539284f5e09: planned 1 task(s)",
+        "stage native-large download: 1 large file(s), up to 4 job(s) × 4 SFTP session(s)",
+        "run 20261122T070701Z-c9da4539284f5e09: failed: 1 task(s) failed"
+      ],
+      "stderr_tail": [
+        "catsync: QUIC data transport failed; no automatic fallback was performed.",
+        "catsync: to retry over pinned-mTLS TCP on port 43411: re-run with --transport daemon --daemon-transport tcp --daemon-port 43411",
+        "catsync: to use the historical SSH data path instead: re-run with --transport ssh",
+        "catsync: to keep diagnosing QUIC: add --quic-qlog PATH (and --remote-quic-qlog ABS_REMOTE_PATH)",
+        "catsync: the failed run is resumable; copy saves no data to the destination without an explicit retry.",
+        "catsync: copy: run 20261122T070701Z-c9da4539284f5e09 is recorded; inspect with 'catsync status 20261122T070701Z-c9da4539284f5e09'"
+      ]
+    },
+    {
+      "id": "old-direct-tcp-small-16MiB-r1",
+      "mode": "pre-detach direct TCP (v0.2.0)",
+      "implementation": "v0.2.0-pre-detach",
+      "direction": "download",
+      "dataset": "small-16MiB",
+      "bytes": 16777216,
+      "files": 1,
+      "repeat": 1,
+      "started_at": "2026-11-22T07:09:24.606073+00:00",
+      "elapsed_ms": 61734,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.216,
+      "cpu_sys_s": 0.254,
+      "maxrss_kb": 25456,
+      "effective_mbps": 2.174,
+      "timing_ms": {},
+      "stdout_tail": [
+        "run 20261122T070823Z-71bca13d056de82a: completed",
+        "run 20261122T070823Z-71bca13d056de82a: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: draining: rpc=0 sftp=0 exec=0 children=0",
+        "catsyncd: drain complete: rpc=0 sftp=0 exec=0 children=0"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "old-direct-tcp-small-16MiB-r2",
+      "mode": "pre-detach direct TCP (v0.2.0)",
+      "implementation": "v0.2.0-pre-detach",
+      "direction": "download",
+      "dataset": "small-16MiB",
+      "bytes": 16777216,
+      "files": 1,
+      "repeat": 2,
+      "started_at": "2026-11-22T07:10:23.541352+00:00",
+      "elapsed_ms": 57935,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.214,
+      "cpu_sys_s": 0.206,
+      "maxrss_kb": 25456,
+      "effective_mbps": 2.317,
+      "timing_ms": {},
+      "stdout_tail": [
+        "run 20261122T070926Z-10c65af63872ab40: completed",
+        "run 20261122T070926Z-10c65af63872ab40: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: draining: rpc=0 sftp=0 exec=0 children=0",
+        "catsyncd: drain complete: rpc=0 sftp=0 exec=0 children=0"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "old-direct-tcp-small-16MiB-r3",
+      "mode": "pre-detach direct TCP (v0.2.0)",
+      "implementation": "v0.2.0-pre-detach",
+      "direction": "download",
+      "dataset": "small-16MiB",
+      "bytes": 16777216,
+      "files": 1,
+      "repeat": 3,
+      "started_at": "2026-11-22T07:11:25.308925+00:00",
+      "elapsed_ms": 60779,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.22,
+      "cpu_sys_s": 0.252,
+      "maxrss_kb": 25456,
+      "effective_mbps": 2.208,
+      "timing_ms": {},
+      "stdout_tail": [
+        "run 20261122T071025Z-3738f5e6d9990cd3: completed",
+        "run 20261122T071025Z-3738f5e6d9990cd3: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: draining: rpc=0 sftp=0 exec=0 children=0",
+        "catsyncd: drain complete: rpc=0 sftp=0 exec=0 children=0"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "direct-tcp-mixed-1001-files-r1",
+      "mode": "daemon direct TCP",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "mixed-1001-files",
+      "bytes": 8388608,
+      "files": 1002,
+      "repeat": 1,
+      "started_at": "2026-11-22T07:11:45.167945+00:00",
+      "elapsed_ms": 18889,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 3.19,
+      "cpu_sys_s": 1.197,
+      "maxrss_kb": 25456,
+      "effective_mbps": 3.553,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 449.637,
+        "handoff_start": 449.759,
+        "handoff_ack": 509.202,
+        "ssh_closed": 521.482,
+        "client_close": 18757.613
+      },
+      "stdout_tail": [
+        "run 20261122T071126Z-29a8364a528fd1cf: completed",
+        "run 20261122T071126Z-29a8364a528fd1cf: completed",
+        "  completed 1002, pending 0, failed 0, skipped 0, unsupported 0 (of 1002 tasks)"
+      ],
+      "stderr_tail": [],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "direct-tcp-mixed-1001-files-r2",
+      "mode": "daemon direct TCP",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "mixed-1001-files",
+      "bytes": 8388608,
+      "files": 1002,
+      "repeat": 2,
+      "started_at": "2026-11-22T07:12:05.183825+00:00",
+      "elapsed_ms": 19057,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 3.126,
+      "cpu_sys_s": 1.195,
+      "maxrss_kb": 25472,
+      "effective_mbps": 3.521,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 400.285,
+        "handoff_start": 400.397,
+        "handoff_ack": 456.733,
+        "ssh_closed": 469.094,
+        "client_close": 18935.915
+      },
+      "stdout_tail": [
+        "run 20261122T071146Z-d4959dfa029ca541: completed",
+        "run 20261122T071146Z-d4959dfa029ca541: completed",
+        "  completed 1002, pending 0, failed 0, skipped 0, unsupported 0 (of 1002 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: handoff complete; detached data control owns the session"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "direct-tcp-mixed-1001-files-r3",
+      "mode": "daemon direct TCP",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "mixed-1001-files",
+      "bytes": 8388608,
+      "files": 1002,
+      "repeat": 3,
+      "started_at": "2026-11-22T07:12:24.837447+00:00",
+      "elapsed_ms": 18636,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 3.189,
+      "cpu_sys_s": 1.19,
+      "maxrss_kb": 25472,
+      "effective_mbps": 3.601,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 396.518,
+        "handoff_start": 396.655,
+        "handoff_ack": 443.858,
+        "ssh_closed": 456.15,
+        "client_close": 18492.253
+      },
+      "stdout_tail": [
+        "run 20261122T071206Z-abe9be090cbdf0ae: completed",
+        "run 20261122T071206Z-abe9be090cbdf0ae: completed",
+        "  completed 1002, pending 0, failed 0, skipped 0, unsupported 0 (of 1002 tasks)"
+      ],
+      "stderr_tail": [],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "direct-quic-mixed-1001-files-r1",
+      "mode": "daemon direct QUIC",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "mixed-1001-files",
+      "bytes": 8388608,
+      "files": 1002,
+      "repeat": 1,
+      "started_at": "2026-11-22T07:12:44.181253+00:00",
+      "elapsed_ms": 18266,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 3.213,
+      "cpu_sys_s": 1.664,
+      "maxrss_kb": 26352,
+      "effective_mbps": 3.674,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 387.44,
+        "handoff_start": 387.545,
+        "handoff_ack": 407.061,
+        "ssh_closed": 418.721,
+        "client_close": 18169.184
+      },
+      "stdout_tail": [
+        "run 20261122T071226Z-16d4a0be27e232d5: completed",
+        "run 20261122T071226Z-16d4a0be27e232d5: completed",
+        "  completed 1002, pending 0, failed 0, skipped 0, unsupported 0 (of 1002 tasks)"
+      ],
+      "stderr_tail": [
+        "2026/11/22 15:12:26 failed to sufficiently increase receive buffer size (was: 208 kiB, wanted: 7168 kiB, got: 416 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.",
+        "catsyncd: handoff complete; detached data control owns the session"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "direct-quic-mixed-1001-files-r2",
+      "mode": "daemon direct QUIC",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "mixed-1001-files",
+      "bytes": 8388608,
+      "files": 1002,
+      "repeat": 2,
+      "started_at": "2026-11-22T07:13:03.051160+00:00",
+      "elapsed_ms": 17707,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 3.376,
+      "cpu_sys_s": 1.745,
+      "maxrss_kb": 26400,
+      "effective_mbps": 3.79,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 441.411,
+        "handoff_start": 441.545,
+        "handoff_ack": 457.768,
+        "ssh_closed": 470.014,
+        "client_close": 17615.704
+      },
+      "stdout_tail": [
+        "run 20261122T071245Z-163332629453a3fb: completed",
+        "run 20261122T071245Z-163332629453a3fb: completed",
+        "  completed 1002, pending 0, failed 0, skipped 0, unsupported 0 (of 1002 tasks)"
+      ],
+      "stderr_tail": [
+        "2026/11/22 15:12:45 failed to sufficiently increase receive buffer size (was: 208 kiB, wanted: 7168 kiB, got: 416 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details."
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "direct-quic-mixed-1001-files-r3",
+      "mode": "daemon direct QUIC",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "mixed-1001-files",
+      "bytes": 8388608,
+      "files": 1002,
+      "repeat": 3,
+      "started_at": "2026-11-22T07:13:22.264919+00:00",
+      "elapsed_ms": 18213,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 3.42,
+      "cpu_sys_s": 1.729,
+      "maxrss_kb": 27584,
+      "effective_mbps": 3.685,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 430.57,
+        "handoff_start": 430.713,
+        "handoff_ack": 448.246,
+        "ssh_closed": 459.648,
+        "client_close": 18116.471
+      },
+      "stdout_tail": [
+        "run 20261122T071304Z-a511c6e33f22f16c: completed",
+        "run 20261122T071304Z-a511c6e33f22f16c: completed",
+        "  completed 1002, pending 0, failed 0, skipped 0, unsupported 0 (of 1002 tasks)"
+      ],
+      "stderr_tail": [
+        "2026/11/22 15:13:04 failed to sufficiently increase receive buffer size (was: 208 kiB, wanted: 7168 kiB, got: 416 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details."
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "old-direct-tcp-mixed-1001-files-r1",
+      "mode": "pre-detach direct TCP (v0.2.0)",
+      "implementation": "v0.2.0-pre-detach",
+      "direction": "upload",
+      "dataset": "mixed-1001-files",
+      "bytes": 8388608,
+      "files": 1002,
+      "repeat": 1,
+      "started_at": "2026-11-22T07:13:43.159540+00:00",
+      "elapsed_ms": 19915,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 4.549,
+      "cpu_sys_s": 0.991,
+      "maxrss_kb": 27584,
+      "effective_mbps": 3.37,
+      "timing_ms": {},
+      "stdout_tail": [
+        "run 20261122T071323Z-ae0e1183858c5acd: completed",
+        "run 20261122T071323Z-ae0e1183858c5acd: completed",
+        "  completed 1002, pending 0, failed 0, skipped 0, unsupported 0 (of 1002 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: draining: rpc=0 sftp=0 exec=0 children=0",
+        "catsyncd: drain complete: rpc=0 sftp=0 exec=0 children=0"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "old-direct-tcp-mixed-1001-files-r2",
+      "mode": "pre-detach direct TCP (v0.2.0)",
+      "implementation": "v0.2.0-pre-detach",
+      "direction": "upload",
+      "dataset": "mixed-1001-files",
+      "bytes": 8388608,
+      "files": 1002,
+      "repeat": 2,
+      "started_at": "2026-11-22T07:14:04.018916+00:00",
+      "elapsed_ms": 19872,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 4.648,
+      "cpu_sys_s": 0.971,
+      "maxrss_kb": 27584,
+      "effective_mbps": 3.377,
+      "timing_ms": {},
+      "stdout_tail": [
+        "run 20261122T071344Z-ffd03faf8a97e164: completed",
+        "run 20261122T071344Z-ffd03faf8a97e164: completed",
+        "  completed 1002, pending 0, failed 0, skipped 0, unsupported 0 (of 1002 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: draining: rpc=0 sftp=0 exec=0 children=0",
+        "catsyncd: drain complete: rpc=0 sftp=0 exec=0 children=0"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "old-direct-tcp-mixed-1001-files-r3",
+      "mode": "pre-detach direct TCP (v0.2.0)",
+      "implementation": "v0.2.0-pre-detach",
+      "direction": "upload",
+      "dataset": "mixed-1001-files",
+      "bytes": 8388608,
+      "files": 1002,
+      "repeat": 3,
+      "started_at": "2026-11-22T07:14:24.777486+00:00",
+      "elapsed_ms": 19757,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 4.618,
+      "cpu_sys_s": 0.964,
+      "maxrss_kb": 27760,
+      "effective_mbps": 3.397,
+      "timing_ms": {},
+      "stdout_tail": [
+        "run 20261122T071405Z-a7ce6de3bef4b6bb: completed",
+        "run 20261122T071405Z-a7ce6de3bef4b6bb: completed",
+        "  completed 1002, pending 0, failed 0, skipped 0, unsupported 0 (of 1002 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: draining: rpc=0 sftp=0 exec=0 children=0",
+        "catsyncd: drain complete: rpc=0 sftp=0 exec=0 children=0"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "tcp-streams1-large-128MiB-r1",
+      "mode": "direct TCP streams=1",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 1,
+      "started_at": "2026-11-22T07:15:49.226411+00:00",
+      "elapsed_ms": 83433,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.493,
+      "cpu_sys_s": 0.955,
+      "maxrss_kb": 27824,
+      "effective_mbps": 12.87,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 401.77,
+        "handoff_start": 401.882,
+        "handoff_ack": 463.79,
+        "ssh_closed": 476.067,
+        "client_close": 83278.592
+      },
+      "stdout_tail": [
+        "run 20261122T071426Z-d995270e70e607f6: completed",
+        "run 20261122T071426Z-d995270e70e607f6: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: handoff complete; detached data control owns the session"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "tcp-streams1-large-128MiB-r2",
+      "mode": "direct TCP streams=1",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 2,
+      "started_at": "2026-11-22T07:17:13.202964+00:00",
+      "elapsed_ms": 82968,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.511,
+      "cpu_sys_s": 1.028,
+      "maxrss_kb": 27824,
+      "effective_mbps": 12.942,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 373.818,
+        "handoff_start": 373.924,
+        "handoff_ack": 423.787,
+        "ssh_closed": 436.058,
+        "client_close": 82820.285
+      },
+      "stdout_tail": [
+        "run 20261122T071550Z-c98fa5c8bbdeaaed: completed",
+        "run 20261122T071550Z-c98fa5c8bbdeaaed: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: handoff complete; detached data control owns the session"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "tcp-streams1-large-128MiB-r3",
+      "mode": "direct TCP streams=1",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 3,
+      "started_at": "2026-11-22T07:18:57.351325+00:00",
+      "elapsed_ms": 102949,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.733,
+      "cpu_sys_s": 1.528,
+      "maxrss_kb": 27952,
+      "effective_mbps": 10.43,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 391.396,
+        "handoff_start": 391.522,
+        "handoff_ack": 440.683,
+        "ssh_closed": 452.887,
+        "client_close": 102803.375
+      },
+      "stdout_tail": [
+        "run 20261122T071715Z-1d2609b97c5dfcda: completed",
+        "run 20261122T071715Z-1d2609b97c5dfcda: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "tcp-streams4-large-128MiB-r1",
+      "mode": "direct TCP streams=4",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 1,
+      "started_at": "2026-11-22T07:19:25.714262+00:00",
+      "elapsed_ms": 27352,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.565,
+      "cpu_sys_s": 1.226,
+      "maxrss_kb": 27952,
+      "effective_mbps": 39.256,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 388.403,
+        "handoff_start": 388.581,
+        "handoff_ack": 447.549,
+        "ssh_closed": 459.929,
+        "client_close": 27186.414
+      },
+      "stdout_tail": [
+        "run 20261122T071858Z-067ff6261bacfd3f: completed",
+        "run 20261122T071858Z-067ff6261bacfd3f: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: handoff complete; detached data control owns the session"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "tcp-streams4-large-128MiB-r2",
+      "mode": "direct TCP streams=4",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 2,
+      "started_at": "2026-11-22T07:19:53.894792+00:00",
+      "elapsed_ms": 27149,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.551,
+      "cpu_sys_s": 1.158,
+      "maxrss_kb": 28064,
+      "effective_mbps": 39.55,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 382.52,
+        "handoff_start": 382.638,
+        "handoff_ack": 439.639,
+        "ssh_closed": 451.854,
+        "client_close": 27005.614
+      },
+      "stdout_tail": [
+        "run 20261122T071927Z-d7ffffafef57e9b9: completed",
+        "run 20261122T071927Z-d7ffffafef57e9b9: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: handoff complete; detached data control owns the session"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "tcp-streams4-large-128MiB-r3",
+      "mode": "direct TCP streams=4",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 3,
+      "started_at": "2026-11-22T07:20:19.784693+00:00",
+      "elapsed_ms": 24863,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.491,
+      "cpu_sys_s": 1.009,
+      "maxrss_kb": 28160,
+      "effective_mbps": 43.186,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 377.455,
+        "handoff_start": 377.599,
+        "handoff_ack": 438.174,
+        "ssh_closed": 450.379,
+        "client_close": 24709.288
+      },
+      "stdout_tail": [
+        "run 20261122T071955Z-cb6ba347723afdd4: completed",
+        "run 20261122T071955Z-cb6ba347723afdd4: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: handoff complete; detached data control owns the session"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "tcp-streams8-large-128MiB-r1",
+      "mode": "direct TCP streams=8",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 1,
+      "started_at": "2026-11-22T07:20:34.940947+00:00",
+      "elapsed_ms": 14122,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.511,
+      "cpu_sys_s": 1.037,
+      "maxrss_kb": 28160,
+      "effective_mbps": 76.033,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 369.017,
+        "handoff_start": 369.099,
+        "handoff_ack": 424.8,
+        "ssh_closed": 435.134,
+        "client_close": 13985.032
+      },
+      "stdout_tail": [
+        "run 20261122T072021Z-a07de01ff08776a9: completed",
+        "run 20261122T072021Z-a07de01ff08776a9: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: handoff complete; detached data control owns the session"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "tcp-streams8-large-128MiB-r2",
+      "mode": "direct TCP streams=8",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 2,
+      "started_at": "2026-11-22T07:20:50.193079+00:00",
+      "elapsed_ms": 14254,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.419,
+      "cpu_sys_s": 0.757,
+      "maxrss_kb": 29136,
+      "effective_mbps": 75.327,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 366.254,
+        "handoff_start": 366.36,
+        "handoff_ack": 422.561,
+        "ssh_closed": 434.778,
+        "client_close": 14112.672
+      },
+      "stdout_tail": [
+        "run 20261122T072036Z-e8393c6da41cc816: completed",
+        "run 20261122T072036Z-e8393c6da41cc816: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: handoff complete; detached data control owns the session"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    },
+    {
+      "id": "tcp-streams8-large-128MiB-r3",
+      "mode": "direct TCP streams=8",
+      "implementation": "workspace-detach-prototype",
+      "direction": "upload",
+      "dataset": "large-128MiB",
+      "bytes": 134217728,
+      "files": 1,
+      "repeat": 3,
+      "started_at": "2026-11-22T07:21:05.215115+00:00",
+      "elapsed_ms": 14050,
+      "success": true,
+      "exit_code": 0,
+      "failure": "",
+      "cpu_user_s": 0.309,
+      "cpu_sys_s": 0.468,
+      "maxrss_kb": 29136,
+      "effective_mbps": 76.425,
+      "timing_ms": {
+        "bootstrap_start": 0.0,
+        "data_control_ready": 377.072,
+        "handoff_start": 377.187,
+        "handoff_ack": 431.438,
+        "ssh_closed": 443.614,
+        "client_close": 13898.135
+      },
+      "stdout_tail": [
+        "run 20261122T072051Z-e8d86656538d84a5: completed",
+        "run 20261122T072051Z-e8d86656538d84a5: completed",
+        "  completed 1, pending 0, failed 0, skipped 0, unsupported 0 (of 1 tasks)"
+      ],
+      "stderr_tail": [
+        "catsyncd: handoff complete; detached data control owns the session"
+      ],
+      "verify_note": "client --verify sha256 passed"
+    }
+  ],
+  "environment": {
+    "client": "MacBook Pro (Apple M5, 16 GB), macOS 27.2.1, Go 1.27.4",
+    "server": "Debian 13 (Linux 6.12.95+deb13-amd64), 2 vCPU, 1973 MB RAM, x86_64",
+    "network": "unrestricted public Internet; ICMP RTT 16.761-20.863 ms (5 probes)",
+    "vps": "Tencent Cloud test VPS (host details sanitized)",
+    "test_date": "2026-11-22"
+  },
+  "controlled_bandwidth": {
+    "status": "SKIP",
+    "reason": "No sudo/root; VPS qdisc/sysctl/firewall changes are out of scope. Shaping only port 43411 while leaving SSH port 22 unshaped would be unfair, and no user-space proxy was inserted into the SSH paths."
+  },
+  "resource_note": "cpu_user_s/cpu_sys_s are per-run child deltas via resource.getrusage. maxrss_kb is the maximum child RSS observed by the process (macOS reports bytes; converted to KiB); it is cumulative across the benchmark process and not a per-run peak. Remote CPU/RSS were not sampled to avoid adding load from observation sessions."
+}

@@ -38,6 +38,26 @@ with hash placeholders and `packaging/homebrew/render.sh` to fill them from
 `dist/release/SHA256SUMS`. Publishing to the tap is a separate, manual step
 and is not performed by CatSync.
 
+## 1c. Lifecycle acceptance before tagging a direct-mode release
+
+Before a release that changes the direct TCP/QUIC lifecycle, run the real
+OpenSSH acceptance and fault-injection scripts against the authorized test
+VPS (or an equivalent disposable host):
+
+```bash
+CATSYNC_E2E_HOST=catsync-test@example.invalid python3 scripts/tests/real-ssh-handoff.py --binary ./bin/catsync \
+  --remote-catsyncd /home/catsync-test/.local/bin/catsyncd \
+  --out docs/assets/benchmarks/lifecycle.json
+CATSYNC_E2E_HOST=catsync-test@example.invalid \
+python3 scripts/tests/worker-timeout.py --binary ./bin/catsync \
+  --remote-catsyncd /home/catsync-test/.local/bin/catsyncd \
+  --out docs/assets/benchmarks/cleanup.json
+```
+
+Both scripts assert a matching SHA-256, no second bootstrap SSH, and a
+disappeared one-shot worker. Do not tag if either script fails; this is a
+release gate, not an optional benchmark.
+
 ## 2. Update the Homebrew tap (manual)
 
 The tap lives in a separate repository (`dotfrankruan/homebrew-catsync`) and

@@ -1,0 +1,9 @@
+{
+  "test": "client SIGKILL after handoff",
+  "binary": "workspace-detach-prototype",
+  "worker_pid": "3857550",
+  "client_exit_ms": 2415,
+  "worker_exit_after_client_kill_ms": 38676,
+  "worker_exited": true,
+  "observation": "separate ssh pgrep only; not part of the transfer"
+}
