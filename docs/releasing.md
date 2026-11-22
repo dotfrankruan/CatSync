@@ -62,12 +62,10 @@ git commit -am "catsync v0.2.0"
 git push   # only when you explicitly intend to publish the tap
 ```
 
-Releases from the one-shot daemon milestone on contain both `catsync` and
-`catsyncd` in every archive, so the rendered formula installs and tests both.
-The currently checked-in tap formula still carries a conditional install for
-the historical v0.1.0 archive, which shipped only `catsync`; after the first
-release containing `catsyncd`, that conditional can be removed and the
-formula replaced with the rendered one verbatim.
+Releases from v0.2.0 on contain both `catsync` and `catsyncd` in every
+archive, so the rendered formula installs and tests both. The tap was updated
+to v0.2.0 during that release and now installs both unconditionally; future
+releases can use the rendered formula verbatim.
 
 ## 3. Bump the Homebrew formula (legacy notes)
 

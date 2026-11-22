@@ -5,9 +5,9 @@
 # then copy the result into the tap's Formula/catsync.rb. CatSync never
 # publishes to the tap itself.
 #
-# Releases from the one-shot daemon milestone on ship both binaries in the
-# same archive. v0.1.0 contained only catsync; the tap's checked-in formula
-# keeps a conditional install so that historical release stays installable.
+# Releases beginning with v0.2.0 ship both binaries in the same archive; the
+# tap formula installs both unconditionally. Only the historical v0.1.0
+# archive predates catsyncd.
 class Catsync < Formula
   desc "Parallel, resumable file tree copier over SSH"
   homepage "https://github.com/dotfrankruan/CatSync"
