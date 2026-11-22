@@ -90,6 +90,30 @@ func authPrompt(o *Options, stderr io.Writer) func(string) (bool, error) {
 	}
 }
 
+// printQUICFallbackHint makes an explicit QUIC failure actionable. QUIC is
+// opt-in, so CatSync never silently switches transports: the operator decides
+// whether to retry over pinned-mTLS TCP on the standard daemon port or to use
+// the historical SSH data path.
+func printQUICFallbackHint(command string, opts *Options, run *state.Run, stderr io.Writer) {
+	if opts == nil {
+		return
+	}
+	used := opts.DaemonTransport == "quic"
+	daemon := opts.Transport == "daemon"
+	if run != nil {
+		used = used || run.Config.DaemonTransport == "quic"
+		daemon = daemon || run.Config.Transport == "daemon"
+	}
+	if !used || !daemon {
+		return
+	}
+	fmt.Fprintln(stderr, "catsync: QUIC data transport failed; no automatic fallback was performed.")
+	fmt.Fprintf(stderr, "catsync: to retry over pinned-mTLS TCP on port 43411: re-run with --transport daemon --daemon-transport tcp --daemon-port 43411\n")
+	fmt.Fprintf(stderr, "catsync: to use the historical SSH data path instead: re-run with --transport ssh\n")
+	fmt.Fprintf(stderr, "catsync: to keep diagnosing QUIC: add --quic-qlog PATH (and --remote-quic-qlog ABS_REMOTE_PATH)\n")
+	fmt.Fprintf(stderr, "catsync: the failed run is resumable; %s saves no data to the destination without an explicit retry.\n", command)
+}
+
 func progressEnabled(mode string, quiet bool, w io.Writer) bool {
 	if quiet || mode == "never" {
 		return false
@@ -188,6 +212,7 @@ func runSync(ctx context.Context, command string, cfg executor.Config, opts *Opt
 	run, err := executor.Sync(ctx, cfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "catsync: %s: %v\n", command, err)
+		printQUICFallbackHint(command, opts, run, stderr)
 		if run != nil {
 			fmt.Fprintf(stderr, "catsync: %s: run %s is recorded; inspect with 'catsync status %s'\n", command, run.ID, run.ID)
 		}
@@ -230,6 +255,7 @@ func runResume(ctx context.Context, opts *Options, id string, stdout, stderr io.
 	run, err := executor.Resume(ctx, cfg, id)
 	if err != nil {
 		fmt.Fprintf(stderr, "catsync: resume: %v\n", err)
+		printQUICFallbackHint("resume", opts, run, stderr)
 		return exitForError(err)
 	}
 	printRunSummary(stdout, run, opts)

@@ -454,3 +454,23 @@ func TestDaemonTransportFlagValidation(t *testing.T) {
 		t.Errorf("ssh-forward with port 0: exit=%d stderr=%q", code, stderr)
 	}
 }
+
+func TestQUICFallbackHint(t *testing.T) {
+	var buf strings.Builder
+	opts := &Options{Transport: "daemon", DaemonTransport: "quic"}
+	printQUICFallbackHint("copy", opts, nil, &buf)
+	got := buf.String()
+	for _, want := range []string{
+		"no automatic fallback", "--daemon-transport tcp --daemon-port 43411",
+		"--transport ssh", "--quic-qlog",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("hint lacks %q: %s", want, got)
+		}
+	}
+	buf.Reset()
+	printQUICFallbackHint("copy", &Options{Transport: "daemon", DaemonTransport: "tcp"}, nil, &buf)
+	if buf.Len() != 0 {
+		t.Errorf("TCP transport produced a QUIC hint: %q", buf.String())
+	}
+}

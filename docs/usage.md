@@ -292,6 +292,12 @@ Security and failure behavior:
   ALPN, and JSONL lifecycle as TCP; 0-RTT is never used. The probe reports
   `transports: ["tcp", "quic"]`.
 
+If QUIC is unavailable or a QUIC run fails, CatSync never switches transports
+silently. The error points at both explicit alternatives: retry with
+`--transport daemon --daemon-transport tcp --daemon-port 43411` (same pinned
+mTLS bootstrap over TCP), or `--transport ssh` (historical SSH data path). The
+failed run stays resumable and no destination data is discarded on failure.
+
 QUIC diagnostics are opt-in and add no work to normal runs. `--quic-qlog`
 writes a standard qlog trace (packet loss, PTO/loss timer, RTT, cwnd, bytes in
 flight, flow control, connection close) for the local connection;
