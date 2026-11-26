@@ -180,6 +180,8 @@ planner, checkpoint format, publish rules, or verification logic.
 
 ## 📚 Documentation
 
+Start at the [documentation index](docs/README.md), or jump straight in:
+
 | | |
 | --- | --- |
 | 🧰 [Usage](docs/usage.md) | Commands, options, backend selection, authentication, troubleshooting. |

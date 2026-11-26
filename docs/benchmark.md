@@ -1,204 +1,168 @@
-# CatSync detached SSH lifecycle benchmark
+# CatSync transport benchmark
 
-This document reports the measured results for the SSH bootstrap lifecycle
-handoff. It separates unrestricted public-network measurements from the
-controlled-bandwidth work, which is marked **SKIP** because the required
-network privileges were not available. Every number comes from this round's
-machine-readable raw data; failed runs are kept in the tables and are not
-silently removed.
+Measured on an unrestricted public network in November 2026. Failed runs are
+included; they are not filtered out of the summary or the charts.
 
-Implementation under test: the local workspace on top of commit `998c169`
-(the pre-detach comparison is the published v0.2.0 binaries). Test date:
-2026-11-22.
+> **TL;DR** — SSH bootstrap lifecycle handoff works for direct TCP and direct
+> QUIC. Direct TCP upload performance matched the pre-detach baseline. QUIC
+> remains experimental and failed 2 of 3 16 MiB downloads with the known
+> public-path `decryption_failure`/idle-timeout issue. Controlled-bandwidth
+> testing is **SKIP** because it needs privileges we intentionally did not use.
 
-## 1. Executive Summary
+## Contents
 
-The lifecycle goal was achieved on a real OpenSSH path:
+- [Executive Summary](#executive-summary)
+- [Architecture Under Test](#architecture-under-test)
+- [Test Environment](#test-environment)
+- [Hardware, OS, and Software](#hardware-os-and-software)
+- [Dataset and Methodology](#dataset-and-methodology)
+- [Baseline Results](#baseline-results)
+- [Detached SSH Lifecycle Results](#detached-ssh-lifecycle-results)
+- [Upload Benchmarks](#upload-benchmarks)
+- [Download Benchmarks](#download-benchmarks)
+- [Stream Concurrency](#stream-concurrency)
+- [Failure Injection and Recovery](#failure-injection-and-recovery)
+- [Resource Usage](#resource-usage)
+- [Limitations and Known Issues](#limitations-and-known-issues)
+- [Reproduction Instructions](#reproduction-instructions)
+- [Raw Data References](#raw-data-references)
+- [Conclusion](#conclusion)
 
-- Direct TCP and direct QUIC complete a one-time SSH bootstrap, establish
-  pinned mTLS/QUIC, hand ownership to the authenticated data control channel,
-  and continue after the bootstrap SSH exits.
-- In the normal TCP acceptance case the SSH process closed at **1.50 s**
-  while the direct data session continued until **25.85 s**, with a matching
-  SHA-256.
-- In the deliberate `SIGKILL` case, only the client-side bootstrap SSH was
-  killed at **1.95 s**; the authenticated direct transfer continued until
-  **33.41 s** and the SHA-256 matched. No second bootstrap SSH was observed.
-- The same normal and SIGKILL cases succeeded for direct QUIC with a 1 MiB
-  data set. QUIC's separate low-bandwidth failure is discussed in
-  [Limitations](#13-limitations-and-known-issues).
-- Every tested worker disappeared after the final authenticated bye. After a
-  client `SIGKILL`, the worker disappeared in **38.68 s**, inside the bounded
-  data-control heartbeat timeout.
+## Executive Summary
 
-Throughput summary (unrestricted public network; median of successful runs):
+| Check | Result |
+| --- | --- |
+| Direct TCP handoff, normal | **PASS** — SSH closed at 1.505 s; data continued to 25.846 s; SHA-256 matched. |
+| Direct TCP handoff, SSH `SIGKILL` | **PASS** — SSH killed at 1.945 s; data continued to 33.406 s; SHA-256 matched. |
+| Direct QUIC handoff, 1 MiB | **PASS** — normal and SSH-kill cases completed with matching SHA-256. |
+| Second bootstrap SSH | **None observed** in either direct case. |
+| Remote worker after completion | **Exited** in every acceptance case. |
+| Client `SIGKILL` | Worker exited 38.676 s after the client died. |
+| 128 MiB upload median | Legacy SSH 37.9, SSH-forward 47.1, direct TCP 41.2, direct QUIC 38.6, pre-detach TCP 41.1 Mbps. |
+| 16 MiB download median | SSH-forward 3.7, legacy SSH 2.4, direct TCP 2.1, pre-detach TCP 2.2 Mbps; direct QUIC 1 success / 2 failures. |
+| Direct TCP upload streams 1 / 4 / 8 | 12.9 / 39.6 / 76.0 Mbps. |
+| Handoff median | Direct TCP 64 ms, direct QUIC 31 ms. |
+| Controlled bandwidth | **SKIP** — no sudo/qdisc/firewall changes. |
 
-- 128 MiB upload: legacy SSH **37.9 Mbps**, SSH-forward **47.1 Mbps**,
-  direct TCP **41.2 Mbps**, direct QUIC **38.6 Mbps**, pre-detach direct TCP
-  **41.1 Mbps**.
-- 16 MiB download: SSH-forward **3.7 Mbps**, direct TCP **2.1 Mbps**,
-  legacy SSH **2.4 Mbps**, pre-detach direct TCP **2.2 Mbps**. Direct QUIC had
-  **1 success and 2 failures**; its one successful run reached 3.5 Mbps.
-- Direct TCP stream scaling for the 128 MiB upload: **12.9 Mbps** at one
-  stream, **39.6 Mbps** at four streams, **76.0 Mbps** at eight streams.
-- Handoff itself is small relative to the transfer: median direct-TCP
-  handoff **64 ms**, direct-QUIC handoff **31 ms**; bootstrap plus
-  authenticated control was **369-419 ms**.
-- The pre-detach TCP baseline and the detached TCP build are statistically
-  indistinguishable for upload; no throughput regression is visible in this
-  environment. Download numbers vary with the public path and are not
-  evidence of an implementation speedup.
-
-Controlled bandwidth, high-RTT, loss, and isolated-LAN tests: **SKIP** (no
-sudo/qdisc/firewall access; shaping only one port would be unfair). The
-public-network baseline is the primary result, and no controlled numbers are
-invented.
-
-## 2. Architecture Under Test
+## Architecture Under Test
 
 ```text
 SSH bootstrap (one session)
   -> ephemeral P-256 identities + exact leaf pinning
   -> pinned mTLS 1.3 data control / QUIC TLS 1.3 (no 0-RTT)
-  -> authenticated handoff request bound to the bootstrap session id
-  -> server confirms detached and closes SSH stdio
+  -> authenticated handoff bound to the bootstrap session id
+  -> server confirms detached, closes SSH stdio
   -> client kills only its local bootstrap ssh
-  -> authenticated data heartbeats + bye own the session
+  -> data heartbeats + authenticated bye own the session
   -> one-shot worker exits
 ```
 
-See [assets/ssh-handoff.svg](assets/ssh-handoff.svg).
+See [ssh-handoff.svg](assets/ssh-handoff.svg) for the diagram and
+[architecture.md](architecture.md#daemon-transport) for implementation details.
 
-| Mode | Bootstrap | Data path | SSH dependence after handoff |
+| Mode | Bootstrap | Data path | SSH after handoff |
 | --- | --- | --- | --- |
-| Legacy SSH | none | SFTP/rsync over SSH | Not applicable; unchanged |
-| daemon SSH-forward | one SSH | mTLS inside the SSH tunnel | SSH must stay alive |
-| daemon direct TCP | one SSH | pinned mTLS TCP | None after handoff |
-| daemon direct QUIC | one SSH | pinned QUIC TLS 1.3 | None after handoff |
-| pre-detach direct TCP | one SSH | old v0.2.0 daemon lifecycle | Baseline: SSH-bound |
+| Legacy SSH | none | SFTP/rsync over SSH | N/A |
+| daemon SSH-forward | one SSH | mTLS inside the SSH tunnel | Required |
+| daemon direct TCP | one SSH | pinned mTLS TCP | Can exit |
+| daemon direct QUIC | one SSH | pinned QUIC TLS 1.3 | Can exit |
+| pre-detach direct TCP | one SSH | v0.2.0 SSH-bound daemon baseline | Required |
 
-## 3. Test Environment
+## Test Environment
 
-- Client: MacBook Pro, Apple M5, 16 GB RAM, macOS 27.2.1, Go 1.27.4
-  (darwin/arm64).
-- Server: Debian 13, Linux 6.12.95+deb13-amd64, 2 vCPU, 1973 MB RAM,
-  x86_64, public IPv4 test VPS (host details sanitized).
-- RTT: ICMP 5 probes, min/avg/max = **16.761 / 17.941 / 20.863 ms**,
-  0% packet loss.
-- VPS nominal bandwidth is 100 Mbps download / 4 Mbps upload. The provider
-  does not guarantee a fixed rate; the observed rate varied between runs.
-- Default `catsyncd` receive-buffer warning was present (`wanted 7168 KiB,
-  got 416 KiB`); no sysctl or privileged tuning was performed.
-- No sudo, root, qdisc, sysctl, firewall, cloud-security-group, or service
-  changes were made on the VPS.
-
-## 4. Hardware / OS / Software Versions
-
-| Component | Version / detail |
+| | |
 | --- | --- |
-| Client CPU | Apple M5 |
-| Client OS | macOS 27.2.1 (build 26B131) |
-| Go toolchain | go1.27.4 darwin/arm64 |
-| Server OS | Debian 13, kernel 6.12.95+deb13-amd64 |
-| Server CPU | 2 vCPU, x86_64 |
-| Server RAM | 1973 MB total |
-| SSH | system OpenSSH; real sshd on the test VPS |
-| quic-go | v0.65.0 (repository dependency) |
+| Client | MacBook Pro, Apple M5, 16 GB RAM |
+| Client OS | macOS 27.2.1 (26B131) |
+| VPS | Debian 13, Linux 6.12.95+deb13-amd64, 2 vCPU, 1973 MB RAM, x86_64 |
+| Network | Public IPv4; ICMP RTT min/avg/max 16.761 / 17.941 / 20.863 ms, 0% loss |
+| Nominal VPS bandwidth | 100 Mbps down / 4 Mbps up, **not guaranteed constant** |
+| Observation | No sudo, qdisc, sysctl, firewall, service, or cloud-security-group changes |
+
+## Hardware, OS, and Software
+
+| Component | Version |
+| --- | --- |
+| Go | go1.27.4 darwin/arm64 |
+| quic-go | v0.65.0 |
 | Catsync under test | workspace detached-lifecycle build |
 | Pre-detach baseline | v0.2.0 (`catsync` + `catsyncd.pre-detach`) |
+| SSH | system OpenSSH against the real Debian VPS sshd |
 
-## 5. Dataset and Methodology
+## Dataset and Methodology
 
-Datasets are generated deterministically with
-`scripts/benchmarks/make_dataset.py`:
+Datasets are generated by `scripts/benchmarks/make_dataset.py` with a fixed
+seed:
 
-- **large-128MiB**: one 128 MiB random file (seed 20261122), enough to
-  exercise the native multistream path.
-- **small-16MiB**: one 16 MiB random file, used for downloads to respect the
-  VPS 4 Mbps upload direction.
-- **mixed-1001-files**: 1000 small files plus one 8 MiB file and one empty
-  file, with Unicode, spaces, and hidden names; 1002 regular files total.
+| ID | Contents |
+| --- | --- |
+| `large-128MiB` | One 128 MiB random file. |
+| `small-16MiB` | One 16 MiB random file, used for downloads. |
+| `mixed-1001-files` | 1000 small files + one 8 MiB file + one empty file (1002 regular files), including Unicode, spaces, and hidden names. |
 
-Every run used identical workloads:
+Every run used the same workload and flags:
 
 ```bash
-catsync copy --transport <mode> --jobs 4 --streams 4 --large-threshold 1MiB \
-  --progress never --verify sha256 <source> <destination>
+catsync copy --transport <mode> --jobs 4 --streams 4 \
+  --large-threshold 1MiB --progress never --verify sha256 \
+  <source> <destination>
 ```
 
-Each condition was repeated **3 times**; the tables report the median of
-successful runs, the min/max range, and the failure count. Failures are not
-removed. A run was successful only if the client exited 0 and its
-`--verify sha256` completion gate passed. Large uploads use four jobs and four
-streams unless the stream-scan variant explicitly says otherwise. Download
-runs use the same settings and the same 16 MiB source.
+- Each condition: **3 repeats**; tables show medians and failure counts.
+- Success requires exit 0 and the client’s `--verify sha256` gate.
+- Timing phases are opt-in (`CATSYNC_BENCH_TIMING`): bootstrap, authenticated
+  data control, handoff, SSH close, client close.
+- Local child CPU is measured with `getrusage`. Remote CPU/RSS were not sampled.
+- NIC counters come from a supplemental 16 MiB probe; they include bootstrap
+  and observation SSH traffic.
 
-The benchmark runner records wall-clock phases from an opt-in
-`CATSYNC_BENCH_TIMING` JSONL diagnostic (disabled by default): bootstrap
-start, authenticated data-control readiness, handoff start/ack, SSH close,
-and client close. Local child CPU is measured with `getrusage`; remote CPU
-and RSS were not sampled to avoid adding observation load. The supplemental
-NIC probe reads VPS interface counters before and after one 16 MiB transfer
-per mode; those readings include the observation SSH connections.
+## Baseline Results
 
-## 6. Baseline Results
+The pre-detach lifecycle was measured with the published v0.2.0 client and the
+saved pre-detach `catsyncd`. It keeps SSH alive for the whole run.
 
-The pre-detach v0.2.0 lifecycle was measured with the published v0.2.0 client
-and the saved pre-detach `catsyncd`, using the same dataset and flags. It
-uses SSH for the entire run (no detached worker).
+| Workload | Mode | n | OK | Fail | Median Mbps | Median elapsed |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 128 MiB upload | pre-detach direct TCP | 3 | 3 | 0 | 41.09 | 26.1 s |
+| 16 MiB download | pre-detach direct TCP | 3 | 3 | 0 | 2.21 | 60.8 s |
+| 1002-file upload | pre-detach direct TCP | 3 | 3 | 0 | 3.38 | 19.9 s |
 
-| Workload | Mode | n | OK | Fail | Median Mbps | Min/Max | Median elapsed |
-| --- | --- | ---: | ---: | ---: | ---: | --- | ---: |
-| 128 MiB upload | pre-detach direct TCP | 3 | 3 | 0 | 41.09 | 37.8/42.8 | 26.1 s |
-| 16 MiB download | pre-detach direct TCP | 3 | 3 | 0 | 2.21 | 2.2/2.3 | 60.8 s |
-| 1002-file upload | pre-detach direct TCP | 3 | 3 | 0 | 3.38 | 3.4/3.4 | 19.9 s |
+The detached TCP upload median (41.20 Mbps) is effectively the same as the
+baseline in this noisy public network. The detached TCP download is not faster
+in this sample; no speedup is claimed.
 
-The new direct-TCP upload median (41.20 Mbps) is effectively the same as the
-old lifecycle (41.09 Mbps) in this noisy public network. The new direct TCP
-download is not faster in these samples; the public path is the dominant
-variable, and no speedup is claimed.
+## Detached SSH Lifecycle Results
 
-## 7. Detached SSH Lifecycle Results
+Raw data: [`lifecycle.json`](assets/benchmarks/lifecycle.json).
 
-### 7.1 Real OpenSSH normal and forced-kill cases
-
-Raw data: `docs/assets/benchmarks/lifecycle.json`. Large TCP cases use the
-128 MiB file; QUIC cases use a 1 MiB file because of the known public-path
-QUIC problem described in Limitations.
-
-| Case | Transport | SSH end | Data end | SHA-256 | Worker PID same after handoff | Second SSH | Worker exited |
+| Case | Transport | SSH end | Data end | SHA-256 | Worker PID after handoff | Second SSH | Worker exited |
 | --- | --- | ---: | ---: | --- | --- | --- | --- |
-| Normal handoff + natural close | direct TCP | 1.505 s | 25.85 s | match | yes | no | yes |
-| Bootstrap SSH SIGKILL after handoff | direct TCP | 1.945 s (kill) | 33.41 s | match | yes | no | yes |
-| Normal handoff + natural close | direct QUIC | 1.434 s | 2.73 s | match | yes | no | yes |
-| Bootstrap SSH SIGKILL after handoff | direct QUIC | 1.953 s (kill) | 9.61 s | match | yes | no | yes |
+| Normal handoff + close | direct TCP | 1.505 s | 25.846 s | match | same | no | yes |
+| Bootstrap SSH `SIGKILL` | direct TCP | 1.945 s | 33.406 s | match | same | no | yes |
+| Normal handoff + close | direct QUIC (1 MiB) | 1.434 s | 2.727 s | match | same | no | yes |
+| Bootstrap SSH `SIGKILL` | direct QUIC (1 MiB) | 1.953 s | 9.607 s | match | same | no | yes |
 
-The SSH process in the normal case was the client-side bootstrap `ssh`
-child; it exited after handoff. The data end is the client's final close
-after transfer plus verification. In the forced-kill cases a separate
-`kill -9` targeted only that client-side SSH PID. The transfer continued,
-the remote worker PID remained the same, and the final remote SHA-256 matched
-the local source.
+The SSH process is the client-side bootstrap `ssh` child. The forced-kill
+cases target only that PID. Observation commands use separate short SSH
+sessions and are not part of the transfer. No second bootstrap SSH appeared in
+the client process tree.
 
-No second bootstrap SSH was observed in the client process tree after the
-handoff/kill. The observation `pgrep`/hash commands are separate short SSH
-sessions and are not part of the transfer.
+### Client death cleanup
 
-### 7.2 Client death cleanup
+[`cleanup.json`](assets/benchmarks/cleanup.json):
 
-`docs/assets/benchmarks/cleanup.json` records a separate run where the
-client was killed with `SIGKILL` after the worker was established:
+| Event | Time |
+| --- | ---: |
+| Client killed with `SIGKILL` | 2.415 s after start |
+| Remote worker exited after client death | 38.676 s |
+| Worker remained afterwards | no |
 
-- client killed at 2.42 s;
-- remote one-shot worker exited **38.68 s after the client kill**;
-- no worker remained afterwards.
+The bound is the data-control heartbeat timeout (30 s default) plus drain
+handling.
 
-The exit is bounded by the data-control heartbeat timeout (30 s default) plus
-drain handling; this is intentional, not a permanent daemon.
+## Upload Benchmarks
 
-## 8. Upload Benchmarks
-
-Unrestricted public network, 128 MiB upload, 3 repeats per condition.
+Unrestricted public network, 128 MiB, 3 repeats.
 
 ![Upload throughput](assets/benchmarks/upload-throughput.svg)
 
@@ -210,11 +174,7 @@ Unrestricted public network, 128 MiB upload, 3 repeats per condition.
 | legacy SSH | 3 | 3 | 0 | 37.89 | 35.8/40.9 | 28.3 s | 2.25 s |
 | pre-detach direct TCP | 3 | 3 | 0 | 41.09 | 37.8/42.8 | 26.1 s | 1.37 s |
 
-Direct QUIC used substantially more client CPU than TCP for this workload
-(10.1 s user+sys vs 1.3 s), which is visible in the resource table but is not
-a reason to call one transport universally better.
-
-The mixed 1002-file upload had **no failures** in 3 runs:
+Mixed 1002-file upload (no failures):
 
 | Mode | n | OK | Fail | Median Mbps | Median elapsed |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -222,31 +182,27 @@ The mixed 1002-file upload had **no failures** in 3 runs:
 | daemon direct QUIC | 3 | 3 | 0 | 3.69 | 18.2 s |
 | pre-detach direct TCP | 3 | 3 | 0 | 3.38 | 19.9 s |
 
-## 9. Download Benchmarks
+## Download Benchmarks
 
-Unrestricted public network, 16 MiB download. Direct QUIC had repeated
-failures on this path; they are retained in the chart and table.
+Unrestricted public network, 16 MiB. The chart keeps the two QUIC failures.
 
 ![Download throughput](assets/benchmarks/download-throughput.svg)
 
-| Mode | n | OK | Fail | Median Mbps (successes) | Min/Max | Median elapsed |
-| --- | ---: | ---: | ---: | ---: | --- | ---: |
-| daemon SSH-forward | 3 | 3 | 0 | 3.69 | 3.7/3.7 | 36.4 s |
-| daemon direct QUIC | 3 | 1 | **2** | 3.51 | 3.5/3.5 | 38.2 s (success) |
-| daemon direct TCP | 3 | 3 | 0 | 2.13 | 2.1/2.2 | 63.0 s |
-| legacy SSH | 3 | 3 | 0 | 2.35 | 2.3/2.4 | 57.2 s |
-| pre-detach direct TCP | 3 | 3 | 0 | 2.21 | 2.2/2.3 | 60.8 s |
+| Mode | n | OK | Fail | Median Mbps (success) | Median elapsed |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| daemon SSH-forward | 3 | 3 | 0 | 3.69 | 36.4 s |
+| daemon direct QUIC | 3 | 1 | **2** | 3.51 | 38.2 s |
+| daemon direct TCP | 3 | 3 | 0 | 2.13 | 63.0 s |
+| legacy SSH | 3 | 3 | 0 | 2.35 | 57.2 s |
+| pre-detach direct TCP | 3 | 3 | 0 | 2.21 | 60.8 s |
 
-The direct-TCP download rate is not presented as an improvement; it is
-within public-network variation and is actually below SSH-forward in this
-sample. The direct-QUIC failures are the known quic-go path issue, not a
-handoff failure: the 1 MiB lifecycle test above completed normally, while
-the 16 MiB download failed after partial progress with the existing
-`decryption_failure`/idle-timeout signature.
+Direct TCP is not faster here; the public path dominates. The QUIC failures
+occur after handoff and show the known `decryption_failure`/idle-timeout
+signature; they are data-path failures, not handoff failures.
 
-## 10. Stream Concurrency
+## Stream Concurrency
 
-128 MiB direct-TCP upload, same client/server and dataset:
+128 MiB direct-TCP upload:
 
 | Streams | n | OK | Fail | Median Mbps | Min/Max | Median elapsed |
 | ---: | ---: | ---: | ---: | ---: | --- | ---: |
@@ -254,131 +210,85 @@ the 16 MiB download failed after partial progress with the existing
 | 4 | 3 | 3 | 0 | 39.55 | 39.3/43.2 | 27.1 s |
 | 8 | 3 | 3 | 0 | 76.03 | 75.3/76.4 | 14.1 s |
 
-Eight streams used the VPS download capacity better on this run; the result
-is workload- and path-dependent, not a promise that more streams is always
-faster. No stream count was silently reduced.
+Eight streams used the available capacity better on this run; this is
+workload- and path-dependent, not a universal rule. No stream count was
+silently reduced.
 
-## 11. Failure Injection and Recovery
+## Failure Injection and Recovery
 
-- **SSH kill after handoff, TCP**: transfer completed, SHA-256 matched,
-  worker exited, no second SSH.
-- **SSH kill after handoff, QUIC (1 MiB)**: transfer completed, SHA-256
-  matched, worker exited, no second SSH.
-- **SSH kill during SSH-forward data transfer**: the client exited non-zero
-  with a failed task; the one-shot worker was gone. SSH-forward did not
-  pretend to be detachable, which is the intended negative behavior.
-- **Client SIGKILL after handoff**: worker exited in 38.68 s and no worker
-  remained; see `cleanup.json`.
-- **Handoff security tests**: wrong bootstrap session id is rejected without
-  closing the SSH bootstrap or detaching; duplicate handoff returns
-  `detached` without starting a second worker; heartbeat/bye are rejected
-  before handoff; HTTP 404/unknown-path and `FEATURE_UNAVAILABLE` are treated
-  as explicit "unsupported handoff" and the client keeps the SSH-bound
-  lifecycle with a warning.
-- **Compatibility checks**: new client ↔ old v0.2.0 server completed with a
-  warning and old SSH-bound lifecycle; old v0.2.0 client ↔ new server
-  completed; the new state documents remain readable by the new binary. See
-  Limitations for state-format one-way compatibility.
+| Test | Result |
+| --- | --- |
+| SSH `SIGKILL` after TCP handoff | Transfer completed, SHA-256 matched, no second SSH, worker exited. |
+| SSH `SIGKILL` after QUIC handoff | Transfer completed, SHA-256 matched, no second SSH, worker exited. |
+| SSH disconnect during SSH-forward transfer | Client exit 1, failed task, no worker left; forwarding stayed SSH-bound. |
+| Client `SIGKILL` after handoff | Worker exited after 38.676 s. |
+| Handoff with wrong session id | Rejected; SSH bootstrap not detached. |
+| Duplicate handoff | Returns `detached`; no second worker. |
+| Heartbeat / data bye before handoff | Rejected. |
+| New client / old v0.2.0 server | Explicit warning, then SSH-bound lifecycle; transfer completed. |
+| Old v0.2.0 client / new server | Transfer completed; old client does not request handoff. |
 
-Data-connection failure itself is safe-fail + checkpoint/resume; this round
-does not implement a no-SSH re-authentication of a *new* direct session.
+A lost direct data connection is a safe failure with checkpoint/resume; this
+release does not re-authenticate a new direct session without SSH.
 
-## 12. Resource Usage
+## Resource Usage
 
-Per-run local child CPU medians (user+sys) are in the upload table. A few
-representative values:
+| Workload | Mode | Median CPU user+sys |
+| --- | --- | ---: |
+| 128 MiB upload | direct TCP | 1.30 s |
+| 128 MiB upload | direct QUIC | 10.10 s |
+| 128 MiB upload | SSH-forward | 2.48 s |
+| 128 MiB upload | legacy SSH | 2.25 s |
+| 1002-file upload | direct TCP | 4.38 s |
+| 1002-file upload | direct QUIC | 5.11 s |
 
-| Workload | Mode | Median CPU user+sys | Note |
-| --- | --- | ---: | --- |
-| 128 MiB upload | direct TCP | 1.30 s | lowest measured among large-upload modes |
-| 128 MiB upload | direct QUIC | 10.10 s | quic-go cryptography/stream overhead |
-| 128 MiB upload | SSH-forward | 2.48 s | includes SSH encryption/tunnel |
-| 128 MiB upload | legacy SSH | 2.25 s | includes SSH/SFTP and rsync processes |
-| 1002-file upload | direct TCP | 4.38 s | small-file metadata/rsync dominates |
-| 1002-file upload | direct QUIC | 5.11 s | includes QUIC control/stream overhead |
+`maxrss_kb` in `results.json` is cumulative across the benchmark process and
+is not used to rank modes. Remote CPU/RSS were not sampled.
 
-`maxrss_kb` in `results.json` is the maximum child RSS seen by the benchmark
-process (macOS reported bytes converted to KiB); it is cumulative and is not
-a per-run peak, so it is not used to rank modes.
+Supplemental VPS NIC probe for a 16 MiB upload
+([`network.json`](assets/benchmarks/network.json)); values include bootstrap
+and observation SSH:
 
-Supplemental VPS NIC probe for a 16 MiB upload (`network.json`; includes the
-observation SSH connections):
+| Mode | Remote `eth0` RX | Payload | RX/payload |
+| --- | ---: | ---: | ---: |
+| legacy SSH | 17,702,775 B | 16,777,216 B | 1.055× |
+| daemon SSH-forward | 17,866,706 B | 16,777,216 B | 1.065× |
+| daemon direct TCP | 17,843,698 B | 16,777,216 B | 1.064× |
+| daemon direct QUIC | 17,837,274 B | 16,777,216 B | 1.063× |
 
-| Mode | Remote `eth0` RX | Payload | RX/payload | Remote `eth0` TX |
-| --- | ---: | ---: | ---: | ---: |
-| legacy SSH | 17,702,775 B | 16,777,216 B | 1.055 | 127,489 B |
-| daemon SSH-forward | 17,866,706 B | 16,777,216 B | 1.065 | 106,170 B |
-| daemon direct TCP | 17,843,698 B | 16,777,216 B | 1.064 | 121,142 B |
-| daemon direct QUIC | 17,837,274 B | 16,777,216 B | 1.063 | 148,561 B |
-
-The NIC deltas include bootstrap, observation SSH, framing, and control
-traffic, so they are an end-to-end overhead indicator rather than pure data
-encapsulation accounting.
-
-## 13. Limitations and Known Issues
+## Limitations and Known Issues
 
 ### Controlled bandwidth: SKIP
 
-The VPS was accessed only as the unprivileged `catsync-test` account. There
-was no permission to change the VPS qdisc, sysctl, firewall, cloud security
-group, or to install a traffic-control service. Shaping only the daemon port
-43411 UDP/TCP while leaving SSH port 22 unshaped would compare unequal
-networks; inserting a user-space proxy only into the daemon path would be
-equally unfair. Controlled-bandwidth, high-RTT, loss, and isolated-LAN
-results are therefore **SKIP**, not failed measurements and not omitted
-successes. No controlled figures are included.
+No sudo/root; modifying the VPS qdisc, sysctl, firewall, or cloud network was
+out of scope. Shaping only the daemon port while leaving SSH port 22 unshaped
+would be unfair, and no user-space proxy was inserted into the SSH paths.
+Controlled-bandwidth, high-RTT, and loss results are therefore **SKIP**; they
+are not omitted failures and no controlled numbers are invented.
 
 ### QUIC
 
-Direct QUIC uploads at 128 MiB completed in all 3 runs, and the 1 MiB handoff
-and SSH-kill cases completed. However, 2 of 3 16 MiB downloads failed on the
-unrestricted public path. These are the previously investigated quic-go
-`decryption_failure`/idle-timeout symptoms on this network path, not a
-handoff-state failure: the handshake and authenticated handoff were already
-complete, and the failure occurred later on the data path. The direct-QUIC
-lifecycle support is implemented and verified, but QUIC remains
-**experimental**; CatSync does not silently downgrade to TCP.
-
-### Public-network variability
-
-The VPS provider does not guarantee a constant 100/4 Mbps rate. Upload and
-download medians and the apparent ordering of legacy SSH, SSH-forward, and
-direct TCP varied between runs. Direct-TCP download was slower than
-SSH-forward in this sample even though direct-TCP upload matched the
-pre-detach baseline; this is reported without claiming an implementation
-regression or improvement.
+Direct QUIC handoff is implemented and the 1 MiB acceptance cases pass, but
+the public path still shows the known quic-go `decryption_failure`/idle-timeout
+failure on larger downloads. QUIC remains **experimental**. CatSync never
+silently downgrades.
 
 ### Other
 
-- Remote CPU/RSS were not sampled to avoid observation load; only local child
-  CPU is reported.
-- NIC counters were collected per run only in the supplemental 16 MiB probe,
-  not per benchmark row.
-- The benchmark does not test FIDO2/security-key re-authentication; the
-  acceptance held an already authenticated SSH session, as intended. No
-  attempt was made to bypass authentication.
-- Run-state compatibility is one-way: new binaries read older additive state,
-  but old binaries may reject fields written by newer releases. Upgrade all
-  clients sharing a state directory. A shadowed old `catsync` in `PATH` can
-  produce `unknown field "transport"`; see docs/usage.md Troubleshooting.
-- SSH-forward intentionally remains SSH-dependent; it is not advertised as
-  detached.
-- A direct data connection that dies cannot be resumed without a new trusted
-  SSH bootstrap; only the active run's already-established direct session is
-  decoupled from SSH.
+- Public VPS bandwidth is not constant; absolute rankings vary between runs.
+- Remote CPU/RSS were not sampled; NIC counters only in the supplemental probe.
+- FIDO2/security-key re-authentication was not exercised; the acceptance used
+  an already authenticated SSH session without bypassing authentication.
+- Run-state compatibility is one-way; upgrade all clients sharing a state dir.
+- SSH-forward intentionally remains SSH-bound.
+- A direct data connection that dies cannot be recovered without a fresh SSH
+  bootstrap.
 
-## 14. Reproduction Instructions
-
-Generate the deterministic datasets:
+## Reproduction Instructions
 
 ```bash
 python3 scripts/benchmarks/make_dataset.py --root /tmp/catsync-bench-data
-```
 
-Run the public-network matrix (3 repeats; host environment variables select
-the authorized test VPS):
-
-```bash
 CATSYNC_BENCH_HOST=catsync-test@example.invalid \
 python3 scripts/benchmarks/run.py \
   --binary ./bin/catsync \
@@ -387,11 +297,12 @@ python3 scripts/benchmarks/run.py \
   --old-remote-catsyncd /home/catsync-test/.local/bin/catsyncd.pre-detach \
   --data /tmp/catsync-bench-data \
   --out docs/assets/benchmarks/results.json --reps 3
+
 python3 scripts/benchmarks/render.py
 python3 scripts/benchmarks/summarize.py
 ```
 
-Real OpenSSH lifecycle acceptance and fault injection:
+Real SSH acceptance:
 
 ```bash
 CATSYNC_E2E_HOST=catsync-test@example.invalid \
@@ -409,70 +320,27 @@ python3 scripts/tests/worker-timeout.py \
   --out docs/assets/benchmarks/cleanup.json
 ```
 
-Supplemental NIC probe:
+The scripts remove only their dedicated remote test directories and processes;
+they install no service and change no system configuration.
 
-```bash
-CATSYNC_BENCH_HOST=catsync-test@example.invalid \
-python3 scripts/benchmarks/network_probe.py \
-  --binary ./bin/catsync \
-  --remote-catsyncd /home/catsync-test/.local/bin/catsyncd \
-  --out docs/assets/benchmarks/network.json
-```
+## Raw Data References
 
-The runner and acceptance scripts remove only their dedicated remote test
-directories and processes; they do not install a service or change system
-configuration. The QUIC lifecycle cases use a 1 MiB source to avoid mixing the
-known QUIC data-path failure with handoff verification; the benchmark's
-16 MiB downloads retain the failure counts.
+- [`results.json`](assets/benchmarks/results.json) — 48 runs with success/failure, elapsed, CPU, phase timing, sanitized environment.
+- [`lifecycle.json`](assets/benchmarks/lifecycle.json) — real OpenSSH normal/SIGKILL cases for TCP and QUIC.
+- [`cleanup.json`](assets/benchmarks/cleanup.json) — client-kill worker timeout.
+- [`network.json`](assets/benchmarks/network.json) — supplemental NIC counters.
+- SVG: [upload](assets/benchmarks/upload-throughput.svg), [download](assets/benchmarks/download-throughput.svg), [handoff latency](assets/benchmarks/handoff-latency.svg), [SSH lifecycle](assets/benchmarks/ssh-lifecycle.svg).
+- Generators: `scripts/benchmarks/*.py` and `scripts/tests/*.py`.
 
-## 15. Raw Data References
+## Conclusion
 
-Machine-readable data:
+The three acceptance facts were observed on real OpenSSH:
 
-- [`results.json`](assets/benchmarks/results.json) - 48 benchmark runs with
-  success/failure, elapsed, CPU, timing phases, and sanitized environment.
-- [`lifecycle.json`](assets/benchmarks/lifecycle.json) - four real OpenSSH
-  normal/SIGKILL cases (TCP and QUIC).
-- [`cleanup.json`](assets/benchmarks/cleanup.json) - client SIGKILL worker
-  timeout.
-- [`network.json`](assets/benchmarks/network.json) - supplemental VPS NIC
-  counters.
+1. Direct TCP/QUIC continue after the SSH bootstrap exits.
+2. Killing the bootstrap SSH after handoff does not stop the authenticated direct transfer.
+3. The one-shot remote worker exits after completion and after client death.
 
-Generated charts:
-
-- [Upload throughput](assets/benchmarks/upload-throughput.svg)
-- [Download throughput](assets/benchmarks/download-throughput.svg)
-- [Handoff latency](assets/benchmarks/handoff-latency.svg)
-- [SSH lifecycle](assets/benchmarks/ssh-lifecycle.svg)
-
-Generators and harnesses:
-
-- `scripts/benchmarks/make_dataset.py`
-- `scripts/benchmarks/run.py`
-- `scripts/benchmarks/render.py`
-- `scripts/benchmarks/summarize.py`
-- `scripts/benchmarks/network_probe.py`
-- `scripts/tests/real-ssh-handoff.py`
-- `scripts/tests/worker-timeout.py`
-
-## 16. Conclusion
-
-The central acceptance facts are demonstrated on a real Debian VPS with real
-OpenSSH:
-
-1. After the SSH bootstrap, direct TCP and direct QUIC continue working
-   without SSH; the normal acceptance case closed SSH at 1.50 s and completed
-   the transfer at 25.85 s with a matching SHA-256.
-2. A deliberate SIGKILL of the bootstrap SSH at 1.95 s did not stop the
-   already handed-off direct transfer; it completed at 33.41 s with a matching
-   SHA-256 and no second SSH.
-3. The one-shot remote worker exits after normal completion and after client
-   death (38.68 s after SIGKILL), leaving no permanent daemon.
-
-The detached TCP lifecycle adds no measurable upload-throughput regression
-against the v0.2.0 SSH-bound baseline in this environment. The absolute
-throughput differences among modes are dominated by public-network
-variability and workload shape. QUIC lifecycle handoff works, but QUIC's
-known public-path data failure remains, so QUIC stays experimental. The
-controlled-bandwidth portion is explicitly SKIP because the required network
-privileges were not available.
+Direct TCP matched the pre-detach upload baseline within public-network noise.
+QUIC lifecycle support works, but its public-path data failure remains a
+documented blocker for calling QUIC production-ready. Controlled-bandwidth
+experiments remain SKIP because the required privileges were not used.

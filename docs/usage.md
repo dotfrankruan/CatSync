@@ -1,670 +1,345 @@
 # CatSync usage
 
-CatSync moves files between one local machine and one remote host over SSH, in
-either direction. This page is the complete user guide: commands, options,
-backend selection, verification, authentication, and troubleshooting. For how it
-works internally see [architecture.md](architecture.md).
+CatSync copies files between a local machine and a remote host over SSH in
+either direction. It plans first, transfers in parallel, never overwrites an
+existing destination file with `copy`, and can resume an interrupted run.
 
-## Contents
+- New here? Start with [First transfer](#first-transfer).
+- Looking for a flag? See [Options](#options).
+- Using the optional daemon? See [Daemon transport](#daemon-transport-one-shot-catsyncd).
+- Something failed? See [Troubleshooting](#troubleshooting).
 
-- [Installation](#installation)
-- [Commands](#commands)
-- [Sources and destinations](#sources-and-destinations)
-- [Interruptions and resume](#interruptions-and-resume)
-- [Expired certificates and re-authentication](#expired-certificates-and-re-authentication)
-- [Options](#options)
-- [Backend selection](#backend-selection)
-- [Verification](#verification)
-- [Examples](#examples)
-- [SSH authentication and Smallstep certificates](#ssh-authentication-and-smallstep-certificates)
-- [Security notes](#security-notes)
-- [Program overrides](#program-overrides)
-- [Troubleshooting](#troubleshooting)
-- [Known limitations](#known-limitations)
+## Install
 
-## Installation
-
-Homebrew, on macOS and Linux:
-
-```sh
+```bash
 brew install dotfrankruan/catsync/catsync
 ```
 
-The formula lives in
-[dotfrankruan/homebrew-catsync](https://github.com/dotfrankruan/homebrew-catsync);
-`dotfrankruan/catsync` is the tap name, which Homebrew maps to that repository.
-The fully-qualified install auto-taps it and needs no trust step. If you tap
-first and then install by short name, Homebrew asks you to trust the tap once:
+Release archives for linux/darwin on amd64/arm64 are on the
+[releases page](https://github.com/dotfrankruan/CatSync/releases). From source:
 
-```sh
-brew tap dotfrankruan/catsync
-brew trust dotfrankruan/catsync   # trusts the whole tap
-brew install catsync
+```bash
+make install   # catsync and catsyncd -> ~/.local/bin
 ```
 
-Prebuilt archives for linux/amd64, linux/arm64, darwin/amd64, and darwin/arm64
-are on the [releases page](https://github.com/dotfrankruan/CatSync/releases),
-each tag with a `SHA256SUMS` file. From source (Go 1.26+):
+See the [README](../README.md#-install) for archive and `go install` options.
 
-```sh
-make install        # -> ~/.local/bin/catsync
+**Runtime requirements**
+
+| | |
+| --- | --- |
+| Local | `ssh`; `rsync` for updated files, mirror sync, and parallel small-file batches. |
+| Remote | POSIX shell, GNU findutils, and `sshd` with `sftp-server`; `rsync` when updates, mirror sync, or parallel small-file batches are needed. |
+| Native uploads | OpenSSH ≥ 9.0 `sftp-server` and GNU coreutils. |
+| Default daemon | Not required. Only install `catsyncd` for `--transport daemon`. |
+
+Run `catsync doctor` to check the local tools.
+
+## First transfer
+
+```bash
+catsync doctor
+catsync plan ./data user@host:/srv/data
+catsync copy ./data user@host:/srv/data
 ```
 
-or `go install github.com/dotfrankruan/CatSync/cmd/catsync@latest`.
+`plan` only inspects; it writes nothing. `copy` adds or updates files and
+never deletes anything that exists only at the destination.
+
+```bash
+# exact mirror: deletes destination-only entries, after all transfer stages pass
+catsync sync ./data user@host:/srv/data
+
+# single file, remote to local
+catsync copy user@host:/srv/archive.tar ./downloads
+```
+
+Remote paths must be absolute. Both operand orders are supported; exactly one
+side must be remote.
 
 ## Commands
 
-### `catsync doctor`
+| Command | What it does |
+| --- | --- |
+| `catsync doctor` | Checks `ssh` and `rsync`; no secrets are printed. |
+| `catsync plan SRC DEST` | Discovers, plans, and prints a summary. Transfers nothing. |
+| `catsync copy SRC DEST` | Safe parallel transfer; never deletes destination data. |
+| `catsync sync SRC DEST` | Optimized transfer, then a checksum-verified mirror pass. |
+| `catsync resume [RUN_ID]` | Resumes the named or latest resumable run. |
+| `catsync status [RUN_ID]` | Prints run state without changing it. |
+| `catsync version` | Prints the version. |
 
-Probes `rsync` and `ssh` with bounded version probes; both are required. No
-secrets or environment contents are printed.
+### `plan`
 
-### `catsync plan SOURCE DESTINATION`
+Prints per-backend counts, skipped/unsupported entries, logical source bytes,
+and whether an interrupted run would be resumed. Exit is nonzero for unsafe
+forced-backend combinations.
 
-Discovers the source, collects destination metadata (or announces the
-conservative fallback), runs the planner, and prints the summary: per-backend
-counts, skipped/unsupported counts, the logical source byte volume (a source-side
-sum, **not** a network-traffic estimate), and whether an interrupted run of the
-same job would be resumed. Nothing is transferred and no run state is written.
-Unsafe forced-backend plans (for example `--backend fpsync` with a large file)
-exit nonzero.
+### `copy`
 
-### `catsync copy SOURCE DESTINATION`
-
-Executes the durable parallel transfer without deleting anything that exists
-only at the destination. This is the safe choice for additive backup/copy jobs.
-
-### `catsync sync SOURCE DESTINATION`
-
-Executes the same optimized transfer stages, then runs a final whole-tree rsync
-archive reconciliation with checksums and delayed deletion, making the
-destination an exact archive mirror of the source when the source stays stable.
-The destructive reconciliation runs only when every preceding transfer stage
-succeeded. Nonzero exit on any transfer, reconciliation, or verification failure.
-
-### `catsync resume [RUN_ID]`
-
-Resumes the named run, or the latest resumable run without an argument.
-Reacquires the destination lock, revalidates source metadata (a changed source
-file fails its task instead of transferring), rebuilds small-file batches from
-pending tasks, resumes large files from their checkpoints, and reuses rsync's
-partial directory. Retained checkpoints survive failed resumes.
-
-`--jobs` and `--streams` may change the parallelism of the resumed run, for
-example after moving to a faster network:
-
-```sh
-catsync resume --streams 16                 # latest resumable run
-catsync resume --jobs 2 --streams 8 RUN_ID
-```
-
-This is safe because the chunk plan, temporary path, and checkpoint are
-independent of parallelism: transferred chunks are never re-sent, the same
-temporary object continues, and the new values are persisted for later resumes.
-Only these two options are accepted, because the rest of a run's strategy is
-recorded and immutable.
-
-### `catsync status [RUN_ID]`
-
-Prints a run without mutating it: status, source/destination, timestamps,
-configuration, per-status and per-backend task counts, retained checkpoint
-count, and recorded errors. Fields recorded by older releases on old runs are
-shown for diagnostics only. Missing or corrupt state exits nonzero.
-
-### `catsync version`
-
-Prints the version.
-
-## Sources and destinations
-
-Exactly one operand must be remote: `LOCAL [user@]host:/absolute/path` uploads
-and `[user@]host:/absolute/path LOCAL` downloads. Every remote path in every
-example is absolute; relative paths and `~` are rejected with a usage error so
-the same destination cannot silently resolve differently on the client and
-server.
-bracketed IPv6 literals are accepted. Remote-to-remote and local-to-local
-transfers are rejected.
-
-A source may name **one regular file** instead of a directory tree. The copy is
-point-to-point: the file keeps its base name at the destination directory, and a
-file at or above `--large-threshold` still uses the native multistream backend,
-so a multi-gigabyte download runs over several SFTP sessions with a checkpoint
-and resumability exactly like a tree transfer.
-
-```sh
-catsync plan user@host:/data/dataset.zip ./downloads
-catsync copy user@host:/data/dataset.zip ./downloads
-catsync copy ./dataset.zip user@host:/data
-```
-
-Both directions accept the form. The destination is always a directory; a
-single-file source never renames the file, and a resumable run revalidates only
-that file rather than rescanning its parent directory.
-
-## Interruptions and resume
-
-Ctrl-C, a dropped connection, or a failing stage leaves a **resumable run**:
-`running` tasks return to `pending`, and everything already durably transferred
-is kept (native large files keep a per-chunk checkpoint and their temporary
-object, small files keep rsync's partial files).
-
-There are two ways to continue, and normally you need neither in mind:
-
-- **Automatic.** Running `copy` or `sync` again for the same job — same
-  direction, source, destination, and command — resumes the interrupted run
-  instead of re-planning it. The output names the run it continues.
-- **Explicit.** `catsync resume` continues the latest resumable run, or the one
-  you name.
-
-A destination lock prevents two runs from writing the same destination
-concurrently. It is an advisory kernel lock held through the whole run, so a
-client killed with `kill -9` (or a power loss) releases it automatically: just
-rerun the command. Lock files may remain in the state directory; their
-existence does not mean a run is active, and they must not be deleted to
-"clear" a lock. Lock files from older releases are ignored as ownership, but
-older catsync binaries still treat file existence as a lock: upgrade every
-client that shares a state directory before running the new release. The state directory must live on a local filesystem with reliable
-advisory-lock support (local APFS/ext4/xfs are fine). Sharing a state directory
-between different hosts is not supported, and a network filesystem that
-silently provides only local lock semantics cannot be detected; such a setup
-does not give global mutual exclusion.
-
-```sh
-catsync copy user@host:/data/dataset ./data         # interrupted
-catsync copy user@host:/data/dataset ./data         # continues the same run
-catsync copy --fresh user@host:/data/dataset ./data # starts over instead
-```
-
-A resumed run fast-forwards its progress bar to the bytes the checkpoints
-confirm, then continues:
-
-```
-resume: continuing from 640.0 MiB of 18.3 GiB already durable (chunks confirmed by checkpoints)
-[------------------------]   3.41%  640.0 MiB/18.3 GiB  ...  ETA 12:36
-```
-
-That figure can sit slightly below what the interrupted run displayed: bytes
-that were written but not yet fsynced are not durable and are transferred again.
-Before any stage runs, a resume also compares pending tasks with the destination
-and marks a file complete when its size and nanosecond mtime already match the
-plan, so a file that finished writing but was never recorded is not sent twice.
-
-`--fresh` forces a new run, for example after rewriting the source tree or to
-discard a checkpoint you no longer trust. A completed run, or one whose
-endpoints differ at all, is never adopted.
-
-## Expired certificates and re-authentication
-
-SSH credentials can expire while a transfer runs: a short-lived certificate or
-an agent identity can be valid at start and rejected minutes later. CatSync
-distinguishes that class of failure (ssh "Permission denied", expired
-certificate, exhausted identities) from ordinary errors and offers two options:
-
-- **Keep the sessions you already have.** Open sessions keep transferring; an
-  interrupted large file resumes from its checkpoint next time, so nothing
-  already transferred is re-sent.
-- **Re-authenticate and continue.** With `--on-auth-failure retry`, CatSync
-  pauses on an authentication rejection, asks you to renew the credentials
-  (re-run `ssh-add`, issue a fresh certificate), and retries the stage after you
-  confirm. Answering no stops with the failure.
-
-```sh
-catsync copy --on-auth-failure retry SRC user@host:/dest
-```
-
-The default is `fail`: the run stops with an actionable message and stays
-resumable, so `catsync resume` continues later. The prompt is only shown on a
-terminal; without one the run fails instead of blocking.
-
-
-## Daemon transport (one-shot `catsyncd`)
-
-The historical transport opens one ssh connection per data stream and relies
-on remote `touch`, `test -ef`, `find`, shell quoting, and GNU coreutils for a
-few metadata operations. The optional daemon transport removes that
-dependency for the remote side and uses exactly one ssh session per run:
+The default safe choice:
 
 ```bash
-catsync plan --transport daemon ~/src user@host:/data
-catsync copy --transport daemon ~/src user@host:/data
-catsync resume --transport daemon <RUN_ID>
+catsync copy ./photos user@host:/srv/photos
+catsync copy user@host:/srv/photos ./photos
 ```
 
-How it works:
+### `sync`
 
-1. CatSync starts one ssh session that runs
-   `catsyncd serve --once --listen ...`. Nothing is installed automatically;
-   `catsyncd` must already exist on the remote host (`--remote-catsyncd PATH`
-   selects it).
-2. Both sides create a fresh ECDSA P-256 leaf certificate in memory and
-   exchange it over the authenticated ssh channel. They pin the exact peer
-   certificate, then open mutual TLS 1.3 connections with a run-specific
-   session id and nonces. Certificates, keys, and nonces are never stored in
-   run state, logs, or argv.
-3. All data plane traffic - native SFTP streams, rsync exec, manifest,
-   hash, stat, mkdir, metadata, samefile - uses those pinned mTLS
-   connections. Native transfers and `--jobs/--streams` semantics are
-   unchanged; the daemon server enforces its own connection budgets and
-   fails with `CONNECTION_LIMIT` before any write if the plan would exceed
-   them.
-4. For direct TCP/QUIC, after both pinned identities are verified and the
-   authenticated data control channel has passed its control precheck, the
-   client hands lifecycle ownership to that channel. The server confirms
-   `detached` on the authenticated channel, closes the SSH bootstrap stdio,
-   and keeps the one-shot worker alive in its own OS session. The client then
-   terminates only its local bootstrap ssh process. From that point data
-   heartbeats and the final data-plane `bye` own the session; SSH is not
-   needed again for this run.
-5. When the run ends the client sends an authenticated data-plane `bye`; the
-   server drains, closes data connections before terminating children, reports
-   final counters, and exits. If the client dies, the server exits after the
-   bounded data-control heartbeat timeout. Interrupted runs leave checkpoints
-   and resume exactly as before; resume creates new ephemeral identities and
-   bootstraps a new one-shot server using SSH again.
+`sync` is the only mode that can delete or replace destination entries. It runs
+the optimized stages first and performs archive reconciliation with
+`--delete-delay` only if every stage succeeded.
 
-**Direct-mode lifecycle:** SSH is used once to establish trust. Direct TCP and
-direct QUIC can continue after the SSH bootstrap exits. `ssh-forward` data
-connections genuinely live inside the SSH tunnel, so that mode still requires
-SSH for its whole lifetime. Legacy `--transport ssh` is unchanged. A direct
-run whose data connection is lost fails safely and can be resumed, but CatSync
-does not claim to re-establish a new direct session without SSH authentication;
-resume always performs a fresh trusted bootstrap.
+### `resume`
 
-Options (also accepted by `resume` to override only the recorded values):
+```bash
+catsync resume                         # latest resumable run
+catsync resume RUN_ID                  # explicit run
+catsync resume --streams 16 RUN_ID     # parallelism can change
+```
 
-| Flag | Meaning |
-| --- | --- |
-| `--transport=ssh|daemon` | Data transport. Default `ssh` on new runs; resume inherits the recorded value. |
-| `--daemon-port N` | Daemon TCP/UDP port. `0` requests an ephemeral port and is distinct from unset. Default 43411. |
-| `--daemon-transport tcp|quic` | `tcp` (default) uses one pinned mTLS connection per data stream. `quic` (experimental) uses one UDP QUIC connection per run with multiplexed streams; ALPN is fixed to `catsync-quic/1`, 0-RTT is disabled, and stream budgets are enforced separately. |
-| `--daemon-bootstrap direct|ssh-forward` | `direct` dials the mTLS port directly and, once authenticated, detaches the session from SSH so the transfer can outlive the bootstrap. `ssh-forward` uses the same ssh bootstrap process with `-L 127.0.0.1:<local>:127.0.0.1:<daemon-port>`; its data path remains dependent on SSH. Requires a fixed non-zero port and a loopback listen address. |
-| `--remote-catsyncd PATH` | Name or absolute path of the remote `catsyncd`. CatSync never installs or uploads it. |
-| `--daemon-listen ADDR` | Value passed to `catsyncd serve --listen`. With ssh-forward it must be loopback. |
-| `--quic-qlog PATH` | Optional diagnostic: write the local QUIC qlog trace to `PATH` (created owner-only, mode 0600). Enables per-stream `last progress` diagnostics on stderr. QUIC only. |
-| `--remote-quic-qlog PATH` | Optional diagnostic: ask the remote `catsyncd` to write its QUIC qlog there (absolute remote path; owner-only). QUIC only. |
-| `--daemon-addr HOST:PORT` | Override the data connection address (advanced: proxies/NAT). |
+`resume` revalidates the source, reuses checkpoints and rsync partial files,
+and rejects changed source files rather than silently copying them.
 
-Prerequisites on the remote host: an executable `catsyncd`, a working
-OpenSSH `sftp-server` for native transfers, and (only if the plan contains
-small batches or mirror stages) `rsync`. Direct TCP/QUIC detachment also
-needs a `setsid` utility on the remote host; when it is unavailable the
-client prints a warning and keeps the SSH-bound lifecycle for that run rather
-than claiming a safe handoff. `catsync daemon probe USER@HOST`
-runs the read-only capability probe over one ssh session and prints what the
-remote host can do; missing software is reported, never installed.
+### `status`
 
-Security and failure behavior:
+```bash
+catsync status
+catsync status RUN_ID --verbose
+```
 
-- The remote listener only binds after the client certificate is verified and
-  pinned. TLS requires 1.3, mutual authentication, the pinned leaf, and a
-  known ALPN. Unauthenticated or wrong-pin connections cannot execute an RPC
-  or start a child process.
-- Direct handoff is accepted only over the pinned mTLS/QUIC data control
-  channel and only with the bootstrap session id. Unauthenticated or
-  wrong-session requests cannot detach a worker; a failed handoff leaves the
-  SSH bootstrap as the authority and fails cleanly instead of orphaning a
-  daemon.
-- `exec` only runs a fixed absolute `rsync` with a strictly validated
-  `--server` argument vector; no shell, arbitrary program, or environment
-  passthrough. See docs/architecture.md.
-- The ssh-forward mode keeps using ssh for transport, so data does travel
-  through the ssh process; the inner mTLS layer and pinning still apply.
-- QUIC is experimental. It uses UDP on the same daemon port, requires a
-  direct bootstrap (not `ssh-forward`), and builds one QUIC connection with
-  independent CONTROL/SFTP/EXEC stream budgets (`catsyncd serve` exposes
-  `--quic-stream-window` and `--quic-conn-window`, plus per-type stream
-  limits). It keeps the same ephemeral certificate identities, pinning,
-  ALPN, and JSONL lifecycle as TCP; 0-RTT is never used. The probe reports
-  `transports: ["tcp", "quic"]`.
+Run state lives under `--state-dir` (default:
+`$XDG_STATE_HOME/catsync` or `~/.local/state/catsync`).
 
-If QUIC is unavailable or a QUIC run fails, CatSync never switches transports
-silently. The error points at both explicit alternatives: retry with
-`--transport daemon --daemon-transport tcp --daemon-port 43411` (same pinned
-mTLS bootstrap over TCP), or `--transport ssh` (historical SSH data path). The
-failed run stays resumable and no destination data is discarded on failure.
+## Paths and sources
 
-QUIC diagnostics are opt-in and add no work to normal runs. `--quic-qlog`
-writes a standard qlog trace (packet loss, PTO/loss timer, RTT, cwnd, bytes in
-flight, flow control, connection close) for the local connection;
-`--remote-quic-qlog` does the same for the remote `catsyncd`. Both files are
-created with mode 0600 (a pre-existing file is tightened to 0600), and the
-stream/control/EXEC progress summary is printed to stderr on connection close
-so a stalled data path can be distinguished from an application wait. The
-remote `catsyncd` also exposes `--quic-qlog PATH` directly for manual runs.
-
-Non-UTF-8 file names are not representable in the daemon protocol: planning
-fails with `UNSUPPORTED_PATH_ENCODING` before any remote write. Use the
-default ssh transport for trees containing such names.
+- Upload: `[user@]host:/absolute/path LOCAL`
+- Download: `LOCAL [user@]host:/absolute/path`
+- Relative remote paths and `~` are rejected.
+- Bracketed IPv6 literals are accepted.
+- Remote-to-remote and local-to-local transfers are rejected.
+- A single regular-file source is a point-to-point transfer and keeps its
+  base name at the destination directory.
 
 ## Options
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--backend` | `auto` | `auto`, `fpsync` (native parallel-rsync), `mscp` (native multistream), `sftp` (native single-file SFTP), or `rsync`; `fpsync`/`mscp` are kept as compatibility values |
-| `--dry-run` | off | transfer nothing; `sync` additionally runs rsync's itemized mirror preview, including deletions |
-| `--verify` | `auto` | `auto`, `none`, `size`, or `sha256` (see [Verification](#verification)) |
-| `--progress` | `auto` | `auto` (interactive terminal only), `always` (log snapshots), or `never` |
-| `--jobs` | 4 | max concurrent rsync batches (small-file stage) or concurrent large-file transfers |
-| `--streams` | 4 | SFTP sessions per large-file transfer |
-| `--large-threshold` | `512MiB` | size at or above which a file counts as large |
-| `--ipv6` | off | restrict ssh, the rsync transport, and the native large-file backend to IPv6 |
-| `--port` | ssh config | explicit SSH server port (`1..65535`), persisted for resume and applied to every SSH/rsync/SFTP path |
-| `--on-auth-failure` | `fail` | `fail` (run stays resumable) or `retry` (ask to renew credentials, then retry the stage) |
-| `--fresh` | off | start a new run instead of resuming an interrupted run for the same job |
-| `--state-dir` | XDG state | run state directory |
-| `--quiet` / `--verbose` | off | output control |
+| `--transport ssh\|daemon` | `ssh` | Remote data transport. `resume` inherits the recorded value. |
+| `--backend` | `auto` | `auto`, `fpsync`, `mscp`, `sftp`, or `rsync`. |
+| `--verify` | `auto` | `auto`, `none`, `size`, or `sha256`. |
+| `--dry-run` | off | Transfer nothing; `sync` also previews deletions. |
+| `--jobs N` | 4 | Concurrent files/batches; capped at 64. |
+| `--streams N` | 4 | SFTP sessions per large file; capped at 64. |
+| `--large-threshold SIZE` | `512MiB` | Size at or above which a file is “large”. |
+| `--port N` | ssh config | Explicit SSH port; persisted for resume. |
+| `--ipv6` | off | Restrict SSH/SFTP/rsync to IPv6. |
+| `--on-auth-failure` | `fail` | `fail` or `retry` after an authentication rejection. |
+| `--fresh` | off | Start a new run instead of resuming the matching one. |
+| `--state-dir DIR` | XDG state | Run-state directory. |
+| `--progress` | `auto` | `auto`, `always`, or `never`. |
+| `--quiet` / `--verbose` | off | Output control. |
+| `--transport daemon` flags | — | See [Daemon transport](#daemon-transport-one-shot-catsyncd). |
 
-Options may appear before, between, or after the operands — `catsync sync
---jobs 8 SRC DEST` and `catsync sync SRC DEST --jobs 8` are equivalent — and
-`--` ends option parsing. Raw `--delete` is rejected: select the complete safety
-policy explicitly with `copy` (never delete) or `sync` (exact mirror).
+Options can appear before, between, or after operands. `--` ends option parsing.
+Raw `--delete` is rejected; choose `copy` or `sync` explicitly.
 
-`catsync resume` accepts only its own documented options (`--jobs`, `--streams`,
-`--on-auth-failure`, `--state-dir`, `--progress`, `--quiet`, `--verbose`); the
-rest of a resumed run's strategy is recorded and immutable.
+**Parallelism.** `--jobs` bounds concurrent files/batches; `--streams` bounds
+SFTP sessions for one large file. Both default to 4 and are capped at 64. An
+estimated peak above 64 connections prints one warning but is not refused.
 
-**Parallelism.** `--jobs` bounds how many files transfer concurrently and
-`--streams` bounds how many parallel SFTP sessions one large-file transfer
-holds (both default to 4). The stages run sequentially, so the peak connection
-count of a plan is the largest of `min(jobs, large files) × streams`,
-`min(jobs, small files)` (one ssh per concurrent rsync batch), and the
-conservative rsync stage. Parallelism is your choice: a single file can use many
-streams (`--streams 32` with the default `--jobs 4` transfers one file over 32
-sessions), and a wide plan is never refused. When the estimate exceeds the
-64-connection guidance, CatSync prints one warning and proceeds. Each value is
-capped at 64 on its own (`--jobs 65` or `--streams 65` is a usage error) to catch
-typos.
+## Transport modes
 
-**Progress.** The display has three parts, redrawn as one block on a terminal and
-printed as snapshots when redirected with `--progress always`:
+| Mode | Selection | Data path | SSH after handoff |
+| --- | --- | --- | --- |
+| SSH | default | one SSH/SFTP connection per stream | N/A |
+| Daemon direct TCP | `--transport daemon` | pinned mTLS TCP | Can exit |
+| Daemon direct QUIC | `... --daemon-transport quic` | pinned QUIC TLS 1.3 | Can exit; experimental |
+| Daemon SSH-forward | `... --daemon-bootstrap ssh-forward` | mTLS inside SSH tunnel | Required |
 
-```
-[============------------]  50.00%  8.2 GiB/16.4 GiB  Current Speed 28.3 MiB/s  Elapsed 04:12  ETA 04:51  ETD 17:44:10  native-large
-ssh conns 7  |  files 12/40 done, 0 checked, 3 skipped
-  …/data/big1.bin  4.1 GiB/9.0 GiB  21.0 MiB/s  ETA 03:58
-  …/data/big2.bin  1.9 GiB/7.4 GiB   7.3 MiB/s  ETA 12:40
+### Daemon transport (one-shot `catsyncd`)
+
+The daemon transport replaces one SSH channel per data stream with a remote
+one-shot agent. It is opt-in and requires `catsyncd` on the remote host:
+
+```bash
+catsync copy --transport daemon ./data user@host:/srv/data
+catsync copy --transport daemon --daemon-transport quic ./data user@host:/srv/data
 ```
 
-- the header aggregates every backend: percentage, transferred logical bytes,
-  smoothed speed, elapsed time, ETA, ETD (estimated local completion clock time),
-  and the active stage;
-- the counter line shows the current SSH connection count and how many files are
-  done, checked (verified), and skipped because the destination already matched;
-- up to five active transfers follow, each with its own bytes, speed, and ETA.
-  Native large-file and single-file SFTP transfers are per file; rsync batches
-  are reported per batch with their file count, because rsync reports progress
-  per invocation rather than per file.
+The flow:
+
+1. One SSH bootstrap session starts `catsyncd serve --once`.
+2. Both sides generate in-memory P-256 identities and pin the exact peer
+   certificate.
+3. Data uses pinned mutual TLS 1.3 (TCP) or pinned QUIC TLS 1.3 (no 0-RTT).
+4. For direct TCP/QUIC, the authenticated data-control channel takes over:
+   the bootstrap SSH exits, data heartbeats and the final authenticated bye own
+   the session, and the one-shot worker exits when the run ends.
+5. If the client dies, the worker exits after the bounded data-control
+   heartbeat timeout. It never becomes a permanent service.
+
+SSH-forward keeps the data path inside the SSH tunnel, so that mode remains
+SSH-dependent. Legacy SSH is unchanged. If the direct data connection is lost,
+the run fails safely and can be resumed; CatSync does not re-authenticate a
+**new** direct session without SSH.
+
+#### Daemon options
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--daemon-port N` | 43411 | TCP/UDP data port; `0` asks for an ephemeral port. |
+| `--daemon-transport tcp\|quic` | `tcp` | QUIC is experimental, one UDP connection, no 0-RTT. |
+| `--daemon-bootstrap direct\|ssh-forward` | `direct` | Direct detaches after handoff; ssh-forward stays tunnel-bound. |
+| `--remote-catsyncd PATH` | `catsyncd` | Remote executable; CatSync never installs it. |
+| `--daemon-listen ADDR` | `:43411` | Passed to `catsyncd serve --listen`. |
+| `--daemon-addr HOST:PORT` | — | Override the data address (advanced proxy/NAT cases). |
+| `--quic-qlog PATH` | — | Local QUIC qlog, mode 0600. |
+| `--remote-quic-qlog PATH` | — | Remote QUIC qlog path, absolute. |
+
+Remote prerequisites: `catsyncd`, `sftp-server`, and `rsync` when the plan needs
+it. Direct handoff additionally needs `setsid`; without it the client warns and
+keeps the SSH-bound lifecycle. Run `catsync daemon probe USER@HOST` for a
+read-only capability report.
+
+#### Security
+
+- The listener binds only after the client certificate is verified and pinned.
+- TLS requires 1.3, mutual auth, the pinned leaf, and a known ALPN.
+- Handoff is accepted only over the authenticated data channel and only with
+  the matching bootstrap session id.
+- `exec` runs only the fixed `rsync` with a strictly validated `--server`
+  argument vector.
+- Identities, keys, and nonces are memory-only for one run.
+- QUIC failure never silently switches transports. The error names the TCP and
+  SSH alternatives explicitly.
+
+Non-UTF-8 filenames are not representable in the daemon protocol; use
+`--transport ssh` for trees containing them.
 
 ## Backend selection
 
-Auto mode assigns every regular file exactly one owner:
+`auto` assigns every regular file exactly one owner:
 
 | Source / destination state | Backend |
 | --- | --- |
-| unchanged size and mtime (hint only) | skipped — no transfer |
-| new file below the threshold | native parallel-rsync batches (backend name `fpsync` for compatibility), or native single-file SFTP transfers when rsync is not installed (backend `sftp`) |
-| new file at or above the threshold | native multistream (backend name `mscp` for compatibility) |
-| existing, modified, or state unknown | rsync |
-| symlink, special file, or scan error | unsupported — recorded distinctly, never followed |
+| Same size and mtime | skipped (hint only; verification is the real gate) |
+| New file below threshold | parallel `rsync` batches (`fpsync` compatibility name) |
+| New file at/above threshold | native multistream (`mscp` compatibility name) |
+| Existing or unknown destination state | `rsync` |
+| Symlink, special file, scan error | `unsupported`, recorded distinctly |
+| No rsync available | new files use native single-file SFTP (`sftp`) |
 
-Size and mtime are planning *hints*, not proof of content equality; the
-verification stage is the completion gate. Forced backends must preserve the
-safety policy: `--backend mscp` rejects files that exist at the destination or
-whose destination state is unknown, and `--backend fpsync` rejects files at or
-above the threshold.
+Forced backends must preserve the safety policy. For example, `--backend mscp`
+refuses a file that already exists at the destination.
 
-### Unsupported entries
-
-Symlinks, special files (devices, FIFOs, sockets), and entries whose scan failed
-are recorded as **unsupported**, distinct from `skipped` and `failed`. In
-`copy` they are never followed or written, and the summary and `status` report
-them prominently. In `sync` the final full-tree rsync reconciliation owns
-entries outside the optimized regular-file plan: if it succeeds they are
-recorded completed, and if rsync cannot reproduce one the entire sync fails
-instead of claiming an exact mirror.
-
-Files initially `skipped` because size and mtime matched are promoted to
-`completed` after a successful checksum reconciliation, because sync has then
-content-checked the whole tree rather than trusting the planning hint.
-
-### Running without rsync
-
-rsync is not required for a copy that only adds files: new small files go over
-a single native SFTP session each (backend `sftp`) and new large files already
-use native multistream, so a host with only `ssh` can copy a new tree. What
-still needs rsync is updating files that already exist at the destination (delta
-transfer), the mirror reconciliation of `sync`, and the parallel batches that
-make many small files fast when rsync *is* installed. `catsync doctor` reports
-rsync as optional and explains what it is used for; a run that needs it fails
-with a clear message instead of guessing.
-
-### Requirements on the remote host
-
-- a POSIX shell and GNU findutils (manifest collection uses `find -printf`);
-- `rsync` for the conservative stage and the native small-file batches.
-  `catsync sync` additionally needs **GNU rsync** (it reconciles with
-  `--acls --xattrs --hard-links`); macOS ships Apple openrsync at
-  `/usr/bin/rsync`, so install GNU rsync (`brew install rsync`) and put it
-  first in `PATH`. `catsync doctor` warns when the rsync in `PATH` is not GNU;
-- for native **uploads**: an OpenSSH ≥ 9.0 `sftp-server` (fsync and
-  `hardlink@openssh.com` extensions) and GNU coreutils (nanosecond `touch`);
-- native **downloads** need the SFTP subsystem and GNU findutils, but not the
-  remote hardlink extension or GNU `touch`.
-
-If manifest collection fails (no GNU find, SSH failure), auto mode plans
-conservatively: every transferable file routes to rsync, and CatSync says so. A
-missing destination directory is detected remotely and counts as an authoritative
-*empty* destination, so first-time syncs still use the native stages.
+`copy` never follows symlinks or writes special files. A successful `sync`
+pass delegates tree-level entries to its final rsync mirror; a failed mirror
+never claims to be exact.
 
 ## Verification
 
-- `--verify none`: a task completes when its backend exits zero and the source
-  file is unchanged before and after the transfer.
-- `--verify size`: after all stages, CatSync scans the receiving side (one remote
-  manifest for uploads, one local walk for downloads) and compares every
-  transferred file's size with the source size. A mismatch fails the task and the
-  run. **Size equality is not content proof.**
-- `--verify auto` (default): performs the size check, then asks the remote
-  endpoint to compute SHA-256 with the first available utility from `sha256sum`,
-  `shasum`, `openssl`, or `busybox sha256sum`, computes the local digest itself,
-  and compares them. If the remote has none of those tools the run completes with
-  size verification only and prints a prominent warning **after** the completion
-  line stating that content verification was not performed.
-- `--verify sha256`: the same size-then-SHA-256 gate, but it fails the run when
-  the remote endpoint has no supported SHA-256 utility.
-
-CatSync never downloads a remote file to hash it locally. Remote content is read
-only by the remote hashing utility, and SSH returns NUL-delimited path/digest
-records. There is intentionally no readback fallback.
-
-## Examples
-
-Exact Linux VPS → Linux VPS mirror (run on the source VPS; deletes extras):
-
-```sh
-catsync sync /srv/data/ deploy@203.0.113.10:/srv/data
-```
-
-Non-deleting copy:
-
-```sh
-catsync copy /srv/data/ deploy@203.0.113.10:/srv/data
-```
-
-IPv6-only:
-
-```sh
-catsync sync --ipv6 /srv/data/ deploy@[2001:db8::10]:/srv/data
-```
-
-Explicit non-default SSH port (applies to manifests, rsync, SFTP, metadata, and
-verification):
-
-```sh
-catsync copy --port 2222 ./data deploy@backup.example.com:/srv/data
-```
-
-Without `--port`, port selection is left to the system `ssh`, so `Port` in
-`~/.ssh/config` keeps working. The explicit port is recorded and reused by
-`resume`.
-
-Parallelism tuned per direction (small files parallelized, 8 jobs × 2 streams):
-
-```sh
-catsync sync --jobs 8 --streams 2 --large-threshold 1GiB ~/Pictures deploy@backup.example.com:/srv/pictures
-```
-
-Remote-to-local (operand order selects the direction):
-
-```sh
-catsync sync --jobs 4 --streams 2 deploy@backup.example.com:/srv/archive ~/Downloads/archive
-```
-
-Dry-run and plan:
-
-```sh
-catsync plan /srv/data/ deploy@203.0.113.10:/srv/data
-catsync sync --dry-run /srv/data/ deploy@203.0.113.10:/srv/data
-```
-
-Resume and status:
-
-```sh
-catsync status                      # latest run
-catsync resume                      # latest resumable run
-catsync resume 20260101T120000Z-0123456789abcdef
-catsync status 20260101T120000Z-0123456789abcdef --verbose
-```
-
-Forced backends (must preserve the safety policy or fail):
-
-```sh
-catsync sync --backend rsync /srv/data/ deploy@203.0.113.10:/srv/data
-catsync sync --backend fpsync --large-threshold 1GiB /srv/small-files/ deploy@203.0.113.10:/srv/small-files
-catsync sync --backend mscp /srv/isos/ deploy@203.0.113.10:/srv/isos      # only if none exist remotely
-catsync sync --backend mscp deploy@203.0.113.10:/srv/isos ~/Downloads/isos # only if none exist locally
-```
-
-## SSH authentication and Smallstep certificates
-
-CatSync delegates authentication to the **system `ssh`**. Every manifest command,
-rsync transport, SFTP session, and metadata command inherits the invoking
-process's environment, including `SSH_AUTH_SOCK`, and uses normal `~/.ssh/config`,
-agent, `known_hosts`, `ProxyJump`, `ControlMaster`, PKCS#11, and security-key
-behavior. CatSync does not add `-i`, does not set `IdentitiesOnly=yes`, does not
-parse private keys, and does not require a certificate to exist as a file.
-
-This directly supports Smallstep's agent-only flow:
-
-```sh
-step ssh login your-name                 # places the short-lived identity/certificate in ssh-agent
-ssh user@host true                       # optional: prove the same shell can authenticate
-catsync sync ./data user@host:/srv/data  # inherits that same SSH_AUTH_SOCK
-```
-
-Run `step ssh login` and CatSync from an environment connected to the same agent.
-Avoid launching CatSync through `sudo` unless the agent socket and its
-permissions are deliberately preserved. CatSync never invokes `step` or refreshes
-certificates itself; if a short-lived certificate expires while opening new SSH
-sessions, use `--on-auth-failure retry` or authenticate again and resume.
-
-## Security notes
-
-- All subprocesses run through `exec.CommandContext` with argument arrays; no
-  local shell ever parses a command line. File lists travel on NUL-delimited
-  stdin. Remote paths in SSH scripts are single-quote escaped.
-- SSH host-key checking is never disabled; CatSync passes no
-  `StrictHostKeyChecking` overrides. Configure `~/.ssh/config` as usual.
-- SSH credentials may live only in an inherited agent. CatSync neither requires
-  nor manufactures on-disk identity/certificate files.
-- No destination path ever has two writers at once: the plan assigns one owner
-  per file, stages run strictly sequentially, and each small-file batch owns a
-  disjoint file set.
-- `copy` never deletes destination-only data. `sync` performs checksum-based
-  archive reconciliation with `--delete-delay`, but only after all preceding
-  transfer stages succeed. Raw `--delete` is not accepted.
-- CatSync never reads or prints credentials or private keys; no environment
-  value is ever printed.
-
-## Program overrides
-
-The `CATSYNC_*` environment variables override paths of programs CatSync executes
-itself. They never change tool behavior, and their values are never printed.
-
-| Variable | Effective scope |
+| Mode | Gate |
 | --- | --- |
-| `CATSYNC_SSH` | Every ssh invocation CatSync starts: remote manifest, batched mkdir, native SFTP sessions, metadata commands, **and** rsync's `-e` transport. Must be one token without whitespace or control characters (rsync splits `-e` on whitespace); `--ipv6` appends `-6` and `--port` appends `-p PORT`. Invalid values are a usage error. |
-| `CATSYNC_RSYNC` | The rsync processes CatSync starts (conservative stage and every native small-file batch). |
+| `none` | Backend exits zero and the source is unchanged. |
+| `size` | Receiving-side size matches for every transferred file. |
+| `auto` (default) | Size, then SHA-256 when a remote hashing tool is available. |
+| `sha256` | Size and SHA-256, or fail if the remote cannot hash. |
 
-`CATSYNC_FPSYNC`, `CATSYNC_FPART`, and `CATSYNC_MSCP` no longer exist: CatSync
-never runs or probes those tools.
+`auto` falls back to size-only with a prominent warning **after** completion
+when no SHA-256 utility exists. Size is not content proof. CatSync never
+downloads a remote file just to hash it locally.
+
+## Interruptions and resume
+
+Ctrl-C, a dropped connection, or a failed stage leaves a resumable run.
+Already durable bytes stay on disk; the next identical command resumes it.
+
+- **Automatic:** rerun the same `copy`/`sync` command.
+- **Explicit:** `catsync resume [RUN_ID]`.
+- **Start over:** `--fresh`.
+
+A destination lock is an OS advisory `flock`, not the existence of a lock file.
+`kill -9` and power loss release it automatically. Lock files may remain; do
+not delete them to “clear” a lock. State is not shareable across hosts, and
+all clients sharing a state directory must be upgraded together.
+
+## Authentication
+
+CatSync delegates SSH to the system `ssh`: `~/.ssh/config`, agent,
+`known_hosts`, `ProxyJump`, hardware keys, and `SSH_AUTH_SOCK` all work as
+usual. It does not add `-i`, set `IdentitiesOnly`, parse keys, or require a
+certificate file.
+
+For a short-lived certificate in an agent:
+
+```bash
+step ssh login your-name
+catsync copy ./data user@host:/srv/data
+```
+
+If credentials expire mid-run, the default fails with a resumable run. Use
+`--on-auth-failure retry` to pause, renew credentials, and retry the stage on a
+terminal:
+
+```bash
+catsync copy --on-auth-failure retry ./data user@host:/srv/data
+```
+
+CatSync never invokes `step`, never refreshes certificates itself, and never
+bypasses SSH authentication.
 
 ## Troubleshooting
 
-If `catsync status` or `resume` reports `corrupt run state ... unknown field
-"transport"`, an older `catsync` binary is reading a run written by a newer
-release. Check `command -v catsync` / `catsync version`; a user-local install
-can shadow a newer Homebrew or release binary. Upgrade the binary in `PATH`
-rather than editing the state file. State formats are not forward
-compatible: all clients sharing a state directory must be upgraded together.
-
-
-**A run stopped; what now?** Run the same `copy`/`sync` command again (it resumes
-the same job automatically) or `catsync resume`. Nothing already durable is
-re-sent.
-
-**The progress bar went backwards after a resume?** It should not: a resume
-starts at the durable byte count and prints that line. If you see a fresh run
-instead, the endpoints differed or you passed `--fresh`.
-
-**`Permission denied` after a while.** The credentials expired (typical for
-short-lived certificates). Re-authenticate in the same shell/agent and resume, or
-use `--on-auth-failure retry` next time.
-
-**`--jobs`/`--streams` do not seem to matter.** For one file only `--streams`
-matters; `--jobs` bounds concurrent *files*. Both are capped at 64 each, and an
-estimate above 64 connections only warns.
-
-**A large file was planned for rsync instead of the native backend.** Auto mode
-uses native multistream only for large files confirmed absent at the destination;
-existing or unknown destination state always falls back to rsync. `--backend
-mscp` refuses such files rather than overwriting them.
-
-**`rsync: unrecognized option '--acls'` on macOS.** The system `/usr/bin/rsync`
-is Apple openrsync, which lacks GNU's ACL/xattr options that `sync` uses.
-Install GNU rsync (`brew install rsync`) and make sure it comes first in
-`PATH`; `catsync doctor` reports this.
-
-**`sync` refuses to delete.** The reconciliation runs only after every transfer
-stage succeeded; fix the transfer failure first.
-
-**Where is the state?** `--state-dir`, defaulting to `$XDG_STATE_HOME/catsync` or
-`~/.local/state/catsync`. Each run has `runs/<id>.json` plus checkpoints under
-`checkpoints/<id>/`.
+| Symptom | Fix |
+| --- | --- |
+| `Permission denied` after a while | Expired credentials. Re-authenticate and resume, or use `--on-auth-failure retry`. |
+| `--jobs`/`--streams` seem ignored | `--streams` parallelizes one file; `--jobs` parallelizes files. Both cap at 64. |
+| Large file planned for rsync | Native multistream handles new files only. Existing/unknown destinations use rsync. |
+| `rsync: unrecognized option '--acls'` on macOS | System rsync is openrsync. Install GNU rsync and put it first in `PATH`. |
+| `sync` refuses to delete | Reconciliation only starts after every transfer stage succeeds. |
+| `corrupt run state ... unknown field "transport"` | An older `catsync` in `PATH` is reading newer state. Check `command -v catsync` / `catsync version`; upgrade all clients sharing the state dir. |
+| `sshd` or `sftp-server` missing | Fix the remote OpenSSH setup; CatSync never installs system tools. |
+| Daemon handoff did not detach | Remote lacks `setsid`, or the server is older. The warning explains the fallback. |
 
 ## Known limitations
 
-- **Mutating source tree**: CatSync does not snapshot the source. Files are
-  re-stat'ed immediately before and after transfer, and a changed file fails its
-  task, but a consistent point-in-time copy of a live tree is not promised. Sync
-  quiescent trees or snapshot first.
-- **Symlinks, special files, and scan-error entries** are unsupported by the
-  optimized planner and remain untransferred in `copy`. A successful final `sync`
-  reconciliation delegates the whole tree to rsync, which handles directories,
-  symlinks, and supported special files; platform privileges still decide whether
-  device/special metadata can be reproduced.
-- **Native multistream** transfers new files only; a modified large file always
-  falls to rsync. Remote-to-remote copies are not supported.
-- **Progress totals are logical transfer bytes** aggregated from successful
-  writes. Delta transfer, already-completed resume chunks, checksum-only mirror
-  work, metadata, and deletion do not map one-to-one to network bytes, so ETA/ETD
-  are live estimates and may jump at stage boundaries.
-- **Manifest buffering**: the remote manifest is buffered in memory during
-  collection (tens of bytes per remote file).
-- **Hash-tool availability**: default `--verify auto` falls back to size-only
-  verification when the remote endpoint has no supported SHA-256 utility and
-  prints a prominent post-completion warning. Use `--verify sha256` when this
-  absence must fail the run.
-- Remote endpoints must run a POSIX shell and GNU findutils. Upload
-  destination-manifest failure has a conservative rsync-only fallback; remote
-  source discovery for a download cannot safely fall back and fails.
+- The source is not snapshotted. A file changed between checks fails its task,
+  but a consistent copy of a mutating tree is not promised.
+- `copy` does not transfer symlinks, special files, or scan errors. `sync` may
+  delegate them to its final rsync pass.
+- Native multistream is for new files only. Modified large files fall back to
+  rsync. Remote-to-remote copies are not supported.
+- Progress totals are logical write bytes, not exact network bytes; ETA/ETD are
+  estimates.
+- Default verification can fall back to size-only when the remote has no
+  hashing utility. Use `--verify sha256` to make that fatal.
+- Remote discovery requires a POSIX shell and GNU findutils. A failed upload
+  destination manifest can fall back to rsync; failed remote source discovery
+  for downloads fails closed.
+- QUIC on the public path can still hit the known quic-go decryption/idle
+  timeout issue. Keep TCP or SSH if this matters.
+
+## Advanced: program overrides
+
+For diagnostics and tests only:
+
+| Variable | Scope |
+| --- | --- |
+| `CATSYNC_SSH` | Every SSH invocation, including rsync’s `-e` transport. One whitespace-free token. |
+| `CATSYNC_RSYNC` | Every rsync process CatSync starts. |
+
+Values are never printed. `CATSYNC_FPSYNC`, `CATSYNC_FPART`, and
+`CATSYNC_MSCP` no longer exist.
+
+## Advanced: security invariants
+
+- All subprocesses use argument arrays; no local shell parses command lines.
+- File lists use NUL-delimited stdin.
+- Remote paths in shell snippets are single-quote escaped.
+- SSH host-key checking is never disabled.
+- No destination path has two writers: one owner per path, sequential stages,
+  and disjoint small-file batches.
+- `copy` never deletes; `sync` deletion is delayed until after successful
+  transfer and checksum reconciliation.
+- CatSync never reads or prints credentials or private keys.

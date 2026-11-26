@@ -1,53 +1,20 @@
 # Releasing CatSync
 
-CatSync ships as versioned archives on the GitHub releases page and as a
-Homebrew formula in [dotfrankruan/homebrew-catsync](https://github.com/dotfrankruan/homebrew-catsync).
+CatSync publishes versioned archives on GitHub Releases and a formula in
+[dotfrankruan/homebrew-catsync](https://github.com/dotfrankruan/homebrew-catsync).
+The release workflow runs the full check suite before publishing anything.
 
-## 1. Tag the release
+## Before tagging
 
-`main` must be green in CI first. Then:
-
-```sh
-git tag -a v0.2.0 -m "v0.2.0"
-git push origin v0.2.0
-```
-
-`.github/workflows/release.yml` reacts to the tag: it re-runs `make check` on
-exactly that commit, builds `linux/amd64`, `linux/arm64`, `darwin/amd64`, and
-`darwin/arm64` archives with the tag baked into `catsync version`, and publishes
-them with `SHA256SUMS` and generated notes. A re-run for an existing tag
-replaces the assets instead of failing.
-
-Watch it with:
-
-```sh
-gh run list --workflow=release.yml
-gh release view v0.2.0
-```
-
-## 1b. Verify the archives
-
-`make release` writes one archive per platform; each must contain both
-`catsync` and `catsyncd` at the archive root. CI builds with the Go version
-declared in `go.mod` (1.26 or newer). CI and the release workflow
-check this automatically. If the Homebrew formula is updated, it must install
-both binaries and test both `catsync version` and `catsyncd version`.
-
-The repository ships `packaging/homebrew/catsync.rb` as the formula source
-with hash placeholders and `packaging/homebrew/render.sh` to fill them from
-`dist/release/SHA256SUMS`. Publishing to the tap is a separate, manual step
-and is not performed by CatSync.
-
-## 1c. Lifecycle acceptance before tagging a direct-mode release
-
-Before a release that changes the direct TCP/QUIC lifecycle, run the real
-OpenSSH acceptance and fault-injection scripts against the authorized test
-VPS (or an equivalent disposable host):
+- [ ] `main` is green in CI.
+- [ ] For a direct-lifecycle change, real SSH acceptance passes:
 
 ```bash
-CATSYNC_E2E_HOST=catsync-test@example.invalid python3 scripts/tests/real-ssh-handoff.py --binary ./bin/catsync \
+CATSYNC_E2E_HOST=catsync-test@example.invalid \
+python3 scripts/tests/real-ssh-handoff.py --binary ./bin/catsync \
   --remote-catsyncd /home/catsync-test/.local/bin/catsyncd \
   --out docs/assets/benchmarks/lifecycle.json
+
 CATSYNC_E2E_HOST=catsync-test@example.invalid \
 python3 scripts/tests/worker-timeout.py --binary ./bin/catsync \
   --remote-catsyncd /home/catsync-test/.local/bin/catsyncd \
@@ -55,79 +22,71 @@ python3 scripts/tests/worker-timeout.py --binary ./bin/catsync \
 ```
 
 Both scripts assert a matching SHA-256, no second bootstrap SSH, and a
-disappeared one-shot worker. Do not tag if either script fails; this is a
-release gate, not an optional benchmark.
+disappeared one-shot worker. Do not tag if either fails.
 
-## 2. Update the Homebrew tap (manual)
-
-The tap lives in a separate repository (`dotfrankruan/homebrew-catsync`) and
-is never updated automatically. After the release workflow has published the
-archives:
+## Tag the release
 
 ```bash
-make release VERSION=v0.2.0
-make brew-formula VERSION=v0.2.0 > /tmp/catsync.rb
+git tag -a vX.Y.Z -m "vX.Y.Z"
+git push origin vX.Y.Z
 ```
 
-Then, in a clone of the tap:
+The tag starts [`.github/workflows/release.yml`](../.github/workflows/release.yml), which:
+
+1. runs `make check` on the tagged commit;
+2. builds `linux/amd64`, `linux/arm64`, `darwin/amd64`, and `darwin/arm64`
+   archives containing both `catsync` and `catsyncd`;
+3. verifies each archive and `SHA256SUMS`;
+4. creates the GitHub Release with generated notes.
+
+Re-running the workflow for an existing tag replaces the assets.
+
+## Verify the release
+
+```bash
+gh run list --workflow=release.yml
+gh release view vX.Y.Z
+gh release download vX.Y.Z --pattern SHA256SUMS --clobber
+sha256sum -c SHA256SUMS
+```
+
+`make release VERSION=vX.Y.Z` builds the same local archives if you need to
+inspect them before tagging.
+
+## Update the Homebrew tap
+
+The tap is a separate repository and is intentionally not published
+automatically. After the GitHub Release exists:
+
+```bash
+make release VERSION=vX.Y.Z
+make brew-formula VERSION=vX.Y.Z > /tmp/catsync.rb
+```
+
+In a clone of `dotfrankruan/homebrew-catsync`:
 
 ```bash
 cp /tmp/catsync.rb Formula/catsync.rb
 brew style Formula/catsync.rb
-# Register the local clone once if needed:
-#   brew tap dotfrankruan/catsync /path/to/homebrew-catsync
 brew audit --strict dotfrankruan/catsync/catsync
 brew test dotfrankruan/catsync/catsync
-git commit -am "catsync v0.2.0"
-git push   # only when you explicitly intend to publish the tap
+git commit -am "catsync vX.Y.Z"
+git push   # only when you intend to publish the tap
 ```
 
-Releases from v0.2.0 on contain both `catsync` and `catsyncd` in every
-archive, so the rendered formula installs and tests both. The tap was updated
-to v0.2.0 during that release and now installs both unconditionally; future
-releases can use the rendered formula verbatim.
+The rendered formula installs and tests both binaries. The tap is currently on
+v0.2.0 and expects every archive to include `catsyncd`.
 
-## 3. Bump the Homebrew formula (legacy notes)
+## Smoke test from the user side
 
-The formula pins the release URLs and their SHA-256 values, so it must be
-updated for every tag. The checksums are the `SHA256SUMS` asset of the release:
+On a clean machine, or after uninstalling the local package:
 
-```sh
-gh release download v0.2.0 --pattern SHA256SUMS --clobber
-cat SHA256SUMS
-```
-
-In a clone of `dotfrankruan/homebrew-catsync`, edit `Formula/catsync.rb`:
-
-- replace every `v0.2.0` with the new tag in the four `url` lines;
-- replace each `sha256` with the matching line from `SHA256SUMS`.
-
-Then validate and publish:
-
-```sh
-brew tap dotfrankruan/catsync
-brew fetch catsync
-brew audit --strict catsync
-brew test catsync
-brew reinstall catsync
-
-git commit -am "catsync 0.1.1"
-git push
-```
-
-`brew test` runs `catsync version` and `catsync help`, so a completely broken
-archive fails before users see it.
-
-## 3. Verify the user experience
-
-On a clean machine (or after `brew uninstall catsync && brew untap dotfrankruan/catsync`):
-
-```sh
+```bash
 brew install dotfrankruan/catsync/catsync
 catsync version
 catsync doctor
 ```
 
-The fully-qualified install auto-taps the repository and needs no trust step;
-only installing by short name after an explicit `brew tap` requires
-`brew trust dotfrankruan/catsync` (that command trusts the whole tap).
+The fully-qualified install auto-taps the repository. Installing by short name
+after an explicit `brew tap` requires `brew trust dotfrankruan/catsync`, which
+trusts the tap as a whole.

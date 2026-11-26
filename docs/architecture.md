@@ -1,418 +1,233 @@
-# CatSync MVP architecture
+# CatSync architecture
 
-CatSync is a local orchestration CLI for local-to-remote and remote-to-local
-transfers. It discovers the source tree, obtains endpoint metadata in batches,
-assigns every path exactly one backend in an
-immutable plan, and drives `rsync` and `ssh` processes plus its own native
-backends. The small-file stage partitions small files in pure Go and runs
-concurrent rsync batches itself. The large-file stage is native multistream:
-sequential system-ssh SFTP sessions copy disjoint byte ranges into a
-receiving-side same-directory temp object with per-chunk atomic checkpoints and
-a no-clobber hardlink publish. The remote host needs only SSH/SFTP, rsync, and
-GNU findutils (plus GNU coreutils for native upload metadata); it does not run a
-CatSync daemon.
+CatSync is a local orchestrator. It discovers a source tree, plans one backend
+per path, runs the transfer in sequential stages with bounded parallelism, and
+verifies the result. The default transport uses only the system `ssh` and
+`rsync`; the optional daemon transport replaces the remote data path with a
+one-shot `catsyncd` and pinned mutual TLS.
 
-## Safety model
+- **One owner per path.** Backends are immutable for a run, so two programs
+  never write the same destination file.
+- **Stages are sequential.** Parallelism happens inside a stage, not between
+  stages that could race for destination metadata.
+- **State is crash-aware.** Run state is atomic; native chunks are checkpointed
+  after durability; destination locks are kernel advisory locks.
+- **Copy is safe by default.** Only `sync` can delete, and only after every
+  optimized transfer stage succeeded.
 
-Planning produces one owner for every relative path:
+## Components
 
-| Source/destination state | Auto backend |
+| Component | Responsibility |
 | --- | --- |
-| unchanged size and mtime | skip |
-| new file below threshold | native parallel-rsync batches (backend name `fpsync` for compatibility) |
-| new file at or above threshold | native multistream (backend name `mscp` for compatibility); uploads use rsync if the server lacks the hardlink extension |
-| existing or uncertain file | rsync |
-| symlink, special file, or scan error | unsupported (distinct task status) |
+| `internal/planner` | Classifies every source path and chooses one backend. |
+| `internal/partition` | Packs small files into deterministic disjoint batches. |
+| `internal/backend/multistream` | Native SFTP range copier with checkpoints and no-clobber publish. |
+| `internal/backend/rsync` | Small-file batches, conservative updates, and mirror reconciliation. |
+| `internal/executor` | Runs stages, tracks progress, resume, and verification. |
+| `internal/state` | Atomic run/task persistence and advisory destination locks. |
+| `internal/daemon` | Optional bootstrap, pinned TLS/QUIC data plane, RPC/SFTP/EXEC. |
 
-Size and modification time are planning hints, not proof of content equality.
-Verification is a separate completion gate. Backend sets are immutable for a
-run and stages execute sequentially, so two programs never write the same
-destination path concurrently. Ownership is exact: each path has one backend,
-and within the small-file stage each batch owns a disjoint file set, so the
-concurrent rsync processes never touch the same destination file. Shared
-destination parents are pre-created with one batched remote mkdir for uploads
-or symlink-safe component creation locally for downloads, and the
-batches run with `--no-implied-dirs`, so implied parent directories are
-never created or attribute-updated by rsync — no directory-metadata race.
-`copy` stops after these non-deleting stages. `sync` is explicitly destructive:
-only after every optimized transfer stage succeeds, one full-tree rsync pass
-uses archive, checksum, hard-link, ACL, xattr, and delayed-delete semantics.
-That final pass represents empty directories and symlinks that the per-file
-planner intentionally omits. A failed earlier stage never reaches deletion.
+## Planning and ownership
 
-The source is rescanned before a task starts and after it exits (locally for
-uploads, through batched remote manifests and exact per-file native probes
-for downloads). A changed
-source is a failed task, not a successful transfer. State is written by
-temporary-file plus rename and a destination lock prevents overlapping runs.
-The lock is an OS advisory lock (flock) on a stable lock-file inode, not the
-existence of a lock file: if a process crashes (including SIGKILL and power
-loss) the kernel releases the lock, so the next run proceeds without manual
-lock-file cleanup. Lock files are intentionally never unlinked while they may
-be opened, and released files remain on disk, unlocked and empty. New
-releases ignore old-format lock files as ownership, but binaries from before
-this change still use existence-only locking, so all clients sharing a state
-directory must be upgraded together. Advisory
-locks are only trustworthy between processes on the same host using the same
-state directory on a filesystem that implements them. Sharing a state
-directory across hosts, or putting it on a network filesystem without reliable
-flock semantics, is not supported: `catsync` fails closed when the OS reports
-advisory locking as unavailable, but it cannot detect a network filesystem
-that accepts flock with only local semantics.
+| Source / destination state | Auto backend |
+| --- | --- |
+| Unchanged size + mtime | skip (planning hint only) |
+| New file below `--large-threshold` | native parallel-rsync batches |
+| New file at/above threshold | native multistream |
+| Existing / unknown destination | `rsync` |
+| Symlink, special file, scan error | `unsupported` |
 
-## Execution stages
-
-1. Stream regular-file discovery into a bounded planner (local Lstat walk or
-   one NUL-delimited remote GNU-find manifest).
-2. Collect receiving-side metadata (one remote manifest for uploads or one
-   local walk for downloads).
-3. Persist the plan and original source working directory.
-4. Run the native small-file stage: pack pending small-file tasks into
-   deterministic disjoint batches (at most 2000 files and at most the large
-   threshold in logical bytes per batch), create receiving-side parent
-   directories safely, then run up to `jobs` concurrent
-   rsync processes with `--no-implied-dirs` and per-batch NUL-delimited
-   `--files-from` lists. Then run native multistream new-large-file tasks
-   (checkpoint per chunk, exclusive temp, hardlink publish), then the rsync
-   conservative/delta stage.
-5. For `sync` only, persist an unreconciled intent and run the full-tree
-   checksum mirror with `--delete-delay`; persist reconciliation success.
-   `copy` skips this stage and never deletes destination-only entries.
-6. Verify successful tasks and atomically save their terminal state. The
-   default `auto` policy always checks size, then compares SHA-256 digests when
-   the remote endpoint provides `sha256sum`, `shasum`, `openssl`, or BusyBox.
-   If none is installed, it completes with size verification and emits a
-   prominent warning after the completion line. Strict `sha256` mode fails
-   instead. The remote utility reads remote content and returns only digest
-   records; CatSync never downloads remote files as a hashing fallback.
-
-If remote manifest collection fails, auto mode routes all regular files to
-rsync. Forced backends fail when they cannot preserve the safety policy.
-
-## Transfer stages
-
-### Native small-file batching
-
-CatSync packs the small files itself (`internal/partition`, pure Go, stable
-next-fit, no filesystem or subprocess access) and runs the resulting disjoint
-batches as concurrent rsync invocations. The planner owns the large/small
-boundary exactly (`size >= threshold` is large), so no tool-side skip list can
-disagree with the plan and let two owners copy one file. Batches are
-deterministic, so resume rebuilds equivalent batches from pending tasks without
-any run-scoped helper state. rsync's per-file partial files live next to the
-destination file, so partial progress survives re-batching.
-
-### Native multistream large-file backend
-
-The native backend (`internal/backend/multistream`) needs no transfer tool
-beyond system ssh: it speaks the SFTP subsystem itself through
-`github.com/pkg/sftp`. One transfer: deterministic chunk plan → atomic local
-checkpoint (JSON; source size, nanosecond mtime, destination identity, chunk
-size, completed set, unpredictable same-directory temp path) saved before any
-remote write → sequential SFTP sessions → exclusive temp create, preallocate,
-sync → per-session O_WRONLY handle pool → range copies where each chunk first
-crosses a remote fsync durability barrier and only then enters the checkpoint
-(so "completed" means remotely durable) → final sync, source re-check,
-metadata (permissions via SFTP, exact nanosecond mtime via a controlled ssh
-`touch` command; SFTP v3 carries only whole seconds) → no-clobber hardlink
-publish → final size/mtime verification. Publish uses `hardlink@openssh.com`, never PosixRename; a final
-path that exists is never overwritten.
-
-Resume validates the checkpoint strictly (version, source, destination, size,
-mtime, chunk size) and the existing temp (regular file, exact size, checked
-again through the open handle), skips completed chunks, and copies only the
-pending ranges. The crash window between a successful hardlink and the
-recorded completion is recovered by proving final and temp are the same inode
-via a controlled remote `test -ef`. Legacy checkpoints written by older
-releases (binary, relative-path format, `.mscpckpt`) are detected and fail
-closed.
-
-Native uploads require an OpenSSH ≥ 9.0 sftp-server (fsync, hardlink) and GNU
-coreutils on the remote. Upload auto mode probes the capability before any remote
-write; only a task proven never started (no checkpoint reference, no derived
-`.nativeckpt`, no legacy `.mscpckpt`) may fall back to the conservative rsync
-stage. Everything else fails closed and keeps its backend, checkpoint, temp,
-and final untouched, because rsync would bypass the no-clobber publish. A
-probe error is not an "unsupported" answer and never causes a fallback; a
-forced run fails clearly.
-
-Remote-to-local native transfer mirrors these invariants: a GNU-find probe
-binds the exact remote size and nanosecond mtime to the immutable plan; each
-system-ssh SFTP session opens an independent read handle; range workers write
-an exclusive same-directory local temp; local fsync precedes each checkpoint
-completion; the remote identity is rechecked before local mode/mtime and a
-no-clobber `link(2)` publish. Resume validates the checkpoint and local temp
-and skips completed ranges. Since publication is local, downloads do not
-require the remote hardlink extension or GNU `touch`.
-
-### rsync
-
-Rsync is the correctness fallback and the owner of existing large files. The
-default command uses archive semantics without deletion, a relative
-`--partial-dir`, and NUL-delimited `--files-from=- --from0`. Modern rsync
-protects remote arguments by default; CatSync detects remote compatibility
-before relying on version-dependent flags. It does not use `--whole-file` or
-`--inplace`.
-
-The separate mirror configuration is reachable only from `sync`. It has no
-`--files-from` filter and uses `--archive --checksum --hard-links --acls
---xattrs --partial --delete-delay`, without protecting a separate partial
-directory that could remain as an extra destination entry. Deletion is therefore an explicit command-level
-policy, not a pass-through flag. `sync --dry-run` runs the same command with
-`--dry-run --itemize-changes` so deletions and non-regular entries are visible
-without mutation. `MirrorReconciled` is saved false before launch and true
-only after exit zero; a failed reconciliation remains resumable even when all
-per-file tasks completed.
-
-## Progress accounting
-
-One concurrency-safe reporter aggregates successful write-byte deltas from
-all active backends. Native multistream reports every successful range write;
-each rsync process emits `--info=progress2`, whose monotonic counters are
-converted to deltas before aggregation. Terminal mode redraws one line at a
-bounded rate. Redirected output is silent by default; forced line mode emits
-periodic snapshots. Every snapshot includes percentage, logical bytes,
-smoothed current speed, elapsed time, ETA, ETD, and the active stage. These
-are logical progress estimates rather than exact network-byte accounting.
-
-## Persistent model
-
-Each JSON run records a schema version, run ID, source, destination, original
-working directory, configuration, timestamps, and tasks. A task records its
-relative path, source size/mtime, destination metadata, backend, status,
-attempt count, checkpoint reference, and last error. Valid statuses are
-`pending`, `running`, `completed`, `failed`, `skipped`, and `unsupported`.
-`unsupported` records entries the optimized per-file planner cannot transfer
-(symlinks, special files, scan errors). They remain unsupported and are
-reported for `copy`. A successful full-tree `sync` reconciliation owns them
-through rsync and atomically changes their task status to completed; if rsync
-cannot reproduce them, reconciliation fails and the run never claims an exact
-mirror.
-Metadata-skipped regular files are likewise promoted to completed after the
-checksum reconciliation proves or repairs their contents.
-
-A task is completed only after subprocess success, unchanged-source checks,
-and requested verification. On startup, `running` becomes `pending` with an
-interruption error so `resume` can revalidate it.
-
-Run-state compatibility is one-way: the current binary reads older additive
-run documents, but an older binary may reject fields added by a newer one.
-All clients sharing a state directory must be upgraded together. A strict
-decode failure such as `unknown field "transport"` therefore usually means
-an older `catsync` binary (for example one earlier in `PATH`) is reading a
-newer run; run `catsync version` and the explicit path of the intended binary
-before assuming the state file is corrupt.
-
-Persistence failures are correctness failures, not warnings. A task's
-`running` state is saved before its subprocess starts, and a failed save
-prevents the launch and propagates to the command. For the parallel
-small-file batches, the whole batch's running intent is one atomic save
-(mutate and save under the run lock, with full rollback on failure), so a
-failed save leaves every task pending and no batch process starts.
-Cancellation is checked at every batch boundary — before work, during
-pre-checks, before the intent save, and between save and launch — so a
-cancelled batch never lingers as running and never starts a process. Completion is saved
-before a native checkpoint is retired; the checkpoint reference is cleared
-and persisted before the file is removed, so a crash leaves either a
-referenced checkpoint or a harmless orphan file, never a completed task
-whose only copy state vanished. A resume-time recovery pass retires
-references left on durably completed tasks, and a fully successful run
-removes its per-run checkpoint directory.
-
-
-## Daemon transport
-
-The daemon transport is an opt-in alternative data path. The planner,
-backend selection, stages, checkpoint format, resume reconciliation, publish
-order, and progress accounting are unchanged; only the `remoteOps`
-implementation and backend transports differ.
-
-Bootstrap (one ssh session per run):
-
-```
-server_hello -> client_hello -> bind -> ready -> ready_ack -> active_ack
-```
-
-Both sides generate an ECDSA P-256 self-signed leaf per run. The client
-verifies the server leaf (EKU, validity) and pins its exact DER; the server
-does the same for the client. The listener is created only after the client
-identity is verified and pinned; the accept loop starts only after
-`active_ack`. Mutual TLS 1.3 with a single pinned certificate per side is
-used for every data connection. Frame/line bounds, duplicate-key rejection,
-unknown-field rejection, and version checks are enforced on all control and
-RPC JSON; any protocol violation closes the run instead of guessing.
-
-Data plane:
-
-- `catsync-http/1.1`: strict JSON RPC over mTLS. Six frozen operations:
-  manifest (three distinct modes: `dest_tree`, `source_tree`, `source_file`),
-  mkdir, metadata (mode and/or exact nanosecond mtime), streaming SHA-256,
-  stat, samefile. Streams are NDJSON and only a final `end{count}` record
-  makes a manifest/hash result valid; truncation, duplicates, unsorted
-  paths, count mismatches, and data after `end` fail the whole result.
-- `catsync-sftp/1`: a raw byte tunnel to a per-connection `sftp-server`
-  child, so each logical SFTP stream is a real OpenSSH SFTP session and the
-  native multistream backend keeps its `jobs x streams` semantics.
-- `catsync-exec/1`: one framed rsync server process per stream. The start
-  record names only `rsync`; arguments must be a `--server [--sender] ...
-  . <one absolute path>` shape with allowlisted flags, learned from real
-  rsync 3.5 golden argv. stdout/stderr/stdin are separate frames, exit codes
-  propagate, and cancellation or connection loss terminates and reaps the
-  child process group.
-
-Resource accounting is separated into RPC, SFTP, exec, and child counters.
-DRAINING closes the listener, rejects pending handshakes, waits boundedly
-for RPC, closes data connections before terminating children, reaps
-children, verifies zero counters, then sends `bye_ack`. A precheck failure
-or a resource-budget violation happens before any run state or remote data
-write.
-
-QUIC data plane (experimental): the same bootstrap runs `catsyncd serve
---once --transport quic`, which binds UDP only after the client identity is
-verified and advertises the actual UDP port in `ready`. Both sides dial one
-QUIC connection (TLS 1.3 mutual auth, pinned leaf, ALPN `catsync-quic/1`,
-0-RTT disabled). The first byte of every client-opened stream selects
-CONTROL, SFTP, or EXEC; each type has its own budget semaphore and the
-connection advertises the sum so control streams always have reserved
-capacity. Stream credit release is explicit (`RequireStreamCreditRelease`)
-and every accepted stream calls `ReleaseStreamCredit`, including rejected
-types and budget failures. CONTROL uses length-prefixed JSON requests and
-status-prefixed responses (NDJSON for streaming RPCs); SFTP and EXEC reuse
-the exact TCP data-plane adapters. The QUIC connection is single-per-run;
-a second connection is refused, and losing the connection without `bye`
-terminates the server non-zero. Flow-control windows are configurable and
-tested with small windows as well as large transfers.
-
-The local rsh agent bridges rsync's `-e "<catsync> rsh"` to the exec channel:
-a private 0700 directory, a 0600 Unix socket, same-uid peer credentials,
-and a random per-run token passed only through the environment. This is what
-keeps direct daemon mode at exactly one ssh session.
-
-### SSH bootstrap lifecycle handoff (direct TCP / QUIC)
-
-The SSH bootstrap is a trust-establishment channel, not the owner of the
-running session. In direct mode `catsyncd` is started under a `setsid -w`
-wrapper, which puts the one-shot worker in its own session while the wrapper
-keeps the SSH channel open for the bootstrap exchange. Once the client has
-verified the server certificate, the server has verified and pinned the
-client certificate, and the authenticated data control channel has passed its
-control precheck, the client sends a handoff request over that data channel.
-The request carries the bootstrap session id; the server accepts it only when
-the id matches and only when it was launched with the detach capability.
-
-The server writes the `detached` response on the authenticated channel first,
-then closes its SSH stdin/stdout/stderr descriptors and stops treating SSH
-EOF or SSH `bye` as shutdown authority. The client kills only its local
-bootstrap ssh process after that response. The remote worker is already in a
-new OS session, so the established data plane survives the SSH process
-disappearing. The direct data CONTROL channel now carries heartbeats and the
-graceful data-plane `bye`; a client crash is detected by a bounded heartbeat
-timeout, and normal completion makes the one-shot worker drain and exit.
-There is no permanent listener or service.
-
-If any of those steps fails before the server commits the handoff, the SSH
-bootstrap remains authoritative and the run fails/cleans up rather than
-leaving an untrusted worker. If the data connection itself is lost later, the
-run fails safely and is resumable; this feature does not implement passwordless
-re-authentication of a *new* direct session without SSH.
-
-SSH forwarding is deliberately excluded: its data connections live inside the
-SSH channel, so the SSH tunnel must stay alive. Legacy SSH is unchanged.
-The complete sequence is illustrated in
-[ssh-handoff.svg](assets/ssh-handoff.svg).
-
-## Compatibility and limitations
-
-Program overrides (diagnostics and tests): `CATSYNC_SSH` and `CATSYNC_RSYNC`
-replace executables CatSync itself spawns; `CATSYNC_SSH` also becomes rsync's
-`-e` transport and must be a whitespace-free token. `CATSYNC_FPSYNC`,
-`CATSYNC_FPART`, and `CATSYNC_MSCP` no longer exist: CatSync never runs or
-probes those tools. The native large-file backend uses the system ssh for
-every connection, so ssh_config, agents, known_hosts, ProxyJump, and hardware
-keys apply unchanged. All child processes inherit `SSH_AUTH_SOCK`; CatSync
-never adds `-i` or `IdentitiesOnly`, parses a key, invokes `step`, or requires
-a certificate file. A Smallstep `step ssh login` identity that exists only in
-the inherited agent is therefore usable directly; an expired certificate can
-be refreshed and the durable run resumed.
-
-An optional explicit SSH port is part of the immutable run configuration.
-Zero delegates to ssh_config; values from 1 through 65535 are rendered as
-`-p PORT` for direct SSH/SFTP invocations and inside rsync's fixed `-e`
-transport. Persisting the value ensures resume cannot silently switch ports.
-
-CatSync checks installed help/version output at runtime. A missing rsync or
-ssh is fatal. Optimized `copy` excludes symlinks and special files and never
-deletes destination-only data; `sync` delegates those entries and delayed
-deletion to its final full-tree rsync pass. Neither mode promises a consistent
-snapshot of a mutating source tree.
-
-Primary references:
-
-- <https://github.com/pkg/sftp>
-- <https://github.com/RsyncProject/rsync/blob/master/rsync.1.md>
+Size and mtime are hints, not content proof. Verification is a separate gate.
+`--backend` can force a backend only when it can preserve the safety rules;
+otherwise planning fails.
 
 ### Single-file sources
 
-A source operand that names one regular file is normalized to a
-point-to-point transfer: the source root becomes the file's parent directory
-and the plan contains exactly that file's base name. Both endpoints still use
-the directory-root model, so every downstream stage (planner, native
-multistream, checkpoint, verification, rsync `--files-from`) works unchanged
-and the file keeps its name at the destination. Local operands are classified
-with `os.Stat`; the remote source manifest script reports a leading mode
-record (`D` for a tree, `F` for one file) so a remote file operand produces
-the same single-entry plan. Resume revalidates the named file only, not its
-parent directory, and the persisted run records the file so `status` renders
-the exact source.
+A single-file source is normalized to a point-to-point transfer. The file keeps
+its base name at the destination; the rest of the pipeline still uses the
+directory-root model.
 
-### Changing parallelism on resume
+## Execution pipeline
 
-Resume accepts `--jobs` and `--streams` overrides. The chunk plan is derived
-from the recorded file size and chunk size, the temporary path and its
-completed-chunk set live in the checkpoint, and neither depends on how many
-workers or SFTP sessions run, so changing parallelism cannot corrupt progress:
-already-completed chunks are skipped, the same temporary object continues, and
-the new values are persisted on the run. Parallelism is not validated against
-a plan-peak ceiling: an estimate above the 64-connection guidance only warns. Everything else about a resumed run stays immutable; a fresh
-`copy`/`sync` creates a new run with its own checkpoint directory, so it never
-adopts another run's temporary object.
+1. **Discover** local files with a bounded walk, or a remote with one
+   NUL-delimited GNU-find manifest.
+2. **Collect metadata** for the receiving side.
+3. **Persist the plan** and original working directory.
+4. **Small-file stage:** deterministic disjoint batches, safe parent creation,
+   then up to `--jobs` concurrent rsync processes.
+5. **Large-file stage:** native multistream for new large files.
+6. **Conservative stage:** rsync for existing/uncertain files.
+7. **Mirror stage** (`sync` only): full-tree archive reconciliation with
+   delayed deletion.
+8. **Verify** by size and optionally SHA-256, then save terminal state.
 
-### Authentication failures and re-authentication
+Stages 4–6 do not delete. If remote metadata collection fails, auto mode routes
+regular files to rsync. A failed upload destination manifest can fall back to
+rsync; a failed remote source manifest for a download fails closed.
 
-SSH authentication is re-established for every new connection, so expiring
-credentials (for example a short-lived certificate) can fail a run midway even
-though earlier sessions are still open. Authentication rejections are
-classified into `backend.ErrAuthentication` (from the native backend's captured
-session stderr, and from the textual signature ssh/rsync print on the
-process-based paths). With `--on-auth-failure retry` the executor's stage
-runner catches that class, prompts on the terminal, reverts tasks that failed
-for that reason to pending, and retries the same stage — safe because stages
-are idempotent: open sessions keep working, native large files resume from
-their checkpoints, completed files are recorded, and rsync skips files whose
-size and mtime already match. The default mode fails the run with a resume hint
-instead of blocking, and without a terminal the retry loop never runs.
+## Transfer backends
 
-### Resume reconciliation
+### Native small-file batching
 
-Before any stage runs, a resume compares pending or failed tasks with the
-destination manifest and marks a task completed when its destination entry
-already has the planned size and nanosecond mtime. An interrupted run can have
-written a file completely while its completion was never recorded — for example
-when the connection dropped during verification — and this avoids transferring
-it again. The immutable plan recorded the file as absent at planning time, so a
-matching entry can only be this run's own interrupted write. A reconciled native
-large-file task also retires its leftover checkpoint and temporary object, since
-the published file is already live. Files whose metadata differs are never
-claimed: they keep their normal stage, and the no-clobber publish still refuses
-to overwrite them.
+`internal/partition` packs small files with a stable next-fit algorithm. Each
+batch owns a disjoint file set; resume deterministically rebuilds batches from
+pending tasks. rsync's per-file partial files live next to the destination, so
+progress survives re-batching.
 
-### Automatic resume of the same job
+### Native multistream
 
-Before planning, `copy` and `sync` look for a resumable run that describes the
-same job: equal direction, equal source endpoint (a single file keeps its name),
-equal destination endpoint, and equal command (copy versus mirror sync). When one
-exists it is resumed through the normal resume path, so its checkpoints,
-temporary objects, and completed tasks are reused instead of being re-planned and
-re-transferred; `--fresh` bypasses the lookup. The match is intentionally strict
-about endpoints, so a different destination, source, or command always produces a
-fresh run, and a completed run is never adopted.
+The large-file backend speaks SFTP directly through `github.com/pkg/sftp`; no
+remote helper is required.
+
+1. Plan deterministic chunks and persist a local checkpoint before any remote
+   write.
+2. Create an exclusive same-directory temp object; preallocate and sync.
+3. Copy ranges over sequential SFTP sessions; each chunk crosses a remote fsync
+   barrier before it enters the checkpoint.
+4. Recheck the source, publish with `hardlink@openssh.com` without overwriting
+   an existing destination path.
+5. Verify final size and mtime.
+
+`hardlink@openssh.com` is required for native uploads; POSIX rename is never
+used for publish. Resume validates the checkpoint and temp object, skips
+durable ranges, and fails closed if the identity no longer matches.
+
+### rsync
+
+`rsync` owns existing files, delta updates, the mirror stage, and small-file
+batches. CatSync uses argument arrays, NUL-delimited file lists, relative
+partial directories for non-mirror stages, and never passes a raw user
+`--delete`. The mirror stage has no file filter and uses
+`--archive --checksum --hard-links --acls --xattrs --partial --delete-delay`.
+
+macOS ships Apple openrsync at `/usr/bin/rsync`; its missing ACL/xattr options
+make it unsuitable for `sync`. Install GNU rsync and put it first in `PATH`.
+
+## State, resume, and locks
+
+Each run is a JSON document with a schema version, endpoint identity, config,
+timestamps, and tasks. Tasks record source identity, destination metadata,
+backend, status, checkpoint reference, attempts, and errors.
+
+- A task is completed only after subprocess success, an unchanged-source check,
+  and requested verification.
+- On startup, interrupted `running` tasks become `pending`. Before work, the
+  executor revalidates the source and destination; a changed source fails the
+  task instead of copying it.
+- State writes use temp-file + rename. Batch running-intent is one atomic save;
+  cancellation is checked before launch.
+- A completion is persisted before its checkpoint is retired. Crash recovery
+  therefore sees either a live checkpoint reference or a harmless orphan.
+- Resume repairs references on already-completed tasks and removes the
+  checkpoint directory after a fully successful run.
+
+The destination lock is an OS advisory `flock` on a stable lock-file inode. It
+is released by the kernel after a crash, including `kill -9`. Lock files may
+remain on disk unlocked; their existence is not ownership. All clients that
+share a state directory must be upgraded together, and the state directory
+must be on a local filesystem with reliable `flock`.
+
+Run-state compatibility is one-way: new binaries read older additive state,
+but older binaries may reject fields written by a newer release. A failure
+like `unknown field "transport"` usually means an older `catsync` earlier in
+`PATH`, not a corrupt file.
+
+## Daemon transport
+
+The daemon transport is opt-in and changes only the remote data path. Planner,
+checkpoints, publish rules, and verification stay the same.
+
+```text
+server_hello -> client_hello -> bind -> ready -> ready_ack -> active_ack
+```
+
+Both sides create a fresh ECDSA P-256 self-signed leaf per run. The client
+verifies and pins the exact server DER; the server does the same for the
+client. The listener is created only after the client identity is verified,
+and the accept loop starts only after `active_ack`.
+
+### Data planes
+
+| ALPN | Purpose |
+| --- | --- |
+| `catsync-http/1.1` | Strict JSON control RPC over mutual TLS. |
+| `catsync-sftp/1` | Byte tunnel to a real per-stream `sftp-server` child. |
+| `catsync-exec/1` | Framed rsync server process with a validated argv. |
+
+Control operations are manifest, mkdir, metadata, hash, stat, and samefile.
+Streams are NDJSON; only a final `end{count}` record makes a result valid.
+Every RPC/control JSON message enforces frame bounds, duplicate-key rejection,
+unknown-field rejection, and version checks.
+
+QUIC is one connection per run, TLS 1.3 mutual auth, pinned leaf, ALPN
+`catsync-quic/1`, no 0-RTT. The first byte of every stream selects
+CONTROL/SFTP/EXEC; each type has its own budget so control retains capacity.
+The connection is single-per-run and explicit stream-credit release is
+required. QUIC is still experimental on some public paths.
+
+The local rsh agent bridges rsync's `-e "<catsync> rsh"` to the exec channel
+with a private 0700 directory, a 0600 Unix socket, same-uid peer credentials,
+and a random per-run environment token. That keeps direct mode at one SSH
+bootstrap session.
+
+### SSH bootstrap lifecycle handoff
+
+Direct TCP and direct QUIC use the SSH bootstrap only to establish trust.
+
+1. `catsyncd` is launched under `setsid -w` in a new OS session.
+2. Certificates are exchanged and pinned; the authenticated data control
+   channel passes its control precheck.
+3. The client sends `/v1/handoff` with the bootstrap session id.
+4. The server writes `detached`, closes SSH stdio, and stops treating SSH
+   EOF/bye as shutdown authority.
+5. The client kills only its local bootstrap `ssh` process.
+6. Data heartbeats and `/v1/bye` own the lifecycle. A client crash is detected
+   by a bounded heartbeat timeout; normal completion drains and exits.
+
+The worker is one-shot. There is no permanent listener or service. SSH-forward
+is intentionally excluded because its data path lives inside the SSH channel.
+If handoff is unavailable, the client warns and stays on the SSH-bound
+lifecycle; it never silently falls back. Losing the direct data connection
+later is a safe failure with checkpoint/resume, not a no-SSH re-authentication
+mechanism.
+
+See [ssh-handoff.svg](assets/ssh-handoff.svg).
+
+## Progress and verification
+
+Progress aggregates successful write-byte deltas from all active backends.
+Native multistream reports range writes; rsync reports per-batch progress.
+The display includes percentage, logical bytes, speed, elapsed, ETA/ETD,
+connection count, finished/checked/skipped files, and up to five active
+transfers. Logical progress is not a network-byte counter.
+
+Verification is a completion gate:
+
+| Mode | Behavior |
+| --- | --- |
+| `none` | Backend success + source unchanged. |
+| `size` | Receiving-side size must match. |
+| `auto` | Size, then SHA-256 when a remote hashing utility exists. |
+| `sha256` | Size + SHA-256, or fail if no remote hashing tool. |
+
+The remote hashing utility reads only remote content and returns digest
+records; CatSync never downloads files just to hash them.
+
+## Compatibility and limitations
+
+- `CATSYNC_SSH` and `CATSYNC_RSYNC` replace programs for diagnostics/tests.
+  `CATSYNC_SSH` must be a single whitespace-free token.
+- An explicit `--port` is recorded and applied to every SSH/SFTP/rsync path.
+- The source is not a snapshot. A file changed between checks fails its task.
+- `copy` does not transfer symlinks/special files; `sync` may delegate them to
+  the final rsync pass.
+- Native multistream handles new files only; modified large files use rsync.
+- Remote-to-remote copies are unsupported.
+- Default verification can complete with size-only and a post-completion
+  warning if the remote has no SHA-256 tool.
+- Remote manifests are buffered in memory during collection.
+
+## References
+
+- <https://github.com/pkg/sftp>
+- <https://github.com/RsyncProject/rsync/blob/master/rsync.1.md>
