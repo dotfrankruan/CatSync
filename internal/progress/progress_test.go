@@ -74,6 +74,10 @@ func TestReporterTracksFilesConnectionsAndCounters(t *testing.T) {
 	if snap.Files[0].Done != 600 {
 		t.Errorf("resumed file done = %d, want 600", snap.Files[0].Done)
 	}
+	// Stop the reporter before reading the builder: the ticker renders in a
+	// separate goroutine, and a strings.Builder is not safe for concurrent
+	// access. Finish joins that goroutine.
+	r.Finish(false)
 	if !strings.Contains(out.String(), "ssh conns") {
 		t.Errorf("rendered output lacks the counter line:\n%s", out.String())
 	}
@@ -115,13 +119,14 @@ func TestReporterClampsAndFinishes(t *testing.T) {
 func TestBaselineShapesTheWholeRun(t *testing.T) {
 	var buf strings.Builder
 	r := NewWithBaseline(&buf, 1000, 250, false)
-	defer r.Finish(false)
 	if got := r.Total(); got != 1000 {
 		t.Errorf("Total = %d, want 1000", got)
 	}
 	if got := r.Done(); got != 250 {
 		t.Errorf("Done = %d, want the 250-byte baseline", got)
 	}
+	// Join the rendering goroutine before reading its writer.
+	r.Finish(false)
 	out := buf.String()
 	if !strings.Contains(out, "25.00%") {
 		t.Errorf("first snapshot should report 25.0%%:\n%s", out)
