@@ -1,162 +1,224 @@
+<div align="center">
+
 # CatSync
 
-*Because one TCP connection is never enough.*
+**Parallel, resumable file-tree transfers over SSH.**
 
-CatSync moves large file trees — or a single file — between your machine and a
-remote host over SSH, in either direction. It plans the transfer file by file,
-runs small files in parallel batches and large files over several SFTP streams,
-never overwrites a file that already exists at the destination, and can resume an
-interrupted transfer from where it stopped. It is a single Go binary with no
-daemon on the remote side.
+A single Go binary. No remote daemon required. Conservative by default.
 
 [![CI](https://github.com/dotfrankruan/CatSync/actions/workflows/ci.yml/badge.svg)](https://github.com/dotfrankruan/CatSync/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/dotfrankruan/CatSync?display_name=tag&sort=semver)](https://github.com/dotfrankruan/CatSync/releases)
+[![Go](https://img.shields.io/github/go-mod/go-version/dotfrankruan/CatSync)](go.mod)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 
-## Supported systems
+[Quick start](#-quick-start) · [Install](#-install) · [How it works](#-how-it-works) · [Docs](#-documentation) · [Benchmarks](docs/benchmark.md)
 
-| | |
-| --- | --- |
-| Local | Linux (amd64, arm64), macOS (amd64, arm64). Prebuilt archives are published on the [releases page](https://github.com/dotfrankruan/CatSync/releases); `make cross` builds all four locally. |
-| Remote | Any POSIX host with `rsync`, an SSH server with the SFTP subsystem, and GNU findutils. |
+</div>
 
-## Requirements
+---
 
-| | |
-| --- | --- |
-| Local | Go 1.26+ to build. At runtime `ssh`, plus `rsync` for updated files and mirror sync; a copy that only adds files works with `ssh` alone. |
-| Remote | `rsync`, `sshd` with `sftp-server`, and GNU findutils. Native uploads additionally need OpenSSH ≥ 9.0 (fsync and `hardlink@openssh.com`) and GNU coreutils; native downloads need only SFTP and GNU findutils. |
-| Not required | No remote daemon and no extra tooling beyond the two programs above. |
+## ✨ Why CatSync?
 
-`catsync doctor` verifies the local tools and prints their versions.
+CatSync is built for the annoying transfer that a single `scp` or `rsync`
+invocation does not handle well: a large tree, a flaky link, and no desire to
+start over from byte zero.
 
-## Install
+- 🚀 **Parallel by design** — small files move in batched `rsync` jobs; large files use multiple native SFTP streams.
+- 🧭 **Plan first** — every path gets one owner before anything is written. You can inspect the plan before touching the destination.
+- 🛡️ **No clobber** — existing destination files are never overwritten by `copy`; `sync` is the only mode allowed to delete extras.
+- ⏯️ **Resume anything** — chunk checkpoints and atomic state make an interrupted transfer resumable with the same command.
+- 🔐 **Ephemeral identities** — the optional daemon transport uses fresh P-256 certificates, pinned mutual TLS 1.3, and never stores private keys.
+- 🩺 **Verified completion** — size and SHA-256 checks are separate from the transfer itself.
+- 🌐 **Works in both directions** — upload, download, single file, directory tree, copy, or exact mirror.
 
-Homebrew (macOS and Linux):
+> Design rule: **SSH establishes trust. The direct transport owns the session. No permanent daemon. No silent fallback.**
 
-```sh
+## 🚀 Quick start
+
+```bash
+# 1. Check that ssh/rsync are available
+catsync doctor
+
+# 2. See what would happen
+catsync plan ./data user@host:/srv/data
+
+# 3. Add new/changed files — never deletes destination data
+catsync copy ./data user@host:/srv/data
+
+# 4. Exact mirror — the only mode that removes destination-only entries
+catsync sync ./data user@host:/srv/data
+
+# 5. Single file, remote to local
+catsync copy user@host:/srv/archive.tar ./downloads
+```
+
+Interrupted? Run the same command again. CatSync resumes the matching run
+automatically; `catsync resume <RUN_ID>` does the same explicitly and
+`--fresh` starts over.
+
+## 📦 Install
+
+### Homebrew (macOS/Linux)
+
+```bash
 brew install dotfrankruan/catsync/catsync
 ```
 
-The formula lives in [dotfrankruan/homebrew-catsync](https://github.com/dotfrankruan/homebrew-catsync)
-(`dotfrankruan/catsync` is the tap name; Homebrew maps it to that repository).
-The fully-qualified install needs no extra trust step. If you prefer to tap
-first and install by short name, Homebrew asks you to trust the tap once:
+The fully-qualified name auto-taps the repository and needs no extra trust
+step. To install by short name after tapping explicitly:
 
-```sh
+```bash
 brew tap dotfrankruan/catsync
-brew trust dotfrankruan/catsync   # trusts the tap, i.e. its formulae
+brew trust dotfrankruan/catsync
 brew install catsync
 ```
 
-Upgrades arrive with `brew upgrade catsync`.
+<details>
+<summary><strong>Prefer a release archive or building from source?</strong></summary>
 
-From a release archive:
+<br>
 
-```sh
+```bash
+# macOS Apple silicon; replace the platform suffix as needed
 curl -LO https://github.com/dotfrankruan/CatSync/releases/download/v0.2.0/catsync_v0.2.0_darwin_arm64.tar.gz
 tar -xzf catsync_v0.2.0_darwin_arm64.tar.gz
 install -m 0755 catsync_v0.2.0_darwin_arm64/catsync ~/.local/bin/catsync
 ```
 
-From source: `make install` (Go 1.26+; installs `catsync` and `catsyncd`),
-`go install github.com/dotfrankruan/CatSync/cmd/catsync@latest`, and separately
-`go install github.com/dotfrankruan/CatSync/cmd/catsyncd@latest` if you want the
-opt-in daemon transport.
+From source:
 
-## Daemon transport (opt-in)
+```bash
+make install   # installs catsync and catsyncd to ~/.local/bin
+```
 
-CatSync can use a one-shot remote agent, `catsyncd`, instead of opening one
-ssh data channel per SFTP stream or rsync batch:
+Or with Go directly:
+
+```bash
+go install github.com/dotfrankruan/CatSync/cmd/catsync@latest
+go install github.com/dotfrankruan/CatSync/cmd/catsyncd@latest   # optional daemon agent
+```
+
+</details>
+
+**Requirements:** Go 1.26+ to build. At runtime CatSync uses the system
+`ssh`; `rsync` is needed for updated files and mirror sync. On the remote side:
+`sshd` with `sftp-server`, `rsync`, and GNU findutils. No remote daemon is
+required for the default transport.
+
+## 🧭 Transport modes
+
+| Mode | Flag | Data path | Notes |
+| --- | --- | --- | --- |
+| **SSH** (default) | — | system `ssh` / SFTP | Works with any SSH setup; one connection per data stream. |
+| **Daemon TCP** | `--transport daemon` | pinned mTLS over TCP | One SSH bootstrap; the authenticated data channel can outlive it. |
+| **Daemon QUIC** | `--transport daemon --daemon-transport quic` | pinned QUIC TLS 1.3 | Experimental; one UDP connection, multiplexed streams, no 0-RTT. |
+| **Daemon SSH-forward** | `--transport daemon --daemon-bootstrap ssh-forward` | mTLS inside an SSH tunnel | The tunnel is required for the whole transfer. |
+
+### ⚡ Optional daemon transport
+
+Direct TCP and direct QUIC start with a single SSH bootstrap, exchange fresh
+in-memory certificates, then hand the session to the authenticated data
+control channel. The bootstrap SSH process can exit; data heartbeats and the
+final authenticated `bye` own the rest of the run. The remote `catsyncd` is a
+one-shot worker and exits when the transfer ends or when the client disappears.
 
 ```bash
 catsync copy --transport daemon ~/src user@host:/data
-# Optional QUIC diagnostics (qlog; owner-only files):
-# catsync copy --transport daemon --daemon-transport quic \
-#   --quic-qlog local.sqlog --remote-quic-qlog /tmp/remote.sqlog ...
 ```
 
-The run starts exactly one ssh bootstrap session. Over that authenticated
-channel the two sides exchange fresh in-memory ECDSA certificates, then use
-pinned mutual TLS 1.3 for the data plane (SFTP streams, rsync exec, RPC).
-For direct TCP and direct QUIC, the authenticated data control channel then
-takes ownership: the SSH bootstrap exits and the transfer continues without
-it; the remote one-shot worker exits on the final authenticated bye or a
-bounded heartbeat timeout. `ssh-forward` still depends on its SSH tunnel.
-An experimental QUIC data transport multiplexes all streams over one UDP
-connection (`--daemon-transport quic`, ALPN `catsync-quic/1`, no 0-RTT).
-The certificates and session nonces exist only for that run and are never
-written to disk or state. `catsyncd` must already be installed by you on the
-remote host and should be an absolute path or on the remote `PATH`; CatSync
-never downloads, copies, or installs it. Default behavior without
-`--transport daemon` is unchanged: plain ssh, exactly as before.
+`catsyncd` must already be installed on the remote host — CatSync never
+downloads, copies, or installs it. See
+[docs/usage.md](docs/usage.md#daemon-transport-one-shot-catsyncd) for the
+security model, SSH-forward behavior, QUIC diagnostics, and resume semantics.
 
-See [docs/usage.md](docs/usage.md#daemon-transport-one-shot-catsyncd) for
-options, security model, resume behavior, and limitations. The lifecycle
-handoff is illustrated in [docs/assets/ssh-handoff.svg](docs/assets/ssh-handoff.svg).
+<details>
+<summary><strong>Daemon lifecycle at a glance</strong></summary>
 
-## Releases
+<br>
 
-Pushing a `v*` tag runs the release workflow: it re-runs the full check suite,
-builds `linux/amd64`, `linux/arm64`, `darwin/amd64`, and `darwin/arm64`
-archives containing `catsync` and the one-shot `catsyncd` agent, with the tag
-baked in, and publishes them with `SHA256SUMS` and
-generated notes on the GitHub releases page.
-
-```sh
-git tag -a v0.2.0 -m "v0.2.0"
-git push origin v0.2.0
+```text
+SSH bootstrap
+  → ephemeral identities + exact pinning
+  → pinned mTLS TCP / QUIC data control
+  → authenticated handoff
+  → SSH bootstrap exits
+  → data + heartbeats continue
+  → authenticated bye
+  → one-shot worker exits
 ```
 
-`make release VERSION=v0.2.0` builds the same archives locally, and
-[docs/releasing.md](docs/releasing.md) lists the remaining steps: publishing the
-tag and bumping the Homebrew formula.
+![CatSync SSH bootstrap lifecycle handoff](docs/assets/ssh-handoff.svg)
 
-## Quick start
+</details>
 
-```sh
-make install            # builds and installs catsync and catsyncd to ~/.local/bin
-catsync doctor          # check ssh and rsync
+## 🛡️ Built for safe transfers
 
-# Remote paths are always absolute (CATSync rejects relative paths and ~).
-catsync plan ./data user@host:/srv/data       # what would be transferred
-catsync copy ./data user@host:/srv/data       # add new/changed files, never delete
-catsync sync ./data user@host:/srv/data       # exact mirror (deletes extras)
+- **One owner per path.** Planning assigns every relative path to exactly one backend; stages never race for the same destination file.
+- **Conservative by default.** `copy` never deletes destination entries. `sync` is explicit and performs deletion only in its final mirror pass.
+- **Crash-aware state.** Run state is written atomically; checkpoints are validated before resume; advisory destination locks are released by the kernel after a crash.
+- **Verification is a gate.** The default `auto` policy checks size first, then SHA-256 when the remote side has a hashing tool. Strict `--verify sha256` fails instead of falling back.
+- **No long-lived secrets.** Daemon identities exist only in memory for one run. There is no persistent certificate, token, or session key.
 
-catsync copy user@host:/srv/data/archive.tar ./downloads   # single file, other direction
-```
+## 🔄 Resume an interrupted transfer
 
-Interrupted? Run the same command again — CatSync resumes that job automatically
-(`catsync resume` does the same explicitly, and `--fresh` starts over). Progress,
-state, and every partial object are kept on disk until the transfer completes.
+Run the same `copy`, `sync`, or `download` command again. CatSync finds the
+matching run, revalidates the source, and resumes pending work; in-flight state
+is recovered automatically. List recorded runs with `catsync status`, or resume
+one explicitly with `catsync resume <RUN_ID>`.
 
-## CI/CD
+## 🧱 How it works
 
-GitHub Actions runs `gofmt`, `go vet`, the full test suite, the race suite, and
-the cross build on Linux and macOS for every push and pull request
-([`.github/workflows/ci.yml`](.github/workflows/ci.yml)). The same checks run
-locally:
+1. 🔍 **Discover** the source tree and collect destination metadata.
+2. 🗺️ **Plan** one backend per path and make the plan immutable for the run.
+3. ⚡ **Transfer** small files in parallel batches and large files with native
+   multistream SFTP.
+4. ✅ **Verify** size and SHA-256 as requested, then publish safely.
+5. 🪞 **Mirror** only for `sync`, after all optimized stages succeed.
 
-```sh
+The daemon transport swaps the remote transport implementation — not the
+planner, checkpoint format, publish rules, or verification logic.
+
+## 📚 Documentation
+
+| | |
+| --- | --- |
+| 🧰 [Usage](docs/usage.md) | Commands, options, backend selection, authentication, troubleshooting. |
+| 🏗️ [Architecture](docs/architecture.md) | Transfer stages, checkpoints, state model, and SSH lifecycle handoff. |
+| 📊 [Benchmarks](docs/benchmark.md) | Measured transport performance, real SSH handoff tests, and limitations. |
+| 🚀 [Releasing](docs/releasing.md) | Tagging, release archives, and Homebrew. |
+| 📄 [Third-party notices](third_party/) | Licenses of linked Go modules. |
+
+## ⚠️ Current limitations
+
+- **QUIC is experimental.** The direct QUIC lifecycle works, but the known
+  quic-go public-network `decryption_failure` / idle-timeout issue is still
+  possible on some paths. CatSync never silently downgrades transports.
+- **SSH-forward is intentionally SSH-bound.** Its data path lives inside the
+  SSH tunnel, so losing SSH terminates that transfer.
+- **A lost direct data connection is resumable, but not recoverable without
+  SSH.** This release decouples an active direct session from its bootstrap;
+  it does not add passwordless re-authentication of a new session.
+- **The remote `catsyncd` must be installed by you.** CatSync does not install
+  or copy it.
+
+## 🛠️ Development
+
+```bash
 make test     # go test ./...
 make check    # gofmt, go vet, go test -race
 make cross    # dist/ binaries: linux/amd64, linux/arm64, darwin/amd64, darwin/arm64
 make release  # versioned archives + SHA256SUMS, as published on a tag
 ```
 
-## Acknowledgements
+CI runs the same checks on Linux and macOS for every push and pull request —
+see [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
-Earlier CatSync releases orchestrated the external `fpsync`, `fpart`, and `mscp`
-tools. Those integrations have been replaced by native implementations and are no
-longer included, invoked, or required; no code from those projects is part of
-CatSync.
+## 🙏 Acknowledgements
 
-## Documentation
+Early CatSync releases orchestrated the external `fpsync`, `fpart`, and `mscp`
+tools. Those integrations have been replaced by native implementations; no
+code from those projects is part of CatSync.
 
-- [docs/usage.md](docs/usage.md) — commands, options, backend selection,
-  verification, authentication, troubleshooting, limitations.
-- [docs/architecture.md](docs/architecture.md) — how the transfer stages,
-  checkpoints, resume, state model, and SSH lifecycle handoff work.
-- [docs/benchmark.md](docs/benchmark.md) — measured transport performance,
-  real SSH handoff acceptance, and known limitations.
-- [third_party/](third_party/) — licenses of the linked Go modules (the main
-  license is [AGPL-3.0-only](LICENSE)).
+## 📄 License
+
+[AGPL-3.0-only](LICENSE) — your data belongs to you, not us.
